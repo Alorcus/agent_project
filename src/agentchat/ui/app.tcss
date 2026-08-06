@@ -1,0 +1,83 @@
+/* Layout uses fractional units and no fixed pixel geometry, so the app
+   reflows rather than breaking on unusual terminal sizes (NFR-P-04). */
+
+Screen {
+    layers: base;
+}
+
+#chat-log {
+    height: 1fr;
+    padding: 1 2;
+    scrollbar-size-vertical: 1;
+}
+
+#composer {
+    height: auto;
+    padding: 0 2 1 2;
+}
+
+#prompt {
+    border: round $panel-lighten-2;
+}
+
+#prompt:focus {
+    border: round $accent;
+}
+
+#statusbar {
+    height: 1;
+    padding: 0 2;
+    color: $text-muted;
+    background: $panel;
+}
+
+#statusbar.-busy {
+    color: $warning;
+}
+
+#statusbar.-error {
+    color: $error;
+}
+
+.bubble {
+    height: auto;
+    margin-bottom: 1;
+    padding: 0 1;
+    border-left: outer $panel-lighten-2;
+}
+
+.bubble--user {
+    border-left: outer $accent;
+}
+
+.bubble--assistant {
+    border-left: outer $success;
+}
+
+.bubble--system {
+    border-left: outer $panel-lighten-1;
+    color: $text-muted;
+}
+
+.bubble--stopped {
+    border-left: outer $warning;
+}
+
+.bubble--error {
+    border-left: outer $error;
+    color: $error;
+}
+
+.bubble__header {
+    color: $text-muted;
+    text-style: bold;
+}
+
+.bubble__body {
+    padding-top: 0;
+}
+
+.placeholder {
+    color: $text-muted;
+    padding: 1 0;
+}

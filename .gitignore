@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# runtime state — regenerated, excluded from the archive (NFR-D-05)
+data/
+*.db
+*.sqlite3
+.models/
+.cache/
