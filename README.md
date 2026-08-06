@@ -30,7 +30,7 @@ uv run pytest
 | `Ctrl+N` | New conversation |
 | `Ctrl+O` | Cycle model |
 | `Ctrl+T` | Toggle thinking mode |
-| `Ctrl+Q` | Quit |
+| `Ctrl+D` | Exit |
 
 ## Configuration
 

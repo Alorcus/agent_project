@@ -32,7 +32,7 @@ class ChatApp(App[None]):
     TITLE = "agentchat"
 
     BINDINGS = [
-        Binding("ctrl+q", "quit", "Quit"),
+        Binding("ctrl+d", "quit", "Exit"),
         Binding("escape", "stop", "Stop"),
         Binding("ctrl+n", "new_conversation", "New chat"),
         Binding("ctrl+o", "cycle_model", "Model"),
