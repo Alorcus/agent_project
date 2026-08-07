@@ -14,7 +14,7 @@ uv run agentchat
 ```
 
 `uv` resolves the interpreter and dependencies from `pyproject.toml`; there is
-no separate install step (NFR-D-01, NFR-D-02).
+no separate install step.
 
 Needs a GPU node — the first message loads the weights, which takes a moment.
 Without one, or on a laptop:
@@ -43,19 +43,18 @@ AGENTCHAT_TEST_REAL_MODEL=1 uv run pytest
 | `phi-4-mini` | 3.8B | 32768 | prompted (no native mode) |
 | `qwen3-14b` | 14B | 16384 | native, via the chat template |
 
-`Ctrl+O` switches between them at runtime (NFR-U-05); only one is resident at a
-time, so switching evicts the other from the GPU (NFR-P-05).
+`Ctrl+O` switches between them at runtime; only one is resident at a time, so
+switching evicts the other from the GPU.
 
-The context windows are deliberately below what the model configs advertise
-(40960 for Qwen3, 131072 for Phi). The limit is KV-cache memory, not the
-architecture: on a 40 GB A100, Qwen3-14B's weights take ~29 GB and its cache
-costs ~0.33 MB per token. `AGENTCHAT_MAX_CONTEXT` lowers them further for a
-smaller GPU.
+The context windows are set below what the model configs advertise (40960 for
+Qwen3, 131072 for Phi). The limit is KV-cache memory, not the architecture: on
+a 40 GB A100, Qwen3-14B's weights take ~29 GB and its cache costs ~0.33 MB per
+token. `AGENTCHAT_MAX_CONTEXT` lowers them further for a smaller GPU.
 
 **Weights are never downloaded.** Checkpoints are read from disk by path with
 `local_files_only=True`. Passing a Hugging Face repo id instead would pull tens
 of gigabytes into `~/.cache/huggingface` per model, per user; a missing
-checkpoint has to fail loudly instead.
+checkpoint fails loudly instead.
 
 ## Keys
 
@@ -70,7 +69,7 @@ checkpoint has to fail loudly instead.
 
 ## Configuration
 
-Environment variables, all prefixed `AGENTCHAT_` (NFR-Q-03):
+Environment variables, all prefixed `AGENTCHAT_`:
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -95,6 +94,7 @@ src/agentchat/
   llm/
     base.py        LLMProvider protocol — the app/backend boundary
     registry.py    model catalogue, residency, runtime switching
+    local.py       real backend (transformers)
     mock.py        the stub backend
   storage/
     base.py        ConversationStore protocol + in-memory implementation
@@ -107,33 +107,28 @@ src/agentchat/
 The dependency direction is one-way: `ui → core → llm/storage`. The UI never
 imports a concrete backend.
 
-## What this milestone establishes
+## What's in place
 
-The point of building against a mock is to lock in the properties that are
-painful to retrofit:
-
-- **Generation runs on a cancellable worker.** Scrolling, model switching and
-  stopping all stay live while tokens arrive (NFR-U-04). The mock streams with
-  jittered delays specifically so this is exercised.
-- **The backend is behind a protocol.** `LLMProvider` is the whole surface a
-  real model has to implement; swapping the mock touches `config.py` only.
-- **Model switching is a user action** (`Ctrl+O`), not a config edit
-  (NFR-U-05), and the registry keeps one model resident at a time (NFR-P-05).
-- **Every prompt is assembled by a `ContextStrategy`,** so the context-management
-  elective is a swap of one object rather than a rewrite (NFR-CTX-*).
-- **Backend failure is a UI error, not a crash** (NFR-Q-02) — set
+- Generation runs on a cancellable worker — scrolling, model switching and
+  stopping stay live while tokens arrive.
+- The backend is behind a protocol (`LLMProvider`); swapping backends touches
+  `config.py` only.
+- Model switching is a runtime action (`Ctrl+O`), and the registry keeps only
+  one model resident at a time.
+- Every prompt is assembled by a `ContextStrategy`, so smarter context
+  management is a swap of one object.
+- Backend failure surfaces as a UI error, not a crash — set
   `AGENTCHAT_SIMULATE_FAILURE=1` and switch to the second model to see it.
-- **Assistant messages record which model produced them** (NFR-FT-10).
+- Assistant messages record which model produced them.
 
 ## Not yet built
 
 Deliberately stubbed, with the seam in place:
 
-- Durable storage — `InMemoryStore` satisfies the protocol; SQLite replaces it
-  (NFR-S-01, NFR-S-03).
-- Conversation list, switching and deletion (NFR-U-03, NFR-U-06).
-- Real model backends and the two required fine-tunes (NFR-FT-01..10).
+- Durable storage — `InMemoryStore` satisfies the protocol; SQLite replaces it.
+- Conversation list, switching and deletion.
+- The two required fine-tunes.
 - Adaptive RAG, sub-agent deployment, intelligent context management (electives).
-- History virtualisation for very long conversations (NFR-U-02).
+- History virtualisation for very long conversations.
 
 See `requirements.md` for the full non-functional requirement set.

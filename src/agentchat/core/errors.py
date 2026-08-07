@@ -1,8 +1,5 @@
-"""Error taxonomy.
-
-Every failure that can reach the user is one of these, so the UI can render an
-error instead of crashing (NFR-Q-02, NFR-SUB-04).
-"""
+"""Error taxonomy: every failure that can reach the user is one of these, so
+the UI can render an error instead of crashing."""
 
 from __future__ import annotations
 

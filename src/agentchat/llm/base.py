@@ -1,9 +1,7 @@
 """The boundary between the app and any model backend.
 
 Everything above this line (UI, chat service) talks only to ``LLMProvider``.
-Everything below it (mock now; llama.cpp / transformers / adapters later) only
-has to satisfy this protocol. Swapping the mock for a real backend must not
-touch the UI.
+Swapping the mock for a real backend must not touch the UI.
 """
 
 from __future__ import annotations
@@ -19,8 +17,8 @@ from agentchat.core.models import Message
 class ModelInfo:
     """Static description of a selectable model or adapter.
 
-    ``base_model_id`` being set marks this as a LoRA/QLoRA adapter that rides on
-    a shared resident base model rather than its own full copy (NFR-FT-08).
+    ``base_model_id`` set marks this as a LoRA/QLoRA adapter riding on a shared
+    resident base model rather than its own full copy.
     """
 
     id: str
@@ -36,11 +34,7 @@ class ModelInfo:
 
 @dataclass(frozen=True)
 class GenerationOptions:
-    """Per-request knobs.
-
-    ``thinking`` is user-controlled rather than always-on so quality can be
-    traded against latency (NFR-U-08).
-    """
+    """Per-request knobs."""
 
     temperature: float = 0.7
     max_tokens: int = 1024
@@ -53,8 +47,7 @@ class LLMProvider(Protocol):
     """A loadable, streaming text generator.
 
     Implementations must be cancellable: when the consumer stops iterating
-    ``generate`` (task cancellation), generation aborts promptly. The UI's stop
-    action depends on it (NFR-U-04).
+    ``generate`` (task cancellation), generation aborts promptly.
     """
 
     @property
@@ -64,12 +57,11 @@ class LLMProvider(Protocol):
     def is_loaded(self) -> bool: ...
 
     async def load(self) -> None:
-        """Acquire weights/resources. Idempotent. May be slow — the caller is
-        expected to show progress (NFR-U-07)."""
+        """Acquire weights/resources. Idempotent; may be slow."""
         ...
 
     async def unload(self) -> None:
-        """Release resources so another model can become resident (NFR-P-05)."""
+        """Release resources so another model can become resident."""
         ...
 
     def generate(

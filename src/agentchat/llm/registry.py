@@ -1,9 +1,7 @@
 """Model registry — the single place that decides which model is resident.
 
-Model switching is a runtime user action (NFR-U-05), and only one base model is
-kept loaded at a time so the app fits both a laptop and the cluster (NFR-P-05).
-Adapters sharing a base (NFR-FT-08) will be handled here too: swapping an
-adapter should not evict its base.
+Only one base model is kept loaded at a time, so the app fits both a laptop
+and the cluster.
 """
 
 from __future__ import annotations

@@ -1,6 +1,3 @@
-/* Layout uses fractional units and no fixed pixel geometry, so the app
-   reflows rather than breaking on unusual terminal sizes (NFR-P-04). */
-
 Screen {
     layers: base;
 }

@@ -1,8 +1,7 @@
 """Runtime configuration and app assembly.
 
-Config is externalised (NFR-Q-03) via environment variables so a grader can
-point the system at their own paths without editing code. ``build_registry`` is
-the single wiring point: which backend the app talks to is decided here and
+Config is externalised via environment variables. ``build_registry`` is the
+single wiring point: which backend the app talks to is decided here and
 nowhere else.
 """
 
@@ -56,11 +55,9 @@ def _env_int(name: str) -> int | None:
 
 @dataclass
 class Settings:
-    #: Where durable state will live once the store is real (NFR-S-01).
     data_dir: Path = field(
         default_factory=lambda: Path(_env("DATA_DIR", "./data") or "./data")
     )
-    #: Where user documents are ingested from (NFR-RAG-02).
     corpus_dir: Path = field(
         default_factory=lambda: Path(_env("CORPUS_DIR", "./corpus") or "./corpus")
     )
@@ -76,10 +73,9 @@ class Settings:
     )
     #: Model id selected at startup; falls back to the first registered.
     default_model: str | None = field(default_factory=lambda: _env("MODEL"))
-    #: Cap every model's context window — the escape hatch for a GPU smaller
-    #: than the one the catalogue's defaults assume (NFR-P-05).
+    #: Cap every model's context window — the escape hatch for a smaller GPU.
     max_context: int | None = field(default_factory=lambda: _env_int("MAX_CONTEXT"))
-    #: Simulate an unavailable backend to exercise error handling (NFR-Q-02).
+    #: Simulate an unavailable backend, to exercise error handling.
     simulate_failure: bool = field(
         default_factory=lambda: _env_flag("SIMULATE_FAILURE")
     )

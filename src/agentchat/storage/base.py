@@ -1,10 +1,4 @@
-"""Conversation persistence.
-
-Only the in-memory implementation exists so far. The protocol is here now
-because "resume chats" (NFR-S-01) means a durable store has to slot in without
-the chat service or UI noticing, and because deletion must cascade into derived
-state (NFR-S-04) — which is a property of the store, not the caller.
-"""
+"""Conversation persistence: protocol plus an in-memory implementation."""
 
 from __future__ import annotations
 
@@ -15,8 +9,7 @@ from agentchat.core.models import Conversation
 
 class ConversationStore(Protocol):
     async def list_conversations(self, group_id: str | None = None) -> list[Conversation]:
-        """Most-recently-updated first. ``group_id`` scopes to a project folder
-        (NFR-S-02)."""
+        """Most-recently-updated first, optionally scoped to a project folder."""
         ...
 
     async def load(self, conversation_id: str) -> Conversation | None: ...
@@ -24,7 +17,7 @@ class ConversationStore(Protocol):
     async def save(self, conversation: Conversation) -> None: ...
 
     async def delete(self, conversation_id: str) -> None:
-        """Must also remove derived state (memory index, caches) — NFR-S-04."""
+        """Must also remove any derived state (memory index, caches)."""
         ...
 
 

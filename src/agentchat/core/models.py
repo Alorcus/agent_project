@@ -1,9 +1,4 @@
-"""Domain objects.
-
-Deliberately plain dataclasses with no persistence or UI knowledge, so the
-storage layer (NFR-S-03) and the UI layer can both depend on them without
-depending on each other.
-"""
+"""Domain objects: plain dataclasses with no persistence or UI knowledge."""
 
 from __future__ import annotations
 
@@ -25,16 +20,13 @@ def _new_id() -> str:
 
 @dataclass
 class Message:
-    """A single turn.
-
-    ``model_id`` records which model/adapter produced an assistant message so a
-    conversation that spans several models stays interpretable (NFR-FT-10).
-    """
+    """A single turn."""
 
     role: Role
     content: str = ""
     id: str = field(default_factory=_new_id)
     created_at: datetime = field(default_factory=_now)
+    #: Which model/adapter produced an assistant message.
     model_id: str | None = None
     #: Free-form provenance: retrieved sources, sub-agent ids, context decisions.
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -46,15 +38,11 @@ class Message:
 
 @dataclass
 class Conversation:
-    """An ordered list of messages.
-
-    ``group_id`` is the project-folder handle that memory recall will be scoped
-    to (NFR-S-02). Nothing uses it yet; it exists so grouping is not a schema
-    migration later.
-    """
+    """An ordered list of messages."""
 
     id: str = field(default_factory=_new_id)
     title: str = "New conversation"
+    #: Project-folder handle; unused today, reserved for scoping memory recall.
     group_id: str | None = None
     created_at: datetime = field(default_factory=_now)
     updated_at: datetime = field(default_factory=_now)

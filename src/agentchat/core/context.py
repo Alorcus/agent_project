@@ -1,12 +1,9 @@
-"""Context assembly — the seam for the intelligent-context-management elective.
+"""Context assembly.
 
-Nothing intelligent happens here yet. What matters is that *every* prompt is
-built through a ``ContextStrategy``, so compression (NFR-CTX-01), selection
-(NFR-CTX-03) and window safety (NFR-CTX-04) become a swap of this object rather
-than a change to the chat service or the UI.
-
-``ContextDecision`` exists because the elective has to be *demonstrable*
-(NFR-CTX-05): the UI must be able to show what was dropped and why.
+Every prompt is built through a ``ContextStrategy``, so trimming, compression,
+or relevance selection is a swap of this object rather than a change to the
+chat service or the UI. ``ContextDecision`` records what happened so the UI can
+show what was dropped and why.
 """
 
 from __future__ import annotations
@@ -52,13 +49,9 @@ class ContextStrategy(Protocol):
 
 
 class RecencyWindowStrategy:
-    """Placeholder strategy: keep the system prompt, then the most recent turns
-    that fit the budget.
-
-    This is explicitly the naive baseline the elective has to beat — recency
-    only, no relevance, no compression. Keeping it as a named class means the
-    comparison in the demo is a one-line swap.
-    """
+    """Naive baseline: keep the system prompt, then the most recent turns that
+    fit the budget. No relevance, no compression — the bar smarter strategies
+    have to clear."""
 
     name = "recency-window"
 

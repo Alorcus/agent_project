@@ -1,10 +1,8 @@
 """Mock backend.
 
-Its job is not to be convincing but to have the same *timing shape* as a real
-local model: a slow load, then chunks arriving one at a time with gaps. Building
-the UI against this means the non-blocking/streaming/stop machinery (NFR-U-04,
-NFR-U-07) is exercised from day one instead of retrofitted when a real model
-lands.
+Not meant to be convincing — meant to have the same timing shape as a real
+local model: a slow load, then chunks arriving one at a time with gaps. That
+keeps the non-blocking/streaming/stop machinery exercised without a GPU.
 """
 
 from __future__ import annotations
@@ -32,9 +30,8 @@ _THINKING_PREFIX = (
 class MockProvider:
     """An ``LLMProvider`` that fabricates streamed text.
 
-    Parameters mirror the failure modes a real backend has, so error handling can
-    be tested without one: ``load_delay`` (slow model load), ``fail`` (backend
-    unavailable).
+    ``load_delay`` and ``fail`` mirror a real backend's failure modes so error
+    handling can be tested without one.
     """
 
     def __init__(
@@ -115,12 +112,8 @@ def _tokenize(text: str) -> list[str]:
 
 
 def default_models() -> list[tuple[ModelInfo, dict]]:
-    """The mock model catalogue.
-
-    Two entries with different context windows, so model switching (NFR-U-05) and
-    window-aware context trimming (NFR-CTX-04) are both testable before any real
-    model exists.
-    """
+    """The mock model catalogue: two entries with different context windows,
+    so model switching and window-aware trimming are both testable."""
     return [
         (
             ModelInfo(

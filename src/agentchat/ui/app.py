@@ -1,9 +1,7 @@
 """The Textual application.
 
-Design rule this file exists to enforce: generation runs on a worker, never on
-the event loop's critical path. Scrolling, switching models and stopping all
-stay live while tokens arrive (NFR-U-04), and every long operation reports state
-in the status bar (NFR-U-07).
+Generation always runs on a worker, never on the event loop's critical path —
+scrolling, switching models and stopping all stay live while tokens arrive.
 """
 
 from __future__ import annotations
@@ -69,8 +67,6 @@ class ChatApp(App[None]):
         self._refresh_status()
 
     def _placeholder_text(self) -> str:
-        """Say which backend is answering — a stubbed reply must never be
-        mistaken for a real one."""
         info = self.registry.active_info
         model = info.name if info else "no model"
         if self.settings.backend == "mock":
@@ -111,8 +107,7 @@ class ChatApp(App[None]):
         self.query_one("#prompt", Input).focus()
 
     def action_cycle_model(self) -> None:
-        """Model switching is a runtime user action, not a config edit
-        (NFR-U-05). Takes effect on the next turn; the running one keeps the
+        """Takes effect on the next turn; a running generation keeps the
         model it started with."""
         info = self.registry.cycle()
         self.notify(f"Model → {info.name} ({info.context_window} tokens)")
@@ -161,7 +156,6 @@ class ChatApp(App[None]):
             bubble.mark_stopped()
             raise
         except AgentChatError as error:
-            # An unavailable backend is a UI error, not a crash (NFR-Q-02).
             bubble.mark_error(str(error))
         finally:
             self._generating = False
@@ -178,8 +172,6 @@ class ChatApp(App[None]):
 
         turn = self.chat.last_turn
         if turn is not None and turn.context.was_trimmed:
-            # Context decisions have to be visible to be demonstrable
-            # (NFR-CTX-05).
             bits.append(f"context: dropped {len(turn.context.dropped)}")
 
         self.status_text = ("  ·  ".join(bits)) + (f"  ·  {busy}" if busy else "")

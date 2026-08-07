@@ -1,9 +1,7 @@
 """Chat orchestration: the only thing that knows how a turn is produced.
 
-The UI calls ``stream_reply`` and renders chunks. It does not know about
-providers, context strategies, or the store. That separation is what lets the
-electives (RAG, sub-agents, context management) be added here without touching
-the interface.
+The UI calls ``stream_reply`` and renders chunks — it knows nothing about
+providers, context strategies, or the store.
 """
 
 from __future__ import annotations
@@ -49,12 +47,9 @@ class ChatService:
         user_text: str,
         options: GenerationOptions | None = None,
     ) -> AsyncIterator[str]:
-        """Append the user turn, then stream the assistant turn into the
-        conversation, yielding each chunk.
-
-        Cancelling the consuming task stops generation and keeps the partial
-        assistant message — a stopped reply is still part of the history.
-        """
+        """Append the user turn, then stream the assistant turn, yielding each
+        chunk. Cancelling the consumer stops generation but keeps the partial
+        reply in history."""
         conversation.add_user(user_text)
         conversation.autotitle()
 

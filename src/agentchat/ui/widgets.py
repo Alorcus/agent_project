@@ -1,8 +1,8 @@
 """Chat widgets.
 
-``MessageBubble`` owns its own text buffer and appends in place. Appending to
-one widget rather than re-rendering the log is what keeps history cost flat as a
-conversation grows (NFR-U-02).
+``MessageBubble`` owns its own text buffer and appends in place — appending to
+one widget rather than re-rendering the log keeps cost flat as a conversation
+grows.
 """
 
 from __future__ import annotations
@@ -25,9 +25,9 @@ class MessageBubble(Vertical):
         self._model_name = model_name
         self._buffer = message.content
         self._status: str | None = None
-        # Children are built eagerly and held by reference: streaming updates
-        # can arrive before compose has finished, and markup must stay off so
-        # model output containing brackets is never parsed as Textual markup.
+        # Built eagerly and held by reference: streaming updates can arrive
+        # before compose() finishes. markup=False so model output containing
+        # brackets is never parsed as Textual markup.
         self._header = Static(self._header_text(), classes="bubble__header")
         self._body = Static(self._buffer, classes="bubble__body", markup=False)
 
@@ -42,8 +42,8 @@ class MessageBubble(Vertical):
         return self._buffer
 
     def bind_message(self, message: Message) -> None:
-        """Attach the real conversation message once the service has created it,
-        so the widget and the stored history are the same object."""
+        """Attach the real conversation message once the service has created
+        it, so the widget and the stored history are the same object."""
         message.content = self._buffer
         self.message = message
         self._refresh_header()
@@ -83,7 +83,6 @@ class MessageBubble(Vertical):
         label = _ROLE_LABEL.get(self.message.role, self.message.role)
         parts = [label]
         if self.message.role == "assistant" and self._model_name:
-            # Provenance stays visible in the transcript itself (NFR-FT-10).
             parts.append(self._model_name)
         if self._status:
             parts.append(self._status)
