@@ -1,5 +1,9 @@
 {
   "enabledPlugins": {
     "compound-engineering@compound-engineering-plugin": true
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "bash ~/agent_project/.claude/statusline-command.sh"
   }
 }
