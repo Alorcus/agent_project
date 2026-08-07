@@ -2,9 +2,10 @@
 
 Terminal chat client for the Intelligent Agents course project.
 
-**Status: foundation milestone.** The interface is real; the model backend is a
-mock. Replies are fabricated text streamed on a realistic cadence — nothing here
-reflects an actual language model yet.
+**Status: real models.** Replies come from actual weights — Phi-4-mini-instruct
+and Qwen3-14B, loaded in-process from the cluster's shared checkpoint directory
+and streamed token by token. The mock backend is still there, behind a switch,
+for working on the interface without a GPU.
 
 ## Run it
 
@@ -15,11 +16,46 @@ uv run agentchat
 `uv` resolves the interpreter and dependencies from `pyproject.toml`; there is
 no separate install step (NFR-D-01, NFR-D-02).
 
+Needs a GPU node — the first message loads the weights, which takes a moment.
+Without one, or on a laptop:
+
+```bash
+AGENTCHAT_BACKEND=mock uv run agentchat
+```
+
 Tests:
 
 ```bash
 uv run pytest
 ```
+
+The suite runs against the mock and needs no GPU. To exercise the real weights
+as well:
+
+```bash
+AGENTCHAT_TEST_REAL_MODEL=1 uv run pytest
+```
+
+## Models
+
+| Model | Size | Window | Thinking mode |
+|---|---|---|---|
+| `phi-4-mini` | 3.8B | 32768 | prompted (no native mode) |
+| `qwen3-14b` | 14B | 16384 | native, via the chat template |
+
+`Ctrl+O` switches between them at runtime (NFR-U-05); only one is resident at a
+time, so switching evicts the other from the GPU (NFR-P-05).
+
+The context windows are deliberately below what the model configs advertise
+(40960 for Qwen3, 131072 for Phi). The limit is KV-cache memory, not the
+architecture: on a 40 GB A100, Qwen3-14B's weights take ~29 GB and its cache
+costs ~0.33 MB per token. `AGENTCHAT_MAX_CONTEXT` lowers them further for a
+smaller GPU.
+
+**Weights are never downloaded.** Checkpoints are read from disk by path with
+`local_files_only=True`. Passing a Hugging Face repo id instead would pull tens
+of gigabytes into `~/.cache/huggingface` per model, per user; a missing
+checkpoint has to fail loudly instead.
 
 ## Keys
 
@@ -38,9 +74,12 @@ Environment variables, all prefixed `AGENTCHAT_` (NFR-Q-03):
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `AGENTCHAT_BACKEND` | `local` | `local` for real weights, `mock` for the stub |
+| `AGENTCHAT_MODEL_ROOT` | `/sc/projects/sci-lippert/intelligent-agents/model_checkpoints` | Where the checkpoints live |
+| `AGENTCHAT_MODEL` | first registered | Model selected at startup (`phi-4-mini`, `qwen3-14b`) |
+| `AGENTCHAT_MAX_CONTEXT` | unset | Cap every model's context window, for a smaller GPU |
 | `AGENTCHAT_DATA_DIR` | `./data` | Durable state (not yet written) |
 | `AGENTCHAT_CORPUS_DIR` | `./corpus` | RAG ingestion source (not yet used) |
-| `AGENTCHAT_MODEL` | first registered | Model selected at startup |
 | `AGENTCHAT_SIMULATE_FAILURE` | `0` | Make the second model fail on load, to exercise error handling |
 
 ## Layout

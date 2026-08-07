@@ -16,6 +16,14 @@ from agentchat.ui.app import ChatApp
 from agentchat.ui.widgets import MessageBubble
 
 
+def mock_settings(**overrides) -> Settings:
+    """The stub backend, explicitly. The app defaults to the real cluster
+    models; these tests are about the interface, not about inference, and must
+    run without a GPU."""
+    overrides.setdefault("backend", "mock")
+    return Settings(**overrides)
+
+
 async def _submit(pilot, text: str) -> None:
     prompt = pilot.app.query_one("#prompt", Input)
     prompt.value = text
@@ -23,7 +31,7 @@ async def _submit(pilot, text: str) -> None:
 
 
 async def test_prompt_produces_a_streamed_reply():
-    app = ChatApp(Settings())
+    app = ChatApp(mock_settings())
     async with app.run_test() as pilot:
         await _submit(pilot, "hello")
 
@@ -43,7 +51,7 @@ async def test_prompt_produces_a_streamed_reply():
 
 
 async def test_ui_stays_responsive_while_generating():
-    app = ChatApp(Settings())
+    app = ChatApp(mock_settings())
     async with app.run_test() as pilot:
         await _submit(pilot, "a long enough prompt to stream")
         await asyncio.sleep(0.6)
@@ -58,7 +66,7 @@ async def test_ui_stays_responsive_while_generating():
 
 
 async def test_escape_stops_generation_and_keeps_partial_text():
-    app = ChatApp(Settings())
+    app = ChatApp(mock_settings())
     async with app.run_test() as pilot:
         await _submit(pilot, "stop me")
         await asyncio.sleep(0.7)
@@ -76,7 +84,7 @@ async def test_escape_stops_generation_and_keeps_partial_text():
 
 
 async def test_backend_failure_surfaces_as_an_error_bubble_not_a_crash():
-    app = ChatApp(Settings(simulate_failure=True))
+    app = ChatApp(mock_settings(simulate_failure=True))
     async with app.run_test() as pilot:
         app.registry.cycle()  # switch to the failing model
         await _submit(pilot, "hi")
@@ -93,7 +101,7 @@ async def test_backend_failure_surfaces_as_an_error_bubble_not_a_crash():
 
 
 async def test_new_conversation_clears_the_log():
-    app = ChatApp(Settings())
+    app = ChatApp(mock_settings())
     async with app.run_test() as pilot:
         await _submit(pilot, "first")
         await asyncio.sleep(0.4)
@@ -105,7 +113,7 @@ async def test_new_conversation_clears_the_log():
 
 
 async def test_status_bar_reports_the_active_model():
-    app = ChatApp(Settings())
+    app = ChatApp(mock_settings())
     async with app.run_test() as pilot:
         assert "Mock Small" in app.status_text
         assert app.query_one("#statusbar", Static) is not None
@@ -115,7 +123,7 @@ async def test_status_bar_reports_the_active_model():
 
 
 async def test_thinking_toggle_is_user_controlled():
-    app = ChatApp(Settings())
+    app = ChatApp(mock_settings())
     async with app.run_test() as pilot:
         assert app.options.thinking is False
         await pilot.press("ctrl+t")

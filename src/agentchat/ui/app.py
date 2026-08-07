@@ -54,11 +54,7 @@ class ChatApp(App[None]):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         yield VerticalScroll(
-            Static(
-                "Mocked backend — replies are stubs. "
-                "Type below and press Enter.",
-                classes="placeholder",
-            ),
+            Static(self._placeholder_text(), classes="placeholder"),
             id="chat-log",
         )
         yield Static("", id="statusbar")
@@ -71,6 +67,18 @@ class ChatApp(App[None]):
     def on_mount(self) -> None:
         self.query_one("#prompt", Input).focus()
         self._refresh_status()
+
+    def _placeholder_text(self) -> str:
+        """Say which backend is answering — a stubbed reply must never be
+        mistaken for a real one."""
+        info = self.registry.active_info
+        model = info.name if info else "no model"
+        if self.settings.backend == "mock":
+            return f"Mocked backend ({model}) — replies are stubs. Type below and press Enter."
+        return (
+            f"{model} — the first message loads the weights, which takes a moment. "
+            "Type below and press Enter."
+        )
 
     # -- events -----------------------------------------------------------
 

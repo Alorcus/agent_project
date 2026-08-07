@@ -6,6 +6,12 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "textual>=8.0",
+    # Local inference against the cluster's checkpoints. Pinned below 5.0
+    # because `torch_dtype=` is removed there in favour of `dtype=`, and a
+    # silently-ignored dtype means a bf16 model loading as fp32.
+    "torch>=2.4",
+    "transformers>=4.51,<5",
+    "accelerate>=1.0",
 ]
 
 [project.scripts]
@@ -24,6 +30,13 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentchat"]
+
+[tool.uv]
+# Build the environment on uv's own CPython, never the system one. Triton JIT-
+# compiles a CUDA helper on the first forward pass and needs Python.h to do it;
+# the cluster's system python3.12 ships without dev headers, so a venv built on
+# it loads the weights fine and then fails on the first token.
+python-preference = "only-managed"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

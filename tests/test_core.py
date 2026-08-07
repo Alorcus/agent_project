@@ -14,6 +14,10 @@ from agentchat.llm.mock import MockProvider
 
 
 def fast_registry(**overrides):
+    # Pinned to the stub backend on purpose: these tests are about orchestration
+    # (streaming, cancellation, residency), and they must not depend on a GPU or
+    # on the cluster's checkpoints being mounted.
+    overrides.setdefault("backend", "mock")
     settings = Settings(**overrides)
     registry = build_registry(settings)
     return registry
