@@ -44,6 +44,18 @@ async def _wait_until_done(pilot, app) -> None:
         await asyncio.sleep(0.05)
 
 
+async def _wait_for_rows(pilot, app, count: int) -> None:
+    """The picker is refreshed by the app after it has awaited the store, so
+    the new row set lands a tick or two after the confirming keypress."""
+    for _ in range(60):
+        await pilot.pause()
+        rows = list(app.screen.query(ListView).first().children)
+        if len(rows) == count:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"picker never settled on {count} rows")
+
+
 async def _wait_for_screen(pilot, app, screen_type) -> None:
     # action_open_conversations is a @work worker; it needs a tick to reach
     # push_screen_wait and mount the new screen.
@@ -382,6 +394,7 @@ async def test_ctrl_x_shows_inline_confirm_and_y_deletes():
 
         await pilot.press("ctrl+l")
         await _wait_for_screen(pilot, app, ConversationPicker)
+        picker = app.screen
 
         # Index 0 is the current ("second") conversation; move to "first".
         await pilot.press("down")
@@ -393,13 +406,14 @@ async def test_ctrl_x_shows_inline_confirm_and_y_deletes():
         assert hint.has_class("-confirming")
 
         await pilot.press("y")
-        await _wait_for_screen(pilot, app, ConversationPicker)
+        # Only "second" (current) remains, plus "+ New conversation".
+        await _wait_for_rows(pilot, app, 2)
 
         remaining = await app.chat.list_conversations()
         assert first_id not in {c.id for c in remaining}
-        rows = list(app.screen.query_one(ListView).children)
-        # Only "second" (current) remains, plus "+ New conversation".
-        assert len(rows) == 2
+        # The same screen the whole time: a delete must not close and reopen
+        # the picker.
+        assert app.screen is picker
 
         await pilot.press("escape")
         await pilot.pause()
@@ -479,6 +493,7 @@ async def test_deleting_active_conversation_switches_to_most_recent_remaining():
 
         await pilot.press("ctrl+l")
         await _wait_for_screen(pilot, app, ConversationPicker)
+        picker = app.screen
 
         # Index 0 is the current ("second") conversation — delete it.
         await pilot.press("ctrl+x")
@@ -492,9 +507,17 @@ async def test_deleting_active_conversation_switches_to_most_recent_remaining():
             await asyncio.sleep(0.05)
 
         assert app.conversation.id == first_id
-        assert not isinstance(app.screen, ConversationPicker)
         remaining = await app.chat.list_conversations()
         assert second_id not in {c.id for c in remaining}
+
+        # Deleting the conversation being viewed swaps another one in behind
+        # the picker; the picker itself stays open, now marking that one.
+        assert app.screen is picker
+        await _wait_for_rows(pilot, app, 2)  # "first", plus "+ New conversation"
+        assert len(list(picker.query(".picker__item.-current"))) == 1
+
+        await pilot.press("escape")
+        await pilot.pause()
         bubbles = list(app.query(MessageBubble))
         assert any(
             b.message.role == "user" and b.message.content == "first" for b in bubbles
@@ -510,6 +533,7 @@ async def test_deleting_only_conversation_leaves_fresh_empty_state_without_resur
 
         await pilot.press("ctrl+l")
         await _wait_for_screen(pilot, app, ConversationPicker)
+        picker = app.screen
 
         await pilot.press("ctrl+x")
         await pilot.pause()
@@ -523,14 +547,27 @@ async def test_deleting_only_conversation_leaves_fresh_empty_state_without_resur
 
         assert app.conversation.id != only_id
         assert app.conversation.messages == []
-        assert not list(app.query(MessageBubble))
-        assert not isinstance(app.screen, ConversationPicker)
+
+        # Nothing left to list, so the still-open picker falls back to its
+        # empty state rather than closing.
+        assert app.screen is picker
+        for _ in range(60):
+            await pilot.pause()
+            if list(picker.query(".picker__empty")):
+                break
+            await asyncio.sleep(0.05)
+        assert list(picker.query(".picker__empty"))
+        assert not list(picker.query(ListView))
 
         # The deleted conversation must not have been resurrected by a
         # persist call on the way out.
         remaining = await app.chat.list_conversations()
         assert remaining == []
         assert await app.chat.store.load(only_id) is None
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not list(app.query(MessageBubble))
 
 
 async def test_delete_conversation_storage_error_notifies_and_keeps_running():

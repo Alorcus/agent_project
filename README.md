@@ -109,7 +109,7 @@ src/agentchat/
   ui/
     app.py         Textual application
     widgets.py     message bubbles
-    screens.py     conversation picker + delete confirmation modals
+    screens.py     conversation picker, with its inline delete confirmation
     app.tcss       styling
 ```
 
@@ -133,7 +133,8 @@ imports a concrete backend.
   `InMemoryStore` remains available with `AGENTCHAT_STORE=memory`.
 - Conversation list, switching and deletion — `Ctrl+L` opens an overview of
   saved conversations and switches to one; `Ctrl+X` deletes the highlighted
-  one behind a confirmation.
+  one behind a confirmation, and the overview stays open so several can be
+  cleared in a row.
 
 ## Not yet built
 

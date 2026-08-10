@@ -13,6 +13,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, VerticalScroll
+from textual.screen import Screen
 from textual.widgets import Footer, Header, Input, Static
 
 from agentchat.config import Settings, build_registry, build_store
@@ -66,8 +67,15 @@ class ChatApp(App[None]):
 
     async def on_mount(self) -> None:
         self.conversation = await self.chat.new_conversation()
-        self.query_one("#prompt", Input).focus()
+        self._chat_screen.query_one("#prompt", Input).focus()
         self._refresh_status()
+
+    @property
+    def _chat_screen(self) -> Screen:
+        """The chat itself, which is the bottom of the screen stack. Queries
+        have to start here rather than at the app: with the picker open,
+        `App.query` only sees the modal on top."""
+        return self.screen_stack[0]
 
     def _placeholder_text(self) -> str:
         info = self.registry.active_info
@@ -104,46 +112,53 @@ class ChatApp(App[None]):
         self.conversation = await self.chat.new_conversation()
         await self._show_conversation(self.conversation)
         self._refresh_status()
-        self.query_one("#prompt", Input).focus()
+        self._chat_screen.query_one("#prompt", Input).focus()
 
     @work
     async def action_open_conversations(self) -> None:
         # Bare @work (not the generation group, not exclusive): opening the
         # picker must never cancel a running generation.
-        while True:
-            conversations = await self.chat.list_conversations()
-            result = await self.push_screen_wait(
-                ConversationPicker(conversations, self.conversation.id)
-            )
-            if result is None:
-                return
-            action, conversation_id = result
-            if action == "switch":
-                await self._switch_to(conversation_id)
-                return
-            if action == "new":
-                await self.action_new_conversation()
-                return
-            # action == "delete" — the picker already confirmed inline
-            # before dismissing, so no second confirmation here.
-            try:
-                await self.chat.delete_conversation(conversation_id)
-            except AgentChatError as error:
-                self.notify(str(error), severity="error")
-                continue
-            if conversation_id != self.conversation.id:
-                continue
-            # The conversation we were looking at is gone; persisting it on
-            # the way out (as _switch_to/action_new_conversation do) would
-            # resurrect it, so swap in a fresh, unsaved one first — persist
-            # already skips conversations with no messages.
+        conversations = await self.chat.list_conversations()
+        result = await self.push_screen_wait(
+            ConversationPicker(conversations, self.conversation.id)
+        )
+        if result is None:
+            return
+        action, conversation_id = result
+        if action == "switch":
+            await self._switch_to(conversation_id)
+        elif action == "new":
+            await self.action_new_conversation()
+
+    async def on_conversation_picker_delete_requested(
+        self, event: ConversationPicker.DeleteRequested
+    ) -> None:
+        """The picker already confirmed inline, so no second confirmation
+        here; it stays open and gets the remaining conversations back."""
+        picker = self.screen
+        if not isinstance(picker, ConversationPicker):
+            return
+        try:
+            await self.chat.delete_conversation(event.conversation_id)
+        except AgentChatError as error:
+            self.notify(str(error), severity="error")
+            return
+        if event.conversation_id == self.conversation.id:
+            # The conversation we were looking at is gone; persisting it
+            # (as _switch_to/action_new_conversation do) would resurrect it,
+            # so swap in a fresh, unsaved one first — persist already skips
+            # conversations with no messages.
             self.conversation = Conversation()
             remaining = await self.chat.list_conversations()
             if remaining:
                 await self._switch_to(remaining[0].id)
             else:
                 await self.action_new_conversation()
-            return
+        # Escape during the store work leaves nothing to refresh.
+        if self.screen is picker:
+            await picker.refresh_conversations(
+                await self.chat.list_conversations(), self.conversation.id
+            )
 
     async def _switch_to(self, conversation_id: str) -> None:
         # A live generation holds bubbles that _show_conversation is about to
@@ -158,10 +173,10 @@ class ChatApp(App[None]):
             return
         await self._show_conversation(self.conversation)
         self._refresh_status()
-        self.query_one("#prompt", Input).focus()
+        self._chat_screen.query_one("#prompt", Input).focus()
 
     async def _show_conversation(self, conversation: Conversation) -> None:
-        log = self.query_one("#chat-log", VerticalScroll)
+        log = self._chat_screen.query_one("#chat-log", VerticalScroll)
         await log.remove_children()
         if not conversation.messages:
             await log.mount(Static("New conversation.", classes="placeholder"))
@@ -200,7 +215,7 @@ class ChatApp(App[None]):
 
     @work(exclusive=True, group=_GENERATION_GROUP)
     async def _turn(self, text: str) -> None:
-        log = self.query_one("#chat-log", VerticalScroll)
+        log = self._chat_screen.query_one("#chat-log", VerticalScroll)
         await log.query(".placeholder").remove()
 
         await log.mount(MessageBubble(Message(role="user", content=text)))
@@ -249,6 +264,6 @@ class ChatApp(App[None]):
             bits.append(f"context: dropped {len(turn.context.dropped)}")
 
         self.status_text = ("  ·  ".join(bits)) + (f"  ·  {busy}" if busy else "")
-        bar = self.query_one("#statusbar", Static)
+        bar = self._chat_screen.query_one("#statusbar", Static)
         bar.set_class(busy is not None, "-busy")
         bar.update(self.status_text)
