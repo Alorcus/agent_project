@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from agentchat.core.context import ContextDecision, ContextStrategy, RecencyWindowStrategy
+from agentchat.core.errors import StorageError
 from agentchat.core.models import Conversation, Message
 from agentchat.llm.base import GenerationOptions
 from agentchat.llm.registry import ModelRegistry
@@ -37,9 +38,36 @@ class ChatService:
         self.last_turn: TurnResult | None = None
 
     async def new_conversation(self, group_id: str | None = None) -> Conversation:
-        conversation = Conversation(group_id=group_id)
-        await self.store.save(conversation)
+        return Conversation(group_id=group_id)
+
+    async def list_conversations(self, group_id: str | None = None) -> list[Conversation]:
+        return await self.store.list_conversations(group_id)
+
+    async def switch_conversation(self, conversation_id: str) -> Conversation:
+        """Resolve an id to the authoritative `Conversation` from the store.
+
+        The single place id -> object resolution happens, so callers never
+        need to guess whether `store.load` returns the same instance they
+        already hold (`InMemoryStore` does; `SqliteStore` doesn't).
+        """
+        conversation = await self.store.load(conversation_id)
+        if conversation is None:
+            raise StorageError(f"No conversation {conversation_id!r}")
+        # last_turn describes the outgoing conversation's context-trimming
+        # decision; carrying it over would report one conversation's
+        # trimming against another's.
+        self.last_turn = None
         return conversation
+
+    async def delete_conversation(self, conversation_id: str) -> None:
+        await self.store.delete(conversation_id)
+
+    async def persist(self, conversation: Conversation) -> None:
+        """Save `conversation`, skipping ones with no messages so an empty
+        "New conversation" is never written to the store."""
+        if not conversation.messages:
+            return
+        await self.store.save(conversation)
 
     async def stream_reply(
         self,
@@ -79,4 +107,4 @@ class ChatService:
         finally:
             reply.content = "".join(parts)
             conversation.touch()
-            await self.store.save(conversation)
+            await self.persist(conversation)
