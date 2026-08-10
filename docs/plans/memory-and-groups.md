@@ -1,6 +1,6 @@
 # Memory & Groups — implementation model
 
-**Status: v2 — fragment/message corrected to an explicit many-to-many.**
+**Status: v3 — write path aligned with the GUM pipeline (Shaikh et al., UIST '25).**
 **Stage: prototype, single user. Schema changes are free; see "Relationship to plan 001".**
 
 Scope: the **chat memory mechanism** (NFR-S-02) and the **grouping** it is scoped
@@ -312,7 +312,8 @@ sequenceDiagram
     participant LLM as LLMProvider
 
     Chat->>Chat: assistant turn completes
-    Chat-)Ex: schedule(conversation, new_messages)
+    Note over Chat: batched — fires every N turns,<br/>and on close or switch
+    Chat-)Ex: schedule(conversation, turns since last extraction)
     Note over Chat,Ex: fire-and-forget, cancellable worker
 
     Ex->>Store: memory_scope(conversation)
@@ -348,6 +349,22 @@ sequenceDiagram
 One LLM call resolves every claim. New, merge and supersede are the same judgement
 over the same candidates, so splitting them into separate passes would multiply
 the cost for nothing.
+
+### When extraction runs
+
+Extraction is **batched over a configurable number of turns**
+(`AGENTCHAT_MEMORY_EXTRACT_EVERY`, turns since the last run) rather than firing on
+every turn. Per-turn extraction pays an LLM call for turns that usually carry no
+durable claim; too large a batch makes the extractor hold many claims at once and
+delays recall of things just said.
+
+A counter alone is not sufficient — it loses the tail. Extraction must **also flush
+on conversation switch and on close**, or the last N-1 turns before you navigate
+away are never extracted. The counter is an optimisation; the flush is what makes
+the invariant "every turn in a project group is eventually extracted" true.
+
+Batching does not weaken provenance: the many-to-many in § 1.1 lets a claim drawn
+from a five-turn window cite every message that supports it.
 
 ### What the four outcomes are decided on
 
@@ -388,9 +405,40 @@ Two rules that fall out of this:
 - **Merge never rewrites fragment text.** Only a citation is added. Otherwise text
   churns on every corroboration and `memory_fts` must re-index each time.
 
-⏸ **"Same subject" is doing all the work here**, and it is currently a free-form
-judgement by a 4B–14B model — the likeliest failure point in the whole design. See
-§ 7 #8.
+**Subject match is a vector comparison**, not a free-form judgement. Candidates are
+retrieved by embedding similarity over fragment text; the model is only asked the
+narrower question of whether the predicates agree. This follows GUM's reranker
+(below), which classifies retrieved propositions as *identical / similar /
+unrelated* — the same three-way split as merge / supersede / new.
+
+### Prior art: the GUM pipeline
+
+Shaikh et al., *Creating General User Models from Computer Use*, UIST '25
+([doi:10.1145/3746059.3747722](https://doi.org/10.1145/3746059.3747722),
+<https://generalusermodels.github.io>). Their architecture is
+**Observe → Audit → Propose → Retrieve → Revise**, and it maps onto this design
+closely enough to be worth following deliberately rather than reinventing.
+
+| GUM | Here | Notes |
+|---|---|---|
+| observation | message | GUM's are unstructured (screenshots); ours are already text |
+| proposition + grounding | fragment + citations | same many-to-many |
+| **Audit** | *dropped* | a privacy gate answering Nissenbaum's contextual-integrity questions. Ours is memory over the user's own chats, so there is no third-party disclosure to gate. Becomes relevant again for the persona pipeline over Enron. |
+| **Propose** | claim extraction | GUM generates a reasoning trace *before* the proposition, then confidence, then decay |
+| **Retrieve** | `candidates()` | BM25 → LLM rerank as identical / similar / unrelated. Their footnote 5 explicitly sanctions swapping BM25 for neural embeddings |
+| **Revise** | merge / supersede | see the caveat below |
+
+**Where GUM is better than § 2.1 as drafted.** GUM has no hard supersede. Revise
+rewrites the proposition and regenerates its confidence — contradiction lowers it,
+reinforcement raises it — and nothing is ever evicted; confidence-0 propositions
+remain for transparency but are not surfaced by default. That dissolves the
+false-supersede failure named in the error table above, where one bad call
+silently drops a true claim out of the digest. See § 7 #9.
+
+**Where the analogy is weaker.** GUM *infers* about a user from indirect
+observation, so confidence carries real weight there. Chat memory mostly records
+what was explicitly said, and a claim the user stated outright is not uncertain.
+Decay is the more valuable import (§ 6); confidence may be close to constant here.
 
 ⏸ The default-group branch shown here does **no** extraction. The alternative —
 extract always, so moving a chat into a project carries its history instantly —
@@ -617,6 +665,13 @@ k ≈ 60
 - `rank_recency` orders by `fragment_support.last_seen_at`, not `created_at`. A
   backfilled three-month-old chat is extracted today; ranking on extraction time
   would make its stale claims look freshest.
+- **Decay is per fragment, not global** — GUM's move, and a better one than a flat
+  recency ordinal. "We decided SQLite" decays slowly; "I'm debugging the picker
+  right now" decays fast. With a per-fragment decay rate `α`, relevance becomes
+  `r̃ᵢ = rᵢ · exp(−αᵢ · k · age(dᵢ))` with `k = 2` and age in days, and
+  `rank_recency` is the ordering of `r̃`. `kind` already correlates with decay
+  (`decision` slow, `open_question` fast), so `α` can start as a per-kind constant
+  before asking the model for it.
 - `rank_support` orders by `conversation_count`, not `citation_count`, and
   saturates: `log(1 + conversation_count)`. Two messages five turns apart in one
   session is usually the user rephrasing, not independent confirmation.
@@ -630,11 +685,19 @@ as corroboration: density measures how much was packed into one turn, not how we
 a claim is supported. Feeding it into `rank_support` would let a single verbose
 message outrank a claim independently confirmed across three conversations.
 
-**Diversity cap.** Because one message can support several fragments, an
+**Diversity via MMR.** Because one message can support several fragments, an
 unconstrained selection can fill the digest with claims all resting on the same
-turn. The model then sees one piece of evidence three times and weights it as
-three. Cap the number of selected fragments sharing any single citation — 2 is a
-reasonable start — applied after fusion, before the budget cut.
+turn — the model then sees one piece of evidence three times and weights it as
+three. Use Maximum Marginal Relevance rather than an ad-hoc cap:
+
+```
+MMR(dᵢ, S) = λ · r̃ᵢ − (1 − λ) · max sim(dᵢ, dⱼ)   for dⱼ ∈ S,   λ = 0.5
+```
+
+Select iteratively until the budget is reached. This is GUM's approach (§ 2.1),
+which makes it citable rather than invented, and it subsumes the shared-citation
+problem: fragments resting on the same message are textually similar, so the
+diversity term suppresses them without needing a separate rule.
 
 ---
 
@@ -648,13 +711,23 @@ reasonable start — applied after fusion, before the budget cut.
 | ⏸ 4 | Does `stable_core` get regenerated by an LLM summarisation pass, or is it just top-N fragment text? The former is truer compression; the latter has no failure mode. | § 2.2, NFR-CTX-01 |
 | ⏸ 5 | Backfill trigger. Chats predating the feature and failed extractions both need one; is it manual, on-move, or on-open? | § 2.1 |
 | ⏸ 7 | Does the extractor get told which messages it already cited for a candidate fragment? Without it, merge decisions may re-cite the same message — harmless (I-7 dedupes) but wasteful of prompt budget. | § 2.1 |
-| ⏸ 8 | Store an explicit `subject` next to `text`? It turns the merge/supersede subject match from a free-form model judgement into a comparison, and lets candidates be retrieved by subject rather than full-text BM25. Costs a column and one more thing for the extractor to get right. | § 2.1, § 1.1 |
+| ⏸ 9 | Replace `superseded_by` with a **confidence score** and GUM-style revision? Contradiction lowers confidence rather than evicting, which removes the false-supersede failure mode entirely. Counter-argument: chat memory records what was *said*, which is not very uncertain — confidence may sit near-constant and earn nothing. | § 2.1, § 1.1, § 2.3 |
+| ⏸ 10 | Adopt GUM's **reasoning trace before the claim**? They generate a rationale first, then the proposition, citing both explainability and accuracy. Costs tokens per extraction; would make the memory inspector able to show *why* a fragment exists. | § 2.1 |
+| ⏸ 11 | Is `α` (decay rate) a per-`kind` constant or model-generated per fragment? Per-kind is free and has no failure mode; model-generated is more expressive and is what GUM does. | § 6 |
+| ✔ 8 | *Resolved.* Subject matching is a vector comparison over fragment embeddings, following GUM's retrieve-then-rerank. The pipeline is intended to generalise later to persona artefact extraction — separate store, shared machinery, per I-6. | § 2.1 |
 | ✔ 6 | *Resolved.* Open decision #4 in `requirements.md` — memory and the persona/profile store are **separate mechanisms** sharing storage primitives only. Fold this back into `requirements.md`. | — |
 
 ---
 
 ## Changelog
 
+- **2026-08-10** — v3. Aligned the write path with Shaikh et al.'s GUM pipeline
+  (UIST '25). Resolved § 7 #8: subject matching is a vector comparison, following
+  their retrieve-then-rerank, with the pipeline intended to generalise later to
+  persona extraction. Added batched extraction on a configurable turn count with a
+  mandatory flush on switch/close. Replaced the ad-hoc diversity cap with MMR and
+  the recency ordinal with per-fragment decay. Recorded that GUM's Audit step is a
+  privacy gate and is deliberately dropped here. New parked items #9–#11.
 - **2026-08-10** — v2.2. Specified what new/merge/supersede are actually decided
   on — § 2.1 had the writes but never the judgement. Added the fourth outcome
   (`ignore`, the common case), a decision flowchart, the error-cost asymmetry that
