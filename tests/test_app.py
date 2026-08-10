@@ -15,7 +15,7 @@ from agentchat.config import Settings
 from agentchat.core.errors import StorageError
 from agentchat.core.models import Conversation, Message
 from agentchat.ui.app import ChatApp
-from agentchat.ui.screens import ConfirmModal, ConversationPicker
+from agentchat.ui.screens import ConversationPicker
 from agentchat.ui.widgets import MessageBubble
 
 
@@ -168,12 +168,7 @@ async def test_switch_to_restores_conversation_history():
     app = ChatApp(mock_settings())
     async with app.run_test() as pilot:
         await _submit(pilot, "hello")
-
-        for _ in range(200):
-            await pilot.pause()
-            if not app._generating:
-                break
-            await asyncio.sleep(0.05)
+        await _wait_until_done(pilot, app)
 
         first_id = app.conversation.id
 
@@ -227,12 +222,7 @@ async def test_switching_cancels_running_generation_and_keeps_partial_reply():
         await app.chat.store.save(target)
 
         await app._switch_to(target.id)
-
-        for _ in range(60):
-            await pilot.pause()
-            if not app._generating:
-                break
-            await asyncio.sleep(0.05)
+        await _wait_until_done(pilot, app)
 
         assert not app._generating
         assert app.conversation.id == target.id
@@ -377,7 +367,7 @@ async def test_picker_marks_the_active_conversation_row():
         assert len(current_rows) == 1
 
 
-async def test_ctrl_x_on_highlighted_conversation_deletes_after_confirmation():
+async def test_ctrl_x_shows_inline_confirm_and_y_deletes():
     app = ChatApp(mock_settings())
     async with app.run_test() as pilot:
         await _submit(pilot, "first")
@@ -396,11 +386,13 @@ async def test_ctrl_x_on_highlighted_conversation_deletes_after_confirmation():
         # Index 0 is the current ("second") conversation; move to "first".
         await pilot.press("down")
         await pilot.press("ctrl+x")
-        await _wait_for_screen(pilot, app, ConfirmModal)
+        await pilot.pause()
 
-        # Cancel is focused by default; Tab reaches Delete.
-        await pilot.press("tab")
-        await pilot.press("enter")
+        hint = app.screen.query_one("#picker-hint")
+        assert "y confirms" in hint.content
+        assert hint.has_class("-confirming")
+
+        await pilot.press("y")
         await _wait_for_screen(pilot, app, ConversationPicker)
 
         remaining = await app.chat.list_conversations()
@@ -413,7 +405,7 @@ async def test_ctrl_x_on_highlighted_conversation_deletes_after_confirmation():
         await pilot.pause()
 
 
-async def test_ctrl_x_cancel_leaves_conversation_in_store_and_reopens_picker():
+async def test_ctrl_x_any_other_key_cancels_and_leaves_conversation_in_store():
     app = ChatApp(mock_settings())
     async with app.run_test() as pilot:
         await _submit(pilot, "first")
@@ -430,11 +422,16 @@ async def test_ctrl_x_cancel_leaves_conversation_in_store_and_reopens_picker():
 
         await pilot.press("down")
         await pilot.press("ctrl+x")
-        await _wait_for_screen(pilot, app, ConfirmModal)
+        await pilot.pause()
 
-        # Cancel is already focused: a bare Enter must be the safe choice.
+        # A stray Enter (or anything but "y") must be the safe choice.
         await pilot.press("enter")
-        await _wait_for_screen(pilot, app, ConversationPicker)
+        await pilot.pause()
+
+        hint = app.screen.query_one("#picker-hint")
+        assert "y confirms" not in hint.content
+        assert not hint.has_class("-confirming")
+        assert isinstance(app.screen, ConversationPicker)
 
         remaining = await app.chat.list_conversations()
         assert first_id in {c.id for c in remaining}
@@ -460,6 +457,8 @@ async def test_ctrl_x_on_new_conversation_row_does_nothing():
         await pilot.pause()
 
         assert isinstance(app.screen, ConversationPicker)
+        hint = app.screen.query_one("#picker-hint")
+        assert "y confirms" not in hint.content
 
         await pilot.press("escape")
         await pilot.pause()
@@ -483,9 +482,8 @@ async def test_deleting_active_conversation_switches_to_most_recent_remaining():
 
         # Index 0 is the current ("second") conversation — delete it.
         await pilot.press("ctrl+x")
-        await _wait_for_screen(pilot, app, ConfirmModal)
-        await pilot.press("tab")
-        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("y")
 
         for _ in range(60):
             await pilot.pause()
@@ -514,9 +512,8 @@ async def test_deleting_only_conversation_leaves_fresh_empty_state_without_resur
         await _wait_for_screen(pilot, app, ConversationPicker)
 
         await pilot.press("ctrl+x")
-        await _wait_for_screen(pilot, app, ConfirmModal)
-        await pilot.press("tab")
-        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("y")
 
         for _ in range(60):
             await pilot.pause()
@@ -534,27 +531,6 @@ async def test_deleting_only_conversation_leaves_fresh_empty_state_without_resur
         remaining = await app.chat.list_conversations()
         assert remaining == []
         assert await app.chat.store.load(only_id) is None
-
-
-async def test_confirm_modal_opens_with_cancel_focused():
-    app = ChatApp(mock_settings())
-    async with app.run_test() as pilot:
-        await _submit(pilot, "hello")
-        await _wait_until_done(pilot, app)
-
-        await pilot.press("ctrl+l")
-        await _wait_for_screen(pilot, app, ConversationPicker)
-
-        await pilot.press("ctrl+x")
-        await _wait_for_screen(pilot, app, ConfirmModal)
-
-        modal = app.screen
-        assert modal.query_one("#confirm-cancel").has_focus
-
-        await pilot.press("escape")
-        await pilot.pause()
-        await pilot.press("escape")
-        await pilot.pause()
 
 
 async def test_delete_conversation_storage_error_notifies_and_keeps_running():
@@ -578,11 +554,11 @@ async def test_delete_conversation_storage_error_notifies_and_keeps_running():
 
         await pilot.press("down")
         await pilot.press("ctrl+x")
-        await _wait_for_screen(pilot, app, ConfirmModal)
-        await pilot.press("tab")
-        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("y")
+        await pilot.pause()
 
-        await _wait_for_screen(pilot, app, ConversationPicker)
+        assert isinstance(app.screen, ConversationPicker)
         assert app.is_running
 
         await pilot.press("escape")

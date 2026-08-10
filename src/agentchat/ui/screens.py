@@ -5,11 +5,12 @@ from __future__ import annotations
 
 from typing import Literal
 
+from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, ListItem, ListView, Static
+from textual.widgets import ListItem, ListView, Static
 
 from agentchat.core.models import Conversation
 
@@ -17,10 +18,16 @@ from agentchat.core.models import Conversation
 PickerResult = tuple[Literal["switch", "new", "delete"], str | None]
 
 _NEW_CONVERSATION_ID = "__new__"
+_HINT = "enter switch · ctrl+x delete · esc cancel"
 
 
 class ConversationPicker(ModalScreen[PickerResult | None]):
-    """Overview of saved conversations; Enter switches, Escape cancels."""
+    """Overview of saved conversations; Enter switches, Escape cancels.
+
+    Delete asks inline, in the hint line, rather than opening a second modal:
+    Ctrl+X on a row replaces the hint with a "delete this?" prompt that only
+    "y" confirms — any other key backs out, so a stray keypress can't delete.
+    """
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
@@ -31,6 +38,7 @@ class ConversationPicker(ModalScreen[PickerResult | None]):
         super().__init__()
         self._conversations = conversations
         self._current_id = current_id
+        self._confirm_delete_id: str | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="picker"):
@@ -46,9 +54,7 @@ class ConversationPicker(ModalScreen[PickerResult | None]):
                     )
                 )
                 yield ListView(*items)
-            yield Static(
-                "enter switch · ctrl+x delete · esc cancel", classes="picker__hint"
-            )
+            yield Static(_HINT, classes="picker__hint", id="picker-hint")
 
     def _item_for(self, conversation: Conversation) -> ListItem:
         classes = "picker__item"
@@ -86,31 +92,30 @@ class ConversationPicker(ModalScreen[PickerResult | None]):
         item = list_views.first().highlighted_child
         if item is None or item.id == _NEW_CONVERSATION_ID:
             return
-        self.dismiss(("delete", item.conversation_id))
+        conversation = next(
+            (c for c in self._conversations if c.id == item.conversation_id), None
+        )
+        title = conversation.title if conversation is not None else "this conversation"
+        self._confirm_delete_id = item.conversation_id
+        self._set_hint(
+            f'Delete "{title}"? y confirms — any other key cancels', confirming=True
+        )
 
+    def on_key(self, event: events.Key) -> None:
+        """While a delete is pending, this screen's own bindings (Escape,
+        Ctrl+X) must not fire — stopping the event here keeps it from
+        reaching the app's binding resolution, so only "y" can confirm."""
+        if self._confirm_delete_id is None:
+            return
+        event.stop()
+        event.prevent_default()
+        confirm_id = self._confirm_delete_id
+        self._confirm_delete_id = None
+        self._set_hint(_HINT)
+        if event.key == "y":
+            self.dismiss(("delete", confirm_id))
 
-class ConfirmModal(ModalScreen[bool]):
-    """Yes/no confirmation; Cancel is focused by default so a stray Enter
-    is safe."""
-
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
-
-    def __init__(self, prompt: str) -> None:
-        super().__init__()
-        self._prompt = prompt
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="confirm"):
-            yield Static(self._prompt, classes="confirm__prompt")
-            with Horizontal(classes="confirm__buttons"):
-                yield Button("Delete", id="confirm-delete", variant="error")
-                yield Button("Cancel", id="confirm-cancel")
-
-    def on_mount(self) -> None:
-        self.query_one("#confirm-cancel", Button).focus()
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id == "confirm-delete")
-
-    def action_cancel(self) -> None:
-        self.dismiss(False)
+    def _set_hint(self, text: str, *, confirming: bool = False) -> None:
+        hint = self.query_one("#picker-hint", Static)
+        hint.set_class(confirming, "-confirming")
+        hint.update(text)

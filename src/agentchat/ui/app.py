@@ -20,7 +20,7 @@ from agentchat.core.chat import ChatService
 from agentchat.core.errors import AgentChatError, ModelNotFoundError
 from agentchat.core.models import Conversation, Message
 from agentchat.llm.base import GenerationOptions
-from agentchat.ui.screens import ConfirmModal, ConversationPicker
+from agentchat.ui.screens import ConversationPicker
 from agentchat.ui.widgets import MessageBubble
 
 _GENERATION_GROUP = "generation"
@@ -124,16 +124,8 @@ class ChatApp(App[None]):
             if action == "new":
                 await self.action_new_conversation()
                 return
-            # action == "delete"
-            title = next(
-                (c.title for c in conversations if c.id == conversation_id),
-                "this conversation",
-            )
-            confirmed = await self.push_screen_wait(
-                ConfirmModal(f"Delete “{title}”?")
-            )
-            if not confirmed:
-                continue
+            # action == "delete" — the picker already confirmed inline
+            # before dismissing, so no second confirmation here.
             try:
                 await self.chat.delete_conversation(conversation_id)
             except AgentChatError as error:
