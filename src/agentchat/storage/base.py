@@ -7,6 +7,12 @@ from typing import Protocol
 from agentchat.core.models import Conversation
 
 
+def by_recency(conversations: list[Conversation]) -> list[Conversation]:
+    """Most-recently-updated first — the ordering every `ConversationStore`
+    implementation's `list_conversations` promises."""
+    return sorted(conversations, key=lambda c: c.updated_at, reverse=True)
+
+
 class ConversationStore(Protocol):
     async def list_conversations(self, group_id: str | None = None) -> list[Conversation]:
         """Most-recently-updated first, optionally scoped to a project folder."""
@@ -35,7 +41,7 @@ class InMemoryStore:
             for c in self._items.values()
             if group_id is None or c.group_id == group_id
         ]
-        return sorted(items, key=lambda c: c.updated_at, reverse=True)
+        return by_recency(items)
 
     async def load(self, conversation_id: str) -> Conversation | None:
         return self._items.get(conversation_id)

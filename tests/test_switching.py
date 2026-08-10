@@ -95,8 +95,8 @@ async def test_switch_conversation_resets_last_turn():
     async for _ in chat.stream_reply(a, "hello"):
         pass
     assert chat.last_turn is not None
-    # b must exist in the store before it can be switched to (KTD3: empty
-    # conversations are never persisted).
+    # b must exist in the store before it can be switched to — empty
+    # conversations are never persisted.
     async for _ in chat.stream_reply(b, "hi"):
         pass
 

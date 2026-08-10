@@ -103,13 +103,17 @@ class Settings:
         return cls()
 
 
+def _require_choice(var_name: str, value: str, choices: tuple[str, ...]) -> None:
+    if value not in choices:
+        raise ConfigurationError(
+            f"Unknown {ENV_PREFIX}{var_name} {value!r} — "
+            f"expected one of {', '.join(choices)}"
+        )
+
+
 def build_registry(settings: Settings) -> ModelRegistry:
     """Populate the registry. The only place backends are named."""
-    if settings.backend not in BACKENDS:
-        raise ConfigurationError(
-            f"Unknown {ENV_PREFIX}BACKEND {settings.backend!r} — "
-            f"expected one of {', '.join(BACKENDS)}"
-        )
+    _require_choice("BACKEND", settings.backend, BACKENDS)
 
     registry = ModelRegistry()
     if settings.backend == "mock":
@@ -124,11 +128,7 @@ def build_registry(settings: Settings) -> ModelRegistry:
 
 def build_store(settings: Settings) -> ConversationStore:
     """Assemble the conversation store. The only place stores are named."""
-    if settings.store not in STORES:
-        raise ConfigurationError(
-            f"Unknown {ENV_PREFIX}STORE {settings.store!r} — "
-            f"expected one of {', '.join(STORES)}"
-        )
+    _require_choice("STORE", settings.store, STORES)
     if settings.store == "memory":
         return InMemoryStore()
     return SqliteStore(settings.data_dir / "agentchat.db")

@@ -15,6 +15,7 @@ from pathlib import Path
 
 from agentchat.core.errors import StorageError
 from agentchat.core.models import Conversation, Message
+from agentchat.storage.base import by_recency
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -79,7 +80,7 @@ class SqliteStore:
         except sqlite3.Error as exc:
             raise StorageError("failed to list conversations") from exc
         items = [c for c in items if c is not None]
-        return sorted(items, key=lambda c: c.updated_at, reverse=True)
+        return by_recency(items)
 
     def _load(self, conversation_id: str) -> Conversation | None:
         try:
