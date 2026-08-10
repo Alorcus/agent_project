@@ -1,8 +1,9 @@
 """Runtime configuration and app assembly.
 
 Config is externalised via environment variables, optionally loaded from a
-``.env`` file. ``build_registry`` is the single wiring point: which backend
-the app talks to is decided here and nowhere else.
+``.env`` file. ``build_registry`` and ``build_store`` are the single wiring
+points: which backend and which store the app uses are decided here and
+nowhere else.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ from agentchat.llm.local import default_models as local_models
 from agentchat.llm.mock import MockProvider
 from agentchat.llm.mock import default_models as mock_models
 from agentchat.llm.registry import ModelRegistry
+from agentchat.storage.base import ConversationStore, InMemoryStore
+from agentchat.storage.sqlite import SqliteStore
 
 ENV_PREFIX = "AGENTCHAT_"
 
@@ -31,6 +34,10 @@ load_dotenv(find_dotenv(usecwd=True))
 #: ``local`` runs the real checkpoints; ``mock`` is the stub backend, kept so the
 #: UI can be developed and tested on a machine with no GPU.
 BACKENDS = ("local", "mock")
+
+#: ``sqlite`` persists across restarts; ``memory`` is the non-durable stub,
+#: kept for tests and for working without touching disk.
+STORES = ("sqlite", "memory")
 
 
 class ConfigurationError(AgentChatError):
@@ -72,6 +79,10 @@ class Settings:
     backend: str = field(
         default_factory=lambda: (_env("BACKEND", "local") or "local").strip().lower()
     )
+    #: Which store to assemble — see ``STORES``.
+    store: str = field(
+        default_factory=lambda: (_env("STORE", "sqlite") or "sqlite").strip().lower()
+    )
     #: Root of the checkpoint tree the local backend loads from.
     model_root: Path = field(
         default_factory=lambda: Path(
@@ -109,6 +120,18 @@ def build_registry(settings: Settings) -> ModelRegistry:
     if settings.default_model:
         registry.set_active(settings.default_model)  # raises if unknown
     return registry
+
+
+def build_store(settings: Settings) -> ConversationStore:
+    """Assemble the conversation store. The only place stores are named."""
+    if settings.store not in STORES:
+        raise ConfigurationError(
+            f"Unknown {ENV_PREFIX}STORE {settings.store!r} — "
+            f"expected one of {', '.join(STORES)}"
+        )
+    if settings.store == "memory":
+        return InMemoryStore()
+    return SqliteStore(settings.data_dir / "agentchat.db")
 
 
 def _register_local(registry: ModelRegistry, settings: Settings) -> None:

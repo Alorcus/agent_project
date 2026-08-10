@@ -21,6 +21,9 @@ def mock_settings(**overrides) -> Settings:
     models; these tests are about the interface, not about inference, and must
     run without a GPU."""
     overrides.setdefault("backend", "mock")
+    # Without this every app test writes a real ./data/agentchat.db as a
+    # side effect.
+    overrides.setdefault("store", "memory")
     return Settings(**overrides)
 
 

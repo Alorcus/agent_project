@@ -4,13 +4,15 @@ import asyncio
 
 import pytest
 
-from agentchat.config import Settings, build_registry
+from agentchat.config import ConfigurationError, Settings, build_registry, build_store
 from agentchat.core.chat import ChatService
 from agentchat.core.context import RecencyWindowStrategy
 from agentchat.core.errors import ModelNotFoundError, ProviderError
 from agentchat.core.models import Conversation, Message
 from agentchat.llm.base import GenerationOptions, ModelInfo
 from agentchat.llm.mock import MockProvider
+from agentchat.storage.base import InMemoryStore
+from agentchat.storage.sqlite import SqliteStore
 
 
 def fast_registry(**overrides):
@@ -153,3 +155,20 @@ async def test_store_scopes_listing_by_group():
     await chat.store.save(Conversation(group_id="g2"))
     assert len(await chat.store.list_conversations("g1")) == 1
     assert len(await chat.store.list_conversations()) == 2
+
+
+def test_build_store_memory_returns_in_memory_store():
+    store = build_store(Settings(backend="mock", store="memory"))
+    assert isinstance(store, InMemoryStore)
+
+
+def test_build_store_sqlite_returns_sqlite_store_and_creates_parent(tmp_path):
+    data_dir = tmp_path / "nested"
+    store = build_store(Settings(backend="mock", store="sqlite", data_dir=data_dir))
+    assert isinstance(store, SqliteStore)
+    assert data_dir.exists()
+
+
+def test_build_store_unknown_raises_configuration_error():
+    with pytest.raises(ConfigurationError):
+        build_store(Settings(backend="mock", store="nope"))
