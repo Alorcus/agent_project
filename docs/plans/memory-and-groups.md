@@ -1,6 +1,6 @@
 # Memory & Groups — implementation model
 
-**Status: v3 — write path aligned with the GUM pipeline (Shaikh et al., UIST '25).**
+**Status: v4 — confidence-based revision, immutable group binding, memory hierarchy.**
 **Stage: prototype, single user. Schema changes are free; see "Relationship to plan 001".**
 
 Scope: the **chat memory mechanism** (NFR-S-02) and the **grouping** it is scoped
@@ -54,9 +54,10 @@ erDiagram
     GROUPS ||--o{ CONVERSATIONS : contains
     CONVERSATIONS ||--o{ MESSAGES : holds
     CONVERSATIONS ||--o{ MEMORY_FRAGMENTS : originates
+    GROUPS ||--o{ MEMORY_FRAGMENTS : scopes
     MEMORY_FRAGMENTS ||--o{ FRAGMENT_CITATIONS : cites
-    MESSAGES ||--o{ FRAGMENT_CITATIONS : "is cited by"
-    MEMORY_FRAGMENTS ||--o| MEMORY_FRAGMENTS : superseded_by
+    MESSAGES ||--o{ FRAGMENT_CITATIONS : "cited as leaf"
+    MEMORY_FRAGMENTS ||--o{ FRAGMENT_CITATIONS : "cited as inner node"
 
     GROUPS {
         text id PK
@@ -67,7 +68,7 @@ erDiagram
     CONVERSATIONS {
         text id PK
         text title
-        text group_id FK "NOT NULL, RESTRICT"
+        text group_id FK "NOT NULL, immutable, RESTRICT"
         text created_at
         text updated_at
     }
@@ -82,21 +83,69 @@ erDiagram
     MEMORY_FRAGMENTS {
         int id PK "rowid, for FTS5"
         text uuid UK
-        text conversation_id FK "origin, CASCADE"
+        text group_id FK "the scope — NOT NULL"
+        text origin_conversation_id FK "provenance hint only, SET NULL"
+        int height "messages are 0, fragments 1 and up"
         text kind "fact decision constraint open_question artefact"
-        text text "self-contained claim, pronouns resolved"
-        real salience "matters to later turns in this project"
-        int superseded_by FK "nullable, SET NULL"
-        blob embedding "nullable"
+        text text "self-contained claim, rewritten on revision"
+        real confidence "0-1, revised. 0 = dormant, never evicted"
+        real decay "alpha — per-fragment staleness rate"
+        real salience
+        blob embedding
+        text reasoning "nullable — only when thinking mode was on"
         text created_at
+        text revised_at
     }
     FRAGMENT_CITATIONS {
-        int fragment_id PK "CASCADE"
-        text message_id PK "CASCADE"
-        text observed_at "copy of the message timestamp"
+        int id PK "surrogate"
+        int fragment_id FK "CASCADE"
+        text source_message_id FK "nullable, CASCADE"
+        int source_fragment_id FK "nullable, CASCADE"
+        text observed_at
         text quote "nullable, the supporting span"
     }
 ```
+
+## 1.1.1 The memory hierarchy
+
+Citations are polymorphic: a fragment cites **either** a message **or** a
+lower-height fragment. `CHECK` enforces exactly one of the two source columns is
+non-null. Messages are leaves at height 0; fragments are inner nodes.
+
+```mermaid
+flowchart BT
+    m1["message · h=0"]
+    m2["message · h=0"]
+    m3["message · h=0"]
+    f1["fragment · h=1<br/>we chose SQLite for storage"]
+    f2["fragment · h=1<br/>WAL, single writer"]
+    f3["fragment · h=2<br/>the storage approach is settled"]
+    m1 --> f1
+    m2 --> f1
+    m2 --> f2
+    m3 --> f2
+    f1 --> f3
+    f2 --> f3
+```
+
+**monotonic id ordering.** A fragment may only cite nodes with a
+strictly smaller creation id. Since ids are assigned monotonically, creation
+satisfies this automatically and revision needs one comparison. No column, no
+maintenance, no recomputation, and it is a total order so it is strictly stronger
+than needed — which costs nothing, because nothing wants to cite *forward* in time
+anyway.
+
+- **The orphan sweep is transitive.** Deleting a message can sweep the fragments
+  resting on it, which can sweep the fragments resting on *those*. Iterate to a
+  fixpoint (or one recursive CTE), not a single pass.
+- **`stable_core` is the consolidated layer** rather than an ephemeral
+  summarisation pass — which resolves § 7 #4 regardless of how the layer is
+  identified.
+
+Because `source_message_id` and `source_fragment_id` are nullable, a composite
+primary key would not dedupe (SQLite treats NULLs as distinct in unique indexes).
+I-7 is therefore enforced by two partial unique indexes — one per source column,
+each `WHERE … IS NOT NULL` — over a surrogate key.
 
 `FRAGMENT_CITATIONS` is an **associative entity resolving a many-to-many**: one
 message can support many fragments, and one fragment can cite many messages. The
@@ -125,17 +174,30 @@ Plus a derived view and an FTS index, which carry no state of their own:
 
 **Two modelling rules the diagram encodes.**
 
-*Derive what is mutable, copy what is immutable.* `group_id` is **not** on the
-fragment — group membership changes on every move, so a copy would drift, and
-deriving it by JOIN makes moving a chat a single-row UPDATE. `observed_at` **is**
-copied onto the citation row — a message timestamp never changes, so the copy is
-safe, and it keeps ranking queries off the `messages` table.
+*Derive what is mutable, copy what is immutable.* `observed_at` is copied onto the
+citation row because a message timestamp never changes. As of v4, `group_id` is
+copied onto the fragment **for the same reason** — a conversation is bound to its
+group for life (§ 2.5), so membership is now immutable and the copy cannot drift.
 
-*Origin versus evidence.* `conversation_id` is the conversation where the claim
-first appeared. It fixes the group and owns the cascade. `fragment_citations` is
-every message supporting the claim, possibly in other conversations of the same
-group — that cross-conversation corroboration is the signal worth having, and
-§ 2.4 / § 2.5 handle what it costs.
+This reverses v1, which derived `group_id` by JOIN precisely because chats could
+move. Two v4 decisions force the change together: immutable binding makes the copy
+*safe*, and the hierarchy makes it *necessary* — a fragment at h ≥ 2 consolidating
+claims from four conversations has no meaningful origin conversation, so
+`conversation_id` cannot carry scope at every height. `group_id` is now the only
+scope key that works for all fragments.
+
+*Scope versus provenance versus evidence.* Three distinct jobs that v1 conflated
+into `conversation_id`:
+
+| Column | Job |
+|---|---|
+| `group_id` | the scope. What NFR-S-02 bounds recall by. NOT NULL at every height. |
+| `origin_conversation_id` | provenance hint for the UI — "this started in *Picker rewrite*". Nullable, `SET NULL` on delete, carries no cascade. |
+| `fragment_citations` | the evidence. What the fragment lives or dies by (I-4). |
+
+Splitting them is what lets § 2.4 drop the re-homing step: the cascade runs through
+citations, so a fragment survives exactly when it still has evidence, rather than
+because someone repointed an ownership column.
 
 ## 1.2 Module placement
 
@@ -154,8 +216,9 @@ flowchart TD
         chat["chat.py<br/>turn orchestration"]
         ctx["context.py<br/>ContextStrategy, ContextDecision"]
         strat["memory/strategy.py<br/>GroupMemoryStrategy"]
-        extract["memory/extract.py<br/>merge / supersede / new"]
-        rank["memory/rank.py<br/>rank fusion, diversity cap"]
+        extract["memory/extract.py<br/>new / reinforce / revise"]
+        consol["memory/consolidate.py<br/>builds higher fragments"]
+        rank["memory/rank.py<br/>rank fusion, decay, MMR"]
     end
 
     subgraph STORAGE["storage/"]
@@ -180,6 +243,8 @@ flowchart TD
     strat --> mstore
     extract --> mstore
     extract --> prov
+    consol --> mstore
+    consol --> prov
     cstore --> db
     mstore --> db
 ```
@@ -217,17 +282,22 @@ classDiagram
     class MemoryFragment {
         +id: int
         +uuid: str
-        +conversation_id: str
+        +group_id: str
+        +origin_conversation_id: str
+        +height: int
         +kind: FragmentKind
         +text: str
+        +confidence: float
+        +decay: float
         +salience: float
-        +superseded_by: int
+        +reasoning: str
         +embedding: bytes
     }
 
     class FragmentCitation {
         +fragment_id: int
-        +message_id: str
+        +source_message_id: str
+        +source_fragment_id: int
         +observed_at: datetime
         +quote: str
     }
@@ -274,25 +344,28 @@ classDiagram
     }
 
     Group "1" o-- "0..*" Conversation
+    Group "1" o-- "0..*" MemoryFragment : scopes
     Conversation "1" o-- "0..*" Message
-    Conversation "1" o-- "0..*" MemoryFragment : origin
+    Conversation "1" ..> "0..*" MemoryFragment : provenance hint
     MemoryFragment "1" o-- "0..*" FragmentCitation
-    Message "1" o-- "0..*" FragmentCitation
+    Message "1" o-- "0..*" FragmentCitation : as leaf
+    MemoryFragment "1" o-- "0..*" FragmentCitation : as lower node
     MemoryFragment "1" -- "1" FragmentSupport : derived
-    MemoryFragment ..> MemoryFragment : superseded_by
     ContextStrategy <|.. RecencyWindowStrategy
     ContextStrategy <|.. GroupMemoryStrategy
     GroupMemoryStrategy o-- RecencyWindowStrategy : wraps
     GroupMemoryStrategy --> MemoryStore
 ```
 
-`FragmentCitation` hangs off **both** `MemoryFragment` and `Message` — that pair of
-edges is the many-to-many. Neither parent owns it.
+`FragmentCitation` hangs off `MemoryFragment` **and** off either a `Message` or a
+lower-height `MemoryFragment` — that is the polymorphic many-to-many of § 1.1.1.
+No parent owns it.
 
-`superseded_by`, `embedding`, `quote` and `model_id` are nullable; Mermaid has no
-notation for it. `ContextDecision.recalled` is the one addition to the existing
-dataclass — without it the UI cannot show what memory contributed, which
-NFR-CTX-05 asks for.
+`origin_conversation_id`, `reasoning`, `embedding`, `quote`, `source_message_id`,
+`source_fragment_id` and `model_id` are nullable; Mermaid has no notation for it.
+`ContextDecision.recalled` is the one addition to the existing dataclass — without
+it the UI cannot show what memory contributed, which NFR-CTX-05 asks for and § 8
+designs.
 
 ---
 
@@ -326,17 +399,20 @@ sequenceDiagram
         Store->>Store: BM25 over memory_fts, scoped to group
         Store-->>Ex: k candidate fragments
 
-        Ex->>LLM: decide(new turns, candidates)
+        Ex->>LLM: decide(new turns, candidates, thinking?)
         LLM-->>Ex: zero or more resolved claims
         Note over Ex: one turn may yield several claims,<br/>and one message may be cited by several
 
         loop per claim
-            alt new
-                Ex->>Store: insert(fragment) plus citation rows
-            else merge
-                Ex->>Store: cite(fragment_id, message_ids, quote)
-            else supersede
-                Ex->>Store: insert(new) then set superseded_by(old)
+            alt unrelated — NEW
+                Ex->>Store: insert(fragment, h=1) plus citation rows
+            else identical — REINFORCE
+                Ex->>Store: cite(...) and raise confidence
+                Note over Ex: no rewrite — text is already right
+            else similar — REVISE
+                Ex->>LLM: rewrite(old, new claim)
+                LLM-->>Ex: revised text plus confidence
+                Ex->>Store: update(text, confidence, revised_at) plus citations
             else ignore
                 Note over Ex: nothing worth remembering.<br/>The common case — no row is written.
             end
@@ -346,9 +422,8 @@ sequenceDiagram
     end
 ```
 
-One LLM call resolves every claim. New, merge and supersede are the same judgement
-over the same candidates, so splitting them into separate passes would multiply
-the cost for nothing.
+One LLM call resolves every claim against its candidates; only the `revise` branch
+pays a second call, because only it rewrites text.
 
 ### When extraction runs
 
@@ -368,48 +443,69 @@ from a five-turn window cite every message that supports it.
 
 ### What the four outcomes are decided on
 
-Extraction is two steps. First, pull candidate **claims** out of the new turn.
-Then resolve each claim against the fragments BM25 retrieved from the same group.
-The branch is per claim — a turn can produce several, or none at all.
+Extraction is two steps. First, pull candidate **claims** out of the new turns.
+Then resolve each claim against the fragments retrieved from the same group by
+embedding similarity. The branch is per claim — a batch can produce several, or
+none at all.
 
 ```mermaid
 flowchart TD
-    turn["new turn"] --> claims["extract candidate claims"]
+    turn["new turns since last extraction"] --> claims["extract candidate claims"]
     claims --> q0{"worth remembering<br/>beyond this turn?"}
     q0 -->|no| ignore["IGNORE<br/>no row written"]
-    q0 -->|yes| match{"does a retrieved candidate<br/>share this claim's subject?"}
-    match -->|no| new["NEW<br/>insert fragment, cite messages"]
-    match -->|yes| compat{"does it assert<br/>something compatible?"}
-    compat -->|compatible| merge["MERGE<br/>add citation to the existing fragment"]
-    compat -->|conflicts| sup["SUPERSEDE<br/>insert new, mark old superseded_by"]
-    compat -->|unclear| new
+    q0 -->|yes| match{"nearest fragment by embedding —<br/>how related?"}
+    match -->|unrelated| new["NEW<br/>insert at h=1, cite messages"]
+    match -->|identical| reinforce["REINFORCE<br/>add citation, raise confidence,<br/>text unchanged"]
+    match -->|similar| revise["REVISE<br/>rewrite text, recompute confidence,<br/>add citation"]
+    match -->|unclear| new
 ```
 
-Merge and supersede both require a **subject match** and differ only on whether
-the predicates agree. "Database choice → SQLite" said again in another chat is a
-merge; "database choice → Postgres" is a supersede.
+These are GUM's three reranker labels — *unrelated / identical / similar* — plus
+`ignore`. **There is no supersede.** A contradiction is a `similar` match whose
+revision lowers confidence; nothing is evicted. Confidence-0 fragments stay in the
+table and simply stop surfacing.
 
-**The three errors do not cost the same**, which is why the unclear edge routes to
-`new`:
+**Why `identical` does not rewrite.** GUM rewrites on every revision. Here, a claim
+restated verbatim in another chat has nothing to add to the text, and repeated
+LLM rewrites of the same sentence drift semantically — each rewrite is a lossy
+re-encoding, and twenty of them compound. Reinforcement therefore only touches
+confidence and citations, which also keeps `memory_fts` from re-indexing on every
+corroboration.
+
+**The errors no longer cost the same, and the worst one is gone:**
 
 | Error | Consequence | Recoverable |
 |---|---|---|
-| false `new` | a duplicate fragment | yes — a later merge can absorb it |
-| false `merge` | two distinct claims collapsed under one text | partly — the citation is wrong but visible |
-| false `supersede` | a true claim silently leaves the digest | only by inspecting superseded rows |
+| false `new` | a duplicate fragment | yes — a later revise can absorb it |
+| false `reinforce` | confidence inflated on a claim that wasn't really restated | yes — decays back |
+| false `revise` | two claims blended into one text | partly — old text is gone, citations remain |
 
-Two rules that fall out of this:
+Losing supersede removes the only outcome that silently dropped a true claim. The
+unclear edge still routes to `new`, since a duplicate is the cheapest mistake.
 
-- **At most one resolution per claim.** If several candidates match, take the
-  highest-ranked; do not emit a merge against each.
-- **Merge never rewrites fragment text.** Only a citation is added. Otherwise text
-  churns on every corroboration and `memory_fts` must re-index each time.
+**One rule survives:** at most one resolution per claim. If several candidates
+match, take the highest-ranked; do not revise against each.
 
-**Subject match is a vector comparison**, not a free-form judgement. Candidates are
-retrieved by embedding similarity over fragment text; the model is only asked the
-narrower question of whether the predicates agree. This follows GUM's reranker
-(below), which classifies retrieved propositions as *identical / similar /
-unrelated* — the same three-way split as merge / supersede / new.
+### Reasoning traces follow the thinking toggle
+
+GUM generates a rationale *before* each proposition, for explainability and
+accuracy. Here that is bound to the existing `Ctrl+T` thinking mode: when thinking
+is on, extraction generates a reasoning trace and stores it in
+`memory_fragments.reasoning`; when off, it goes straight to the claim and
+`reasoning` is null.
+
+This reuses whatever mechanism the generation path already uses per model — native
+via the chat template for `qwen3-14b`, prompted for `phi-4-mini` — rather than
+inventing a second one, and it fits NFR-U-08's principle that expensive modes are
+user-controlled.
+
+Two consequences to accept deliberately:
+
+- **Memory quality becomes coupled to a generation setting.** Someone toggling
+  thinking off for faster replies also degrades extraction, invisibly and in the
+  background. Worth surfacing in § 8's extraction indicator.
+- **The "why" display degrades with it.** Fragments captured with thinking off can
+  never explain themselves in the inspector, so the transcript will be mixed.
 
 ### Prior art: the GUM pipeline
 
@@ -426,23 +522,22 @@ closely enough to be worth following deliberately rather than reinventing.
 | **Audit** | *dropped* | a privacy gate answering Nissenbaum's contextual-integrity questions. Ours is memory over the user's own chats, so there is no third-party disclosure to gate. Becomes relevant again for the persona pipeline over Enron. |
 | **Propose** | claim extraction | GUM generates a reasoning trace *before* the proposition, then confidence, then decay |
 | **Retrieve** | `candidates()` | BM25 → LLM rerank as identical / similar / unrelated. Their footnote 5 explicitly sanctions swapping BM25 for neural embeddings |
-| **Revise** | merge / supersede | see the caveat below |
+| **Revise** | reinforce / revise | adopted in v4 — see below |
 
-**Where GUM is better than § 2.1 as drafted.** GUM has no hard supersede. Revise
-rewrites the proposition and regenerates its confidence — contradiction lowers it,
-reinforcement raises it — and nothing is ever evicted; confidence-0 propositions
-remain for transparency but are not surfaced by default. That dissolves the
-false-supersede failure named in the error table above, where one bad call
-silently drops a true claim out of the digest. See § 7 #9.
+**Adopted from GUM in v4.** No hard supersede: revision rewrites and regenerates
+confidence, contradiction lowers it, and nothing is ever evicted. Per-fragment
+decay (§ 6). MMR for diversity (§ 6). Reasoning traces (§ 2.1, gated on thinking
+mode). Propositions built on propositions — the hierarchy of § 1.1.1.
 
 **Where the analogy is weaker.** GUM *infers* about a user from indirect
 observation, so confidence carries real weight there. Chat memory mostly records
-what was explicitly said, and a claim the user stated outright is not uncertain.
-Decay is the more valuable import (§ 6); confidence may be close to constant here.
+what was explicitly said, and a claim the user stated outright is not uncertain —
+expect confidence to cluster high and do less work than it does for GUM. Its value
+here is mostly as the *mechanism* that replaces eviction, not as a signal.
 
-⏸ The default-group branch shown here does **no** extraction. The alternative —
-extract always, so moving a chat into a project carries its history instantly —
-costs GPU on throwaway chats. See § 7.
+The default-group branch does **no** extraction, and as of v4 that is settled
+rather than parked: a chat cannot later be filed into a project (§ 2.5), so
+fragments extracted from a default-group chat could never become reachable.
 
 ## 2.2 Read path — context assembly
 
@@ -470,10 +565,10 @@ sequenceDiagram
     else project group
         Store-->>GMS: group_id
         GMS->>Store: stable_core(group_id, core_budget)
-        Store-->>GMS: top-N by salience and recency, no query
+        Store-->>GMS: highest-height fragments, no query
         GMS->>Store: select(group_id, query=latest turn, sel_budget)
-        Store->>Store: fuse bm25, recency, support ranks
-        Store->>Store: apply diversity cap on shared citations
+        Store->>Store: fuse bm25, decay-adjusted recency, support
+        Store->>Store: MMR for diversity, drop confidence = 0
         Store-->>GMS: selected fragments
         GMS->>Inner: build(messages, remaining budget)
         Inner-->>GMS: ContextDecision
@@ -492,7 +587,7 @@ would invalidate the KV cache on every message.
 
 ```mermaid
 flowchart LR
-    A["system prompt"] --> B["stable group core<br/>salience + recency"]
+    A["system prompt"] --> B["stable group core<br/>highest-height fragments"]
     B --> C["conversation history<br/>from RecencyWindowStrategy"]
     C --> D["query-selected fragments"]
     D --> E["latest user turn"]
@@ -512,82 +607,103 @@ Two blocks, two jobs: the stable core is context **compression** (NFR-CTX-01), t
 query-selected block is context **selection by relevance** (NFR-CTX-03). Both are
 MUSTs, so both blocks are needed regardless of the cache argument.
 
+**Height splits them cleanly.** The stable core wants consolidated, general
+fragments — the h ≥ 2 layer, which literally *is* compression, built by folding
+lower nodes together. The query-selected block wants specific ones — the h = 1
+layer, closest to what was actually said. So the two blocks draw from different
+heights rather than competing for the same rows.
+
 ## 2.3 Fragment lifecycle
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Active : extraction emits new
+    [*] --> Live : extraction emits new
 
-    Active --> Active : extraction emits merge<br/>(one more citation)
-    Active --> Active : origin deleted but other citations survive<br/>(re-homed to a surviving conversation)
-    Active --> Superseded : a later claim contradicts it
+    Live --> Live : reinforce<br/>(citation added, confidence up)
+    Live --> Live : revise<br/>(text rewritten, confidence recomputed)
+    Live --> Live : consolidated into a higher fragment<br/>(still cited from above)
+    Live --> Dormant : revision drives confidence to 0
 
-    Superseded --> Superseded : retained for history
+    Dormant --> Live : a later claim revives it
 
-    Active --> [*] : last citation removed
-    Active --> [*] : origin deleted, no other citations
-    Active --> [*] : group deleted
-    Superseded --> [*] : last citation removed
+    Live --> [*] : last citation removed
+    Live --> [*] : group deleted
+    Dormant --> [*] : last citation removed
 
-    note right of Active
+    note right of Live
         enters the digest and
         is reachable by recall
     end note
 
-    note right of Superseded
-        excluded from the digest,
-        still reachable by explicit recall
+    note right of Dormant
+        confidence = 0. Retained for
+        transparency, not surfaced by
+        default, still inspectable.
     end note
 ```
 
-Deleting a single message can weaken many fragments at once and kill any that were
-resting on it alone — the many-to-many makes that a fan-out, which is why the
-orphan sweep in § 2.4 is a set operation rather than a per-fragment check.
+Dormancy replaces the v3 `Superseded` state. The difference that matters: it is
+**reversible and continuous** rather than a one-way flag, so a wrong call costs
+confidence rather than destroying a claim.
+
+Deleting one message can weaken many fragments at once and kill any resting on it
+alone. With the hierarchy that fan-out now propagates *upward* too — a swept h=1
+fragment can orphan the h=2 fragment built on it — which is why the sweep in § 2.4
+iterates to a fixpoint rather than running once.
 
 ## 2.4 Deleting a conversation
 
-The cascade alone no longer suffices, because a fragment may be corroborated by
-conversations that survive. Order matters and the whole thing is one transaction.
+Simpler than v3, because nothing owns a fragment any more. Deletion removes
+evidence; fragments die when they run out of it.
 
 ```mermaid
 flowchart TD
     start["delete conversation C"] --> tx["BEGIN"]
-    tx --> q1{"fragments originating in C<br/>with citations in other conversations?"}
-    q1 -->|yes| rehome["re-home: repoint conversation_id<br/>to a surviving cited conversation"]
-    q1 -->|no| del
-    rehome --> del["DELETE conversation C"]
-    del --> casc["cascade removes C's messages,<br/>its remaining fragments,<br/>and citations of C's messages"]
-    casc --> sweep["sweep fragments left with zero citations"]
-    sweep --> fts["rebuild affected memory_fts rows"]
+    tx --> del["DELETE conversation C"]
+    del --> casc["cascade removes C's messages<br/>and every citation of them"]
+    casc --> null["origin_conversation_id SET NULL<br/>on fragments that started in C"]
+    null --> sweep["sweep fragments with zero citations"]
+    sweep --> q1{"did the sweep orphan<br/>any higher fragment?"}
+    q1 -->|yes| sweep
+    q1 -->|no| fts["rebuild affected memory_fts rows"]
     fts --> commit["COMMIT"]
 ```
 
-Re-homing must happen **before** the delete, or the cascade removes the fragment
-first.
+**The re-homing step is gone.** v3 needed it because `conversation_id` owned the
+cascade, so deleting the origin conversation would take a still-corroborated
+fragment with it. Splitting scope (`group_id`) from provenance
+(`origin_conversation_id`) removes the problem at the source: the cascade now runs
+through citations only, and a fragment survives exactly when evidence for it
+survives.
 
-⚠ The re-homing step is a judgement call against NFR-S-04. A fragment corroborated
-in two other chats survives deletion of the chat that first said it: the reference
-to the deleted conversation is gone, but the claim persists. Reading it strictly,
-that surviving fragment is residue. Decide deliberately and state which reading
-was taken — this is a likely demo question. See § 7.
+That also settles ⚠ § 7 #2. The lenient reading is no longer a judgement call
+someone has to defend — it falls out of the model. "Every reference to the deleted
+conversation is removed, and claims still supported by surviving messages remain
+supported" is a sentence that answers NFR-S-04 directly.
 
-## 2.5 Moving a conversation between groups
+The loop is the one new cost: the hierarchy means a sweep can orphan the layer
+above, so it iterates to a fixpoint. One recursive CTE does it in a single
+statement.
 
-```mermaid
-flowchart TD
-    start["move conversation C into group G"] --> tx["BEGIN"]
-    tx --> upd["UPDATE conversations SET group_id = G"]
-    upd --> find["find citations on C's fragments<br/>pointing at messages now outside G"]
-    find --> q1{"any cross-group citations?"}
-    q1 -->|yes| drop["DELETE those citation rows"]
-    q1 -->|no| commit
-    drop --> sweep["sweep fragments left with zero citations"]
-    sweep --> commit["COMMIT"]
-```
+## 2.5 Conversations do not move between groups
 
-Because `group_id` is derived rather than stored on the fragment, the fragments
-follow the conversation with no write of their own. The second step exists only to
-enforce invariant I-3.
+A conversation is assigned to its group at creation and **bound to it for life**.
+There is no move operation, so v3's § 2.5 flowchart is deleted rather than revised.
+
+What this buys:
+
+- I-3 (citations stay inside the group) holds **by construction**. No pruning step,
+  no cross-group citation to detect.
+- `group_id` on the fragment becomes immutable and therefore safe to copy (§ 1.1).
+- § 7 #1 resolves: a default-group chat can never be promoted into a project, so
+  extracting fragments from one could never pay off.
+
+What it costs, stated plainly: **you cannot retroactively file a chat into a
+project.** Starting a conversation, realising three turns in that it belongs to an
+existing project, and moving it there is a thing both ChatGPT and Claude support
+and this design does not. The mitigation is at creation time — the new-conversation
+flow has to make the group choice obvious and cheap, because it is the only chance
+to get it right.
 
 ---
 
@@ -597,11 +713,14 @@ enforce invariant I-3.
 |---|---|---|
 | I-1 | Every conversation belongs to exactly one group. `group_id` is NOT NULL. | Schema |
 | I-2 | The default group is not a memory scope. Fragments never cross it. | `memory_scope()`, single decision point |
-| I-3 | A fragment's citations all lie within the fragment's own group. | § 2.5 pruning step |
-| I-4 | A fragment with zero citations does not exist. | Sweep in § 2.4 and § 2.5 |
+| I-3 | A fragment's citations all lie within the fragment's own group. | By construction — conversations never move (§ 2.5) |
+| I-4 | A fragment with zero citations does not exist. | Transitive sweep in § 2.4 |
 | I-5 | Fragment text is self-contained — no unresolved pronouns or references. | Extraction prompt; unenforceable in schema |
 | I-6 | Memory code never reads persona data, and persona code never reads fragments. | Package boundary; if they ever meet it is at prompt assembly, explicitly |
-| I-7 | A (fragment, message) pair is cited at most once. | Composite PK |
+| I-7 | A (fragment, source) pair is cited at most once. | Two partial unique indexes (§ 1.1.1) |
+| I-8 | The citation graph is acyclic. | § 1.1.1 — mechanism still open |
+| I-9 | A fragment cites either a message or a fragment, never both and never neither. | `CHECK` on the citation row |
+| I-10 | Confidence-0 fragments are retained, not deleted. | Sweep keys on citations only, never on confidence |
 
 I-2 is the one that earns its keep. Making the default group a real memory scope
 would pool every unrelated one-off chat into one invisible digest — a leak that is
@@ -616,9 +735,14 @@ worthless once detached from its turn, and nothing in the schema can catch it.
 
 | Decision | Requirement | Priority |
 |---|---|---|
-| Fragments scoped by group, resolved by JOIN | NFR-S-02 | MUST |
+| `group_id` on the fragment, immutable | NFR-S-02 | MUST |
 | Default group is not a memory scope (I-2) | NFR-CTX-02 | MUST |
-| Ordered delete transaction, orphan sweep | NFR-S-04 | SHOULD |
+| Transitive orphan sweep; fragments live only while cited | NFR-S-04 | SHOULD |
+| Consolidation into higher fragments — real compression, not truncation | NFR-CTX-01 | MUST |
+| Confidence replaces eviction; nothing is destroyed by a wrong call | NFR-S-04, NFR-CTX-05 | SHOULD |
+| Reasoning traces gated on the existing thinking toggle | NFR-U-08 | MUST |
+| Recall shown inline; extraction shown in the status line (§ 8) | NFR-CTX-05, NFR-Q-01 | SHOULD / MUST |
+| Symbols not colour alone for memory actions (§ 8) | NFR-P-04 | SHOULD |
 | SQLite, single file, inspectable | NFR-S-01, NFR-S-03 | MUST / SHOULD |
 | Stable group core | NFR-CTX-01 | MUST |
 | Query-selected block, ranked not recency-only | NFR-CTX-03 | MUST |
@@ -638,17 +762,19 @@ what to cut first if the schedule tightens. Listed most-cuttable first.
 
 | Feature | What is lost by cutting it |
 |---|---|
-| `quote` on the citation row | The memory inspector can name the message but not highlight the span. Cheap to keep; nullable, so it can be added later without migration pain. |
-| Diversity cap on shared citations | One dense message can dominate the digest. Only bites once messages are commonly multi-cited. |
-| Support-count rank fusion | Corroboration stops influencing ranking. BM25 + recency alone still satisfies NFR-CTX-03. |
-| `superseded_by` chains | Contradictory claims both surface. Mitigated by recency weighting, badly. |
-| Cross-conversation citations | Fragments become conversation-local; § 2.4 re-homing and § 2.5 pruning both disappear, and the model gets materially simpler. |
-| Re-homing on delete | Corroborated fragments die with their origin. Strictly *more* compliant with NFR-S-04. |
+| `quote` on the citation row | The memory inspector can name the message but not highlight the span. Cheap to keep. |
+| `reasoning` traces | Fragments cannot explain themselves in the inspector. Only costs tokens when thinking is on. |
+| MMR diversity | One dense message can dominate the digest. Only bites once messages are commonly multi-cited. |
+| Support-count rank fusion | Corroboration stops influencing ranking. BM25 + decay alone still satisfies NFR-CTX-03. |
+| Per-fragment decay | Falls back to a flat recency ordinal. Noticeably worse once a group mixes durable decisions with transient status. |
+| **The hierarchy** (fragments citing fragments) | `stable_core` degenerates to top-N truncation, which is selection wearing compression's clothes — NFR-CTX-01 is a MUST, so something has to fill the gap. This is the largest single cut available and the one to think hardest about. |
+| Cross-conversation citations | Fragments become conversation-local and corroboration collapses to within-chat repetition. |
 | KV-cache-aware prompt split | Slower per turn. Both blocks are still required; only their placement is an optimisation. |
 
-Cutting the cross-conversation row collapses roughly half of § 2 — worth knowing
-which half is load-bearing. Note that it does **not** collapse the many-to-many:
-one message can support several fragments within a single conversation too.
+Cutting the hierarchy removes § 1.1.1 entirely, along with the transitive sweep,
+I-8 and I-9, and the height-splits-the-two-blocks argument in § 2.2. It does
+**not** collapse the many-to-many: one message can support several fragments
+within a single conversation too.
 
 ---
 
@@ -675,8 +801,12 @@ k ≈ 60
 - `rank_support` orders by `conversation_count`, not `citation_count`, and
   saturates: `log(1 + conversation_count)`. Two messages five turns apart in one
   session is usually the user rephrasing, not independent confirmation.
+- **Confidence gates rather than ranks.** Fragments at confidence 0 are excluded
+  outright (I-10 keeps the rows; the query drops them). Between 0 and 1 it is a
+  weak signal here — see the GUM caveat in § 2.1 — so it does not get a fusion
+  term of its own until there's evidence it separates anything.
 - The fusion is deterministic and each term is inspectable, which is what makes
-  the memory indicator in § 2.2 able to explain itself (NFR-CTX-05).
+  the recall indicator in § 8 able to explain itself (NFR-CTX-05).
 
 **Message density is deliberately not a ranking signal.** The many-to-many makes
 "how many fragments does this message support" cheap to compute, and it is
@@ -701,19 +831,95 @@ diversity term suppresses them without needing a separate rule.
 
 ---
 
+# 8 — Making memory visible
+
+Two things the user has to be able to see: **what memory went into this prompt**,
+and **what memory came out of that turn**. They are different problems and want
+different affordances — one is per-turn and synchronous, the other is batched and
+asynchronous.
+
+## 8.1 Recall — what enriched the prompt
+
+Proposed: a dim, collapsed line between the user's message and the assistant's
+reply, expandable in place.
+
+```
+  you  Should we use WAL?
+
+  ▸ 3 memories recalled                                    ← dim, collapsed
+  ────────────────────────────────────────────────
+  assistant  Yes — you settled on SQLite in *Storage plan*…
+```
+
+Expanded, each line shows the fragment text, its confidence, and the conversation
+it came from, so the jump to the source is one keypress.
+
+Three reasons for collapsed-by-default rather than the always-visible grey block:
+
+- **Only half of it changes per turn.** The stable core is identical on every turn
+  of the group (§ 2.2), so rendering it inline each time is pure repetition. Show
+  the *query-selected* fragments per turn; show the stable core once, in the
+  conversation header or the memory inspector.
+- **NFR-U-02** says rendering cost must not grow with history. An expanded block on
+  every turn of a 200-turn conversation is exactly that growth.
+- Recall is background reassurance most of the time and forensic detail
+  occasionally. Collapsed serves the first, one keypress serves the second.
+
+Textual's `Collapsible` does this natively. ⏸ Whether the collapsed line appears on
+turns where nothing was recalled — an explicit "0 memories" is honest and makes
+absence visible, but adds a line to every turn in a default-group chat where recall
+never happens. § 7 #13.
+
+## 8.2 Extraction — what changed in the store
+
+Extraction is batched and runs off the reply path, so it finishes at an
+unpredictable moment, possibly after the user has navigated elsewhere. That rules
+out attaching it to a turn.
+
+Proposed: a **status-line indicator** for the event, plus a **persistent log** in
+the memory inspector, since a transient toast is unreadable if it fires while the
+user is reading something else.
+
+```
+  memory · +2 new  ↑1 reinforced  ~1 revised            [M to inspect]
+```
+
+| Symbol | Action | Confidence shown as |
+|---|---|---|
+| `+` | new | the initial value |
+| `↑` | reinforce | the delta, e.g. `0.6 → 0.8` |
+| `~` | revise | the delta, and `→ 0` reads as dormant |
+
+**Symbols, not colour alone.** NFR-P-04 requires graceful degradation across
+terminal colour capabilities, so encoding new/reinforce/revise purely as
+green/blue/amber fails on a monochrome terminal. Colour can reinforce the symbol;
+it cannot carry the meaning.
+
+Revisions are the ones worth surfacing hardest — a revise silently rewrites text
+the user never approved, and `→ 0` is the closest thing left to a deletion. The
+inspector should let a revision be read as a diff against the previous text.
+
+This is also where the thinking-mode coupling from § 2.1 should surface: if
+extraction ran without reasoning traces, the indicator should say so, or the user
+has no way to know their memory is being built in a degraded mode.
+
+---
+
 # 7 — Open decisions
 
 | # | Question | Blocks |
 |---|---|---|
-| ⏸ 1 | Do ungrouped chats accumulate fragments? § 2.1 says no. "Yes" makes moving a chat into a project carry its history instantly, at the cost of extraction on every throwaway chat. | § 2.1, § 2.5 |
-| ⚠ 2 | Strict or lenient reading of NFR-S-04 on re-homing (§ 2.4). | § 2.4, § 5 |
-| ⏸ 3 | Salience: model-assigned at extraction, or derived from support and recency alone? A derived value is one less thing for a small model to get wrong. | § 6 |
-| ⏸ 4 | Does `stable_core` get regenerated by an LLM summarisation pass, or is it just top-N fragment text? The former is truer compression; the latter has no failure mode. | § 2.2, NFR-CTX-01 |
-| ⏸ 5 | Backfill trigger. Chats predating the feature and failed extractions both need one; is it manual, on-move, or on-open? | § 2.1 |
-| ⏸ 7 | Does the extractor get told which messages it already cited for a candidate fragment? Without it, merge decisions may re-cite the same message — harmless (I-7 dedupes) but wasteful of prompt budget. | § 2.1 |
-| ⏸ 9 | Replace `superseded_by` with a **confidence score** and GUM-style revision? Contradiction lowers confidence rather than evicting, which removes the false-supersede failure mode entirely. Counter-argument: chat memory records what was *said*, which is not very uncertain — confidence may sit near-constant and earn nothing. | § 2.1, § 1.1, § 2.3 |
-| ⏸ 10 | Adopt GUM's **reasoning trace before the claim**? They generate a rationale first, then the proposition, citing both explainability and accuracy. Costs tokens per extraction; would make the memory inspector able to show *why* a fragment exists. | § 2.1 |
+| ⏸ 13 | Does the recall line appear on turns where nothing was recalled? Explicit "0 memories" makes absence visible but adds a line to every turn in a default-group chat. | § 8.1 |
+| ⏸ 14 | What triggers consolidation into a higher fragment — a fragment-count threshold, a schedule, or `stable_core` overflowing its budget? Demand-driven has the most natural trigger. | § 1.1.1, § 2.2 |
+| ⏸ 3 | Salience: model-assigned at extraction, or derived from support and recency alone? A derived value is one less thing for a small model to get wrong. Now overlaps confidence — possibly one of the two should go. | § 6 |
+| ⏸ 5 | Backfill trigger. Chats predating the feature and failed extractions both need one; is it manual or on-open? | § 2.1 |
+| ⏸ 7 | Does the extractor get told which messages it already cited for a candidate fragment? Without it, reinforce decisions may re-cite the same message — harmless (I-7 dedupes) but wasteful of prompt budget. | § 2.1 |
 | ⏸ 11 | Is `α` (decay rate) a per-`kind` constant or model-generated per fragment? Per-kind is free and has no failure mode; model-generated is more expressive and is what GUM does. | § 6 |
+| ✔ 1 | *Resolved.* Ungrouped chats do not accumulate fragments. Since conversations never move (§ 2.5), a default-group chat can never be promoted, so its fragments could never become reachable. | § 2.1 |
+| ✔ 2 | *Resolved.* The strict/lenient question dissolved. Splitting scope from provenance means the cascade runs through citations alone, so "a claim survives while evidence for it survives" is structural rather than a judgement call. | § 2.4 |
+| ✔ 4 | *Resolved.* `stable_core` is the consolidated layer — stored higher fragments, not an ephemeral summarisation pass. | § 1.1.1, § 2.2 |
+| ✔ 9 | *Resolved.* `superseded_by` is replaced by confidence-based revision. Nothing is evicted; confidence 0 is dormant and reversible. | § 2.1, § 2.3 |
+| ✔ 10 | *Resolved.* Reasoning traces are adopted, gated on the `Ctrl+T` thinking toggle. | § 2.1 |
 | ✔ 8 | *Resolved.* Subject matching is a vector comparison over fragment embeddings, following GUM's retrieve-then-rerank. The pipeline is intended to generalise later to persona artefact extraction — separate store, shared machinery, per I-6. | § 2.1 |
 | ✔ 6 | *Resolved.* Open decision #4 in `requirements.md` — memory and the persona/profile store are **separate mechanisms** sharing storage primitives only. Fold this back into `requirements.md`. | — |
 
@@ -721,6 +927,17 @@ diversity term suppresses them without needing a separate rule.
 
 ## Changelog
 
+- **2026-08-10** — v4. Four decisions and their knock-ons.
+  (1) `superseded_by` replaced by confidence-based revision — outcomes are now
+  new / reinforce / revise / ignore, nothing is evicted, and the worst failure mode
+  is gone. (2) Reasoning traces adopted, gated on the `Ctrl+T` thinking toggle.
+  (3) Conversations are bound to their group for life; § 2.5's move flowchart
+  deleted, and `group_id` moved *onto* the fragment now that it is immutable.
+  (4) Fragments may cite lower fragments — a consolidation hierarchy whose top
+  layer is `stable_core`. Splitting scope from provenance let § 2.4 drop re-homing
+  entirely. Added § 8 on making recall and extraction visible. Resolved #1, #2,
+  #4, #9, #10; new #12–#14. **The height mechanism (#12) is explicitly open** —
+  acyclicity is the requirement, and monotonic id ordering may serve it better.
 - **2026-08-10** — v3. Aligned the write path with Shaikh et al.'s GUM pipeline
   (UIST '25). Resolved § 7 #8: subject matching is a vector comparison, following
   their retrieve-then-rerank, with the pipeline intended to generalise later to
