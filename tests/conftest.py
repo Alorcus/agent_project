@@ -49,9 +49,18 @@ def _guard_real_database(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def mock_settings(**overrides) -> Settings:
     """The stub backend and the non-durable store — the default for tests
-    that are about interface behaviour, not real inference or persistence."""
+    that are about interface behaviour, not real inference or persistence.
+
+    Defaults to near-zero mock timing so tests that just drain a stream to
+    completion don't pay for realistic load/chunk delays. Tests that assert
+    on *mid-generation* behaviour (still streaming, cancel, stop) need a real
+    gap to land in — pass ``mock_chunk_delay=None, mock_load_delay=None``
+    to opt back into ``mock.default_models()``'s realistic timing.
+    """
     overrides.setdefault("backend", "mock")
     overrides.setdefault("store", "memory")
+    overrides.setdefault("mock_chunk_delay", 0.0)
+    overrides.setdefault("mock_load_delay", 0.0)
     return Settings(**overrides)
 
 

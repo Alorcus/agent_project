@@ -86,7 +86,9 @@ async def test_chat_service_records_both_turns_and_provenance():
 
 
 async def test_stopping_mid_stream_keeps_the_partial_reply():
-    registry = fast_registry()
+    # Needs a real mid-generation gap to cancel into — fast_registry()'s
+    # default near-zero delay would finish before the sleep below.
+    registry = fast_registry(mock_chunk_delay=None, mock_load_delay=None)
     chat = ChatService(registry)
     conversation = await chat.new_conversation()
 
