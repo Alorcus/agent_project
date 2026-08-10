@@ -1,8 +1,8 @@
 """Runtime configuration and app assembly.
 
-Config is externalised via environment variables. ``build_registry`` is the
-single wiring point: which backend the app talks to is decided here and
-nowhere else.
+Config is externalised via environment variables, optionally loaded from a
+``.env`` file. ``build_registry`` is the single wiring point: which backend
+the app talks to is decided here and nowhere else.
 """
 
 from __future__ import annotations
@@ -10,6 +10,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+
+from dotenv import find_dotenv, load_dotenv
 
 from agentchat.core.errors import AgentChatError
 from agentchat.llm.base import ModelInfo
@@ -20,6 +22,11 @@ from agentchat.llm.mock import default_models as mock_models
 from agentchat.llm.registry import ModelRegistry
 
 ENV_PREFIX = "AGENTCHAT_"
+
+# Walks up from the cwd for a `.env` and merges it into os.environ. Real
+# environment variables always win — load_dotenv() never overwrites a key
+# that's already set.
+load_dotenv(find_dotenv(usecwd=True))
 
 #: ``local`` runs the real checkpoints; ``mock`` is the stub backend, kept so the
 #: UI can be developed and tested on a machine with no GPU.

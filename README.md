@@ -81,6 +81,10 @@ Environment variables, all prefixed `AGENTCHAT_`:
 | `AGENTCHAT_CORPUS_DIR` | `./corpus` | RAG ingestion source (not yet used) |
 | `AGENTCHAT_SIMULATE_FAILURE` | `0` | Make the second model fail on load, to exercise error handling |
 
+Variables can also go in a `.env` file at the project root (copy
+`.env.example`) instead of being exported in the shell. Real environment
+variables take precedence over `.env`.
+
 ## Layout
 
 ```
