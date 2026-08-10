@@ -7,9 +7,9 @@ from typing import Literal
 
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import ListItem, ListView, Static
+from textual.widgets import Button, ListItem, ListView, Static
 
 from agentchat.core.models import Conversation
 
@@ -22,7 +22,10 @@ _NEW_CONVERSATION_ID = "__new__"
 class ConversationPicker(ModalScreen[PickerResult | None]):
     """Overview of saved conversations; Enter switches, Escape cancels."""
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("ctrl+x", "delete_highlighted", "Delete"),
+    ]
 
     def __init__(self, conversations: list[Conversation], current_id: str | None) -> None:
         super().__init__()
@@ -75,3 +78,39 @@ class ConversationPicker(ModalScreen[PickerResult | None]):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+    def action_delete_highlighted(self) -> None:
+        list_views = self.query(ListView)
+        if not list_views:
+            return
+        item = list_views.first().highlighted_child
+        if item is None or item.id == _NEW_CONVERSATION_ID:
+            return
+        self.dismiss(("delete", item.conversation_id))
+
+
+class ConfirmModal(ModalScreen[bool]):
+    """Yes/no confirmation; Cancel is focused by default so a stray Enter
+    is safe."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, prompt: str) -> None:
+        super().__init__()
+        self._prompt = prompt
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm"):
+            yield Static(self._prompt, classes="confirm__prompt")
+            with Horizontal(classes="confirm__buttons"):
+                yield Button("Delete", id="confirm-delete", variant="error")
+                yield Button("Cancel", id="confirm-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#confirm-cancel", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "confirm-delete")
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)

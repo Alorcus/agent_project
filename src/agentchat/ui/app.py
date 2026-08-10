@@ -20,7 +20,7 @@ from agentchat.core.chat import ChatService
 from agentchat.core.errors import AgentChatError, ModelNotFoundError
 from agentchat.core.models import Conversation, Message
 from agentchat.llm.base import GenerationOptions
-from agentchat.ui.screens import ConversationPicker
+from agentchat.ui.screens import ConfirmModal, ConversationPicker
 from agentchat.ui.widgets import MessageBubble
 
 _GENERATION_GROUP = "generation"
@@ -124,6 +124,33 @@ class ChatApp(App[None]):
             if action == "new":
                 await self.action_new_conversation()
                 return
+            # action == "delete"
+            title = next(
+                (c.title for c in conversations if c.id == conversation_id),
+                "this conversation",
+            )
+            confirmed = await self.push_screen_wait(
+                ConfirmModal(f"Delete “{title}”?")
+            )
+            if not confirmed:
+                continue
+            try:
+                await self.chat.delete_conversation(conversation_id)
+            except AgentChatError as error:
+                self.notify(str(error), severity="error")
+                continue
+            if conversation_id != self.conversation.id:
+                continue
+            # The conversation we were looking at is gone; persisting it on
+            # the way out (as _switch_to/action_new_conversation do) would
+            # resurrect it, so swap in a fresh, unsaved one first — persist
+            # already skips conversations with no messages.
+            self.conversation = Conversation()
+            remaining = await self.chat.list_conversations()
+            if remaining:
+                await self._switch_to(remaining[0].id)
+            else:
+                await self.action_new_conversation()
             return
 
     async def _switch_to(self, conversation_id: str) -> None:

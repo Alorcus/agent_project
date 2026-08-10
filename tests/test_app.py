@@ -12,9 +12,10 @@ import asyncio
 from textual.widgets import Input, ListView, Static
 
 from agentchat.config import Settings
+from agentchat.core.errors import StorageError
 from agentchat.core.models import Conversation, Message
 from agentchat.ui.app import ChatApp
-from agentchat.ui.screens import ConversationPicker
+from agentchat.ui.screens import ConfirmModal, ConversationPicker
 from agentchat.ui.widgets import MessageBubble
 
 
@@ -374,3 +375,215 @@ async def test_picker_marks_the_active_conversation_row():
         picker = app.screen
         current_rows = list(picker.query(".picker__item.-current"))
         assert len(current_rows) == 1
+
+
+async def test_ctrl_x_on_highlighted_conversation_deletes_after_confirmation():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await _submit(pilot, "first")
+        await _wait_until_done(pilot, app)
+        first_id = app.conversation.id
+
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+
+        await _submit(pilot, "second")
+        await _wait_until_done(pilot, app)
+
+        await pilot.press("ctrl+l")
+        await _wait_for_screen(pilot, app, ConversationPicker)
+
+        # Index 0 is the current ("second") conversation; move to "first".
+        await pilot.press("down")
+        await pilot.press("ctrl+x")
+        await _wait_for_screen(pilot, app, ConfirmModal)
+
+        # Cancel is focused by default; Tab reaches Delete.
+        await pilot.press("tab")
+        await pilot.press("enter")
+        await _wait_for_screen(pilot, app, ConversationPicker)
+
+        remaining = await app.chat.list_conversations()
+        assert first_id not in {c.id for c in remaining}
+        rows = list(app.screen.query_one(ListView).children)
+        # Only "second" (current) remains, plus "+ New conversation".
+        assert len(rows) == 2
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+
+async def test_ctrl_x_cancel_leaves_conversation_in_store_and_reopens_picker():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await _submit(pilot, "first")
+        await _wait_until_done(pilot, app)
+        first_id = app.conversation.id
+
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        await _submit(pilot, "second")
+        await _wait_until_done(pilot, app)
+
+        await pilot.press("ctrl+l")
+        await _wait_for_screen(pilot, app, ConversationPicker)
+
+        await pilot.press("down")
+        await pilot.press("ctrl+x")
+        await _wait_for_screen(pilot, app, ConfirmModal)
+
+        # Cancel is already focused: a bare Enter must be the safe choice.
+        await pilot.press("enter")
+        await _wait_for_screen(pilot, app, ConversationPicker)
+
+        remaining = await app.chat.list_conversations()
+        assert first_id in {c.id for c in remaining}
+        rows = list(app.screen.query_one(ListView).children)
+        assert len(rows) == 3  # "first", "second" (current), "+ New conversation"
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+
+async def test_ctrl_x_on_new_conversation_row_does_nothing():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await _submit(pilot, "hello")
+        await _wait_until_done(pilot, app)
+
+        await pilot.press("ctrl+l")
+        await _wait_for_screen(pilot, app, ConversationPicker)
+
+        # Index 0 is the current conversation; index 1 is "+ New conversation".
+        await pilot.press("down")
+        await pilot.press("ctrl+x")
+        await pilot.pause()
+
+        assert isinstance(app.screen, ConversationPicker)
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+
+async def test_deleting_active_conversation_switches_to_most_recent_remaining():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await _submit(pilot, "first")
+        await _wait_until_done(pilot, app)
+        first_id = app.conversation.id
+
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        await _submit(pilot, "second")
+        await _wait_until_done(pilot, app)
+        second_id = app.conversation.id
+
+        await pilot.press("ctrl+l")
+        await _wait_for_screen(pilot, app, ConversationPicker)
+
+        # Index 0 is the current ("second") conversation — delete it.
+        await pilot.press("ctrl+x")
+        await _wait_for_screen(pilot, app, ConfirmModal)
+        await pilot.press("tab")
+        await pilot.press("enter")
+
+        for _ in range(60):
+            await pilot.pause()
+            if app.conversation.id != second_id:
+                break
+            await asyncio.sleep(0.05)
+
+        assert app.conversation.id == first_id
+        assert not isinstance(app.screen, ConversationPicker)
+        remaining = await app.chat.list_conversations()
+        assert second_id not in {c.id for c in remaining}
+        bubbles = list(app.query(MessageBubble))
+        assert any(
+            b.message.role == "user" and b.message.content == "first" for b in bubbles
+        )
+
+
+async def test_deleting_only_conversation_leaves_fresh_empty_state_without_resurrection():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await _submit(pilot, "only one")
+        await _wait_until_done(pilot, app)
+        only_id = app.conversation.id
+
+        await pilot.press("ctrl+l")
+        await _wait_for_screen(pilot, app, ConversationPicker)
+
+        await pilot.press("ctrl+x")
+        await _wait_for_screen(pilot, app, ConfirmModal)
+        await pilot.press("tab")
+        await pilot.press("enter")
+
+        for _ in range(60):
+            await pilot.pause()
+            if app.conversation.id != only_id:
+                break
+            await asyncio.sleep(0.05)
+
+        assert app.conversation.id != only_id
+        assert app.conversation.messages == []
+        assert not list(app.query(MessageBubble))
+        assert not isinstance(app.screen, ConversationPicker)
+
+        # The deleted conversation must not have been resurrected by a
+        # persist call on the way out.
+        remaining = await app.chat.list_conversations()
+        assert remaining == []
+        assert await app.chat.store.load(only_id) is None
+
+
+async def test_confirm_modal_opens_with_cancel_focused():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await _submit(pilot, "hello")
+        await _wait_until_done(pilot, app)
+
+        await pilot.press("ctrl+l")
+        await _wait_for_screen(pilot, app, ConversationPicker)
+
+        await pilot.press("ctrl+x")
+        await _wait_for_screen(pilot, app, ConfirmModal)
+
+        modal = app.screen
+        assert modal.query_one("#confirm-cancel").has_focus
+
+        await pilot.press("escape")
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+
+
+async def test_delete_conversation_storage_error_notifies_and_keeps_running():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await _submit(pilot, "first")
+        await _wait_until_done(pilot, app)
+
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        await _submit(pilot, "second")
+        await _wait_until_done(pilot, app)
+
+        async def boom(conversation_id: str) -> None:
+            raise StorageError("boom")
+
+        app.chat.delete_conversation = boom
+
+        await pilot.press("ctrl+l")
+        await _wait_for_screen(pilot, app, ConversationPicker)
+
+        await pilot.press("down")
+        await pilot.press("ctrl+x")
+        await _wait_for_screen(pilot, app, ConfirmModal)
+        await pilot.press("tab")
+        await pilot.press("enter")
+
+        await _wait_for_screen(pilot, app, ConversationPicker)
+        assert app.is_running
+
+        await pilot.press("escape")
+        await pilot.pause()

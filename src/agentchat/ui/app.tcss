@@ -113,3 +113,27 @@ ConversationPicker {
 .picker__item.-current {
     color: $accent;
 }
+
+ConfirmModal {
+    align: center middle;
+}
+
+#confirm {
+    width: 50;
+    border: round $accent;
+    background: $panel;
+    padding: 1 2;
+}
+
+.confirm__prompt {
+    padding-bottom: 1;
+}
+
+.confirm__buttons {
+    height: auto;
+    align: right middle;
+}
+
+.confirm__buttons Button {
+    margin-left: 1;
+}
