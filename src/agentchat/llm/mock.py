@@ -111,10 +111,17 @@ def _tokenize(text: str) -> list[str]:
     return out
 
 
-def default_models() -> list[tuple[ModelInfo, dict]]:
+def default_models(
+    *, chunk_delay: float | None = None, load_delay: float | None = None
+) -> list[tuple[ModelInfo, dict]]:
     """The mock model catalogue: two entries with different context windows,
-    so model switching and window-aware trimming are both testable."""
-    return [
+    so model switching and window-aware trimming are both testable.
+
+    ``chunk_delay``/``load_delay``, when given, replace both entries' timing —
+    tests that don't care about real streaming/loading gaps can run near
+    instantly instead of paying the realistic delays below.
+    """
+    models = [
         (
             ModelInfo(
                 id="mock-small",
@@ -134,3 +141,9 @@ def default_models() -> list[tuple[ModelInfo, dict]]:
             {"chunk_delay": 0.07, "load_delay": 0.9, "seed": 2},
         ),
     ]
+    for _, kwargs in models:
+        if chunk_delay is not None:
+            kwargs["chunk_delay"] = chunk_delay
+        if load_delay is not None:
+            kwargs["load_delay"] = load_delay
+    return models

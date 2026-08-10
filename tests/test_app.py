@@ -11,23 +11,17 @@ import asyncio
 
 from textual.widgets import Input, ListView, Static
 
-from agentchat.config import Settings
 from agentchat.core.errors import StorageError
 from agentchat.core.models import Conversation, Message
 from agentchat.ui.app import ChatApp
 from agentchat.ui.screens import ConversationPicker
 from agentchat.ui.widgets import MessageBubble
+from conftest import mock_settings
 
-
-def mock_settings(**overrides) -> Settings:
-    """The stub backend, explicitly. The app defaults to the real cluster
-    models; these tests are about the interface, not about inference, and must
-    run without a GPU."""
-    overrides.setdefault("backend", "mock")
-    # Without this every app test writes a real ./data/agentchat.db as a
-    # side effect.
-    overrides.setdefault("store", "memory")
-    return Settings(**overrides)
+# mock_settings() defaults to near-instant timing; tests that assert on
+# mid-generation state need a real gap to observe, so they opt back into
+# mock.default_models()'s realistic load/chunk delays.
+_REALISTIC_TIMING = {"mock_chunk_delay": None, "mock_load_delay": None}
 
 
 async def _submit(pilot, text: str) -> None:
@@ -88,7 +82,7 @@ async def test_prompt_produces_a_streamed_reply():
 
 
 async def test_ui_stays_responsive_while_generating():
-    app = ChatApp(mock_settings())
+    app = ChatApp(mock_settings(**_REALISTIC_TIMING))
     async with app.run_test() as pilot:
         await _submit(pilot, "a long enough prompt to stream")
         await asyncio.sleep(0.6)
@@ -103,7 +97,7 @@ async def test_ui_stays_responsive_while_generating():
 
 
 async def test_escape_stops_generation_and_keeps_partial_text():
-    app = ChatApp(mock_settings())
+    app = ChatApp(mock_settings(**_REALISTIC_TIMING))
     async with app.run_test() as pilot:
         await _submit(pilot, "stop me")
         await asyncio.sleep(0.7)
@@ -138,7 +132,7 @@ async def test_backend_failure_surfaces_as_an_error_bubble_not_a_crash():
 
 
 async def test_new_conversation_clears_the_log():
-    app = ChatApp(mock_settings())
+    app = ChatApp(mock_settings(**_REALISTIC_TIMING))
     async with app.run_test() as pilot:
         await _submit(pilot, "first")
         await asyncio.sleep(0.4)
@@ -223,7 +217,7 @@ async def test_show_conversation_empty_shows_placeholder_and_no_bubbles():
 
 
 async def test_switching_cancels_running_generation_and_keeps_partial_reply():
-    app = ChatApp(mock_settings())
+    app = ChatApp(mock_settings(**_REALISTIC_TIMING))
     async with app.run_test() as pilot:
         await _submit(pilot, "a long enough prompt to stream")
         await asyncio.sleep(0.6)
@@ -349,7 +343,7 @@ async def test_ctrl_l_with_empty_store_shows_empty_state():
 
 
 async def test_ctrl_l_during_generation_does_not_cancel_it():
-    app = ChatApp(mock_settings())
+    app = ChatApp(mock_settings(**_REALISTIC_TIMING))
     async with app.run_test() as pilot:
         await _submit(pilot, "a long enough prompt to stream")
         await asyncio.sleep(0.3)

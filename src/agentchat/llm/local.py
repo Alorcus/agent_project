@@ -103,14 +103,17 @@ class TransformersProvider:
         self._loaded = True
 
     def _load_blocking(self) -> None:
-        torch, auto_model, auto_tokenizer = import_backend(self._info.name)
-        quiet_backend()
-
+        # Checked before importing torch/transformers: a missing checkpoint
+        # is a common misconfiguration (wrong AGENTCHAT_MODEL_ROOT), and
+        # those imports alone can take well over a minute.
         if not self._path.is_dir():
             raise ProviderError(
                 f"{self._info.name}: no checkpoint at {self._path}. "
                 "Set AGENTCHAT_MODEL_ROOT to where the weights live."
             )
+
+        torch, auto_model, auto_tokenizer = import_backend(self._info.name)
+        quiet_backend()
 
         if torch.cuda.is_available():
             dtype, device_map = torch.bfloat16, {"": "cuda:0"}

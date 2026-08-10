@@ -2,18 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from agentchat.config import Settings, build_registry
 from agentchat.core.chat import ChatService
 from agentchat.core.errors import StorageError
 from agentchat.core.models import Conversation
 from agentchat.storage.base import InMemoryStore
 from agentchat.storage.sqlite import SqliteStore
-
-
-def fast_registry(**overrides):
-    overrides.setdefault("backend", "mock")
-    settings = Settings(**overrides)
-    return build_registry(settings)
+from conftest import fast_registry
 
 
 async def test_list_conversations_on_fresh_service_is_empty():
