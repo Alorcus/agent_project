@@ -28,11 +28,11 @@ would need, delete it.
 
 ```
 src/agentchat/
-  config.py        settings + the single wiring point for backends
+  config.py        settings + the single wiring point for backends and stores
   core/            domain model, chat orchestration, context strategy, errors
   llm/             LLMProvider protocol, mock + local (transformers) backends, registry
-  storage/         ConversationStore protocol + in-memory implementation
-  ui/              Textual application and widgets
+  storage/         ConversationStore protocol, in-memory and SQLite implementations
+  ui/              Textual application, widgets, and modal screens
 ```
 
 Dependency direction is one-way: `ui → core → llm/storage`. The UI never

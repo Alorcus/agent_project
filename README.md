@@ -63,6 +63,8 @@ checkpoint fails loudly instead.
 | `Enter` | Send |
 | `Escape` | Stop the running generation |
 | `Ctrl+N` | New conversation |
+| `Ctrl+L` | Open the conversation overview |
+| `Ctrl+X` | Delete the highlighted conversation (in the overview) |
 | `Ctrl+O` | Cycle model |
 | `Ctrl+T` | Toggle thinking mode |
 | `Ctrl+D` | Exit |
@@ -77,7 +79,8 @@ Environment variables, all prefixed `AGENTCHAT_`:
 | `AGENTCHAT_MODEL_ROOT` | `/sc/projects/sci-lippert/intelligent-agents/model_checkpoints` | Where the checkpoints live |
 | `AGENTCHAT_MODEL` | first registered | Model selected at startup (`phi-4-mini`, `qwen3-14b`) |
 | `AGENTCHAT_MAX_CONTEXT` | unset | Cap every model's context window, for a smaller GPU |
-| `AGENTCHAT_DATA_DIR` | `./data` | Durable state (not yet written) |
+| `AGENTCHAT_STORE` | `sqlite` | `sqlite` for durable storage, `memory` for the non-durable stub |
+| `AGENTCHAT_DATA_DIR` | `./data` | Where `agentchat.db` lives (the `sqlite` store) |
 | `AGENTCHAT_CORPUS_DIR` | `./corpus` | RAG ingestion source (not yet used) |
 | `AGENTCHAT_SIMULATE_FAILURE` | `0` | Make the second model fail on load, to exercise error handling |
 
@@ -102,9 +105,11 @@ src/agentchat/
     mock.py        the stub backend
   storage/
     base.py        ConversationStore protocol + in-memory implementation
+    sqlite.py      durable implementation — two tables, one save per turn
   ui/
     app.py         Textual application
     widgets.py     message bubbles
+    screens.py     conversation picker + delete confirmation modals
     app.tcss       styling
 ```
 
@@ -124,13 +129,16 @@ imports a concrete backend.
 - Backend failure surfaces as a UI error, not a crash — set
   `AGENTCHAT_SIMULATE_FAILURE=1` and switch to the second model to see it.
 - Assistant messages record which model produced them.
+- Durable storage — conversations survive a restart via `SqliteStore`.
+  `InMemoryStore` remains available with `AGENTCHAT_STORE=memory`.
+- Conversation list, switching and deletion — `Ctrl+L` opens an overview of
+  saved conversations and switches to one; `Ctrl+X` deletes the highlighted
+  one behind a confirmation.
 
 ## Not yet built
 
 Deliberately stubbed, with the seam in place:
 
-- Durable storage — `InMemoryStore` satisfies the protocol; SQLite replaces it.
-- Conversation list, switching and deletion.
 - The two required fine-tunes.
 - Adaptive RAG, sub-agent deployment, intelligent context management (electives).
 - History virtualisation for very long conversations.
