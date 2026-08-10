@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import asyncio
 
-from textual.widgets import Input, Static
+from textual.widgets import Input, ListView, Static
 
 from agentchat.config import Settings
 from agentchat.core.models import Conversation, Message
 from agentchat.ui.app import ChatApp
+from agentchat.ui.screens import ConversationPicker
 from agentchat.ui.widgets import MessageBubble
 
 
@@ -32,6 +33,25 @@ async def _submit(pilot, text: str) -> None:
     prompt = pilot.app.query_one("#prompt", Input)
     prompt.value = text
     await pilot.press("enter")
+
+
+async def _wait_until_done(pilot, app) -> None:
+    for _ in range(200):
+        await pilot.pause()
+        if not app._generating:
+            break
+        await asyncio.sleep(0.05)
+
+
+async def _wait_for_screen(pilot, app, screen_type) -> None:
+    # action_open_conversations is a @work worker; it needs a tick to reach
+    # push_screen_wait and mount the new screen.
+    for _ in range(60):
+        await pilot.pause()
+        if isinstance(app.screen, screen_type):
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"{screen_type} never became the active screen")
 
 
 async def test_prompt_produces_a_streamed_reply():
@@ -224,3 +244,133 @@ async def test_switch_to_unknown_id_notifies_and_leaves_conversation_unchanged()
         current = app.conversation
         await app._switch_to("does-not-exist")
         assert app.conversation is current
+
+
+async def test_ctrl_l_opens_picker_listing_conversations_and_new_row():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await _submit(pilot, "hello")
+        await _wait_until_done(pilot, app)
+
+        await pilot.press("ctrl+l")
+        await _wait_for_screen(pilot, app, ConversationPicker)
+
+        picker = app.screen
+        rows = list(picker.query_one(ListView).children)
+        assert len(rows) == 2  # the saved conversation + "+ New conversation"
+
+
+async def test_escape_dismisses_picker_without_affecting_generation_state():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        main_screen = app.screen
+
+        await pilot.press("ctrl+l")
+        await _wait_for_screen(pilot, app, ConversationPicker)
+        generating_before = app._generating
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+        assert app.screen is main_screen
+        assert app._generating == generating_before
+
+
+async def test_picker_switches_to_selected_conversation():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await _submit(pilot, "first")
+        await _wait_until_done(pilot, app)
+        first_id = app.conversation.id
+
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+
+        await _submit(pilot, "second")
+        await _wait_until_done(pilot, app)
+
+        await pilot.press("ctrl+l")
+        await _wait_for_screen(pilot, app, ConversationPicker)
+
+        # Most-recently-updated first: index 0 is the current (second)
+        # conversation, index 1 is the first one.
+        await pilot.press("down")
+        await pilot.press("enter")
+
+        for _ in range(60):
+            await pilot.pause()
+            if app.conversation.id == first_id:
+                break
+            await asyncio.sleep(0.05)
+
+        assert app.conversation.id == first_id
+        bubbles = list(app.query(MessageBubble))
+        assert any(
+            b.message.role == "user" and b.message.content == "first" for b in bubbles
+        )
+
+
+async def test_picker_new_conversation_row_starts_a_fresh_conversation():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await _submit(pilot, "hello")
+        await _wait_until_done(pilot, app)
+        old_id = app.conversation.id
+
+        await pilot.press("ctrl+l")
+        await _wait_for_screen(pilot, app, ConversationPicker)
+
+        # Only conversation is at index 0; "+ New conversation" is next.
+        await pilot.press("down")
+        await pilot.press("enter")
+
+        for _ in range(60):
+            await pilot.pause()
+            if app.conversation.id != old_id:
+                break
+            await asyncio.sleep(0.05)
+
+        assert app.conversation.id != old_id
+        assert not list(app.query(MessageBubble))
+
+
+async def test_ctrl_l_with_empty_store_shows_empty_state():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await pilot.press("ctrl+l")
+        await _wait_for_screen(pilot, app, ConversationPicker)
+
+        picker = app.screen
+        assert list(picker.query(".picker__empty"))
+        assert not list(picker.query(ListView))
+
+
+async def test_ctrl_l_during_generation_does_not_cancel_it():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await _submit(pilot, "a long enough prompt to stream")
+        await asyncio.sleep(0.3)
+        assert app._generating, "should still be mid-generation"
+
+        await pilot.press("ctrl+l")
+        await _wait_for_screen(pilot, app, ConversationPicker)
+
+        assert app._generating
+
+        await pilot.press("escape")
+        await pilot.pause()
+        await _wait_until_done(pilot, app)
+
+
+async def test_picker_marks_the_active_conversation_row():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await _submit(pilot, "hello")
+        await _wait_until_done(pilot, app)
+
+        await pilot.press("ctrl+l")
+        await _wait_for_screen(pilot, app, ConversationPicker)
+
+        picker = app.screen
+        current_rows = list(picker.query(".picker__item.-current"))
+        assert len(current_rows) == 1

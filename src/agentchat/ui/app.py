@@ -20,6 +20,7 @@ from agentchat.core.chat import ChatService
 from agentchat.core.errors import AgentChatError, ModelNotFoundError
 from agentchat.core.models import Conversation, Message
 from agentchat.llm.base import GenerationOptions
+from agentchat.ui.screens import ConversationPicker
 from agentchat.ui.widgets import MessageBubble
 
 _GENERATION_GROUP = "generation"
@@ -33,6 +34,7 @@ class ChatApp(App[None]):
         Binding("ctrl+d", "quit", "Exit"),
         Binding("escape", "stop", "Stop"),
         Binding("ctrl+n", "new_conversation", "New chat"),
+        Binding("ctrl+l", "open_conversations", "Chats"),
         Binding("ctrl+o", "cycle_model", "Model"),
         Binding("ctrl+t", "toggle_thinking", "Thinking"),
     ]
@@ -103,6 +105,26 @@ class ChatApp(App[None]):
         await self._show_conversation(self.conversation)
         self._refresh_status()
         self.query_one("#prompt", Input).focus()
+
+    @work
+    async def action_open_conversations(self) -> None:
+        # Bare @work (not the generation group, not exclusive): opening the
+        # picker must never cancel a running generation.
+        while True:
+            conversations = await self.chat.list_conversations()
+            result = await self.push_screen_wait(
+                ConversationPicker(conversations, self.conversation.id)
+            )
+            if result is None:
+                return
+            action, conversation_id = result
+            if action == "switch":
+                await self._switch_to(conversation_id)
+                return
+            if action == "new":
+                await self.action_new_conversation()
+                return
+            return
 
     async def _switch_to(self, conversation_id: str) -> None:
         # A live generation holds bubbles that _show_conversation is about to

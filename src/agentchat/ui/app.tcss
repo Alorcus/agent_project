@@ -78,3 +78,38 @@ Screen {
     color: $text-muted;
     padding: 1 0;
 }
+
+ConversationPicker {
+    align: center middle;
+}
+
+#picker {
+    width: 60;
+    max-height: 80%;
+    border: round $accent;
+    background: $panel;
+    padding: 1 2;
+}
+
+.picker__title {
+    text-style: bold;
+    padding-bottom: 1;
+}
+
+.picker__empty {
+    color: $text-muted;
+    padding: 1 0;
+}
+
+.picker__hint {
+    color: $text-muted;
+    padding-top: 1;
+}
+
+.picker__meta {
+    color: $text-muted;
+}
+
+.picker__item.-current {
+    color: $accent;
+}
