@@ -42,6 +42,11 @@ imports a concrete backend.
 
 - Tests: `uv run pytest` (runs against the mock backend, no GPU needed).
   `AGENTCHAT_TEST_REAL_MODEL=1 uv run pytest` also exercises real weights.
+- `tests/conftest.py` scrubs every `AGENTCHAT_*` variable per test (an autouse
+  fixture) and points the sqlite store at `tmp_path`, so a local `.env` never
+  changes what a test sees and no test can touch `./data/agentchat.db`. Use
+  `conftest.mock_settings` / `conftest.fast_registry` rather than building
+  `Settings` by hand.
 - Run the app: `uv run agentchat` (needs a GPU node), or
   `AGENTCHAT_BACKEND=mock uv run agentchat` on a laptop.
 - See `README.md` for configuration and keybindings.

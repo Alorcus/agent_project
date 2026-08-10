@@ -11,23 +11,12 @@ import asyncio
 
 from textual.widgets import Input, ListView, Static
 
-from agentchat.config import Settings
 from agentchat.core.errors import StorageError
 from agentchat.core.models import Conversation, Message
 from agentchat.ui.app import ChatApp
 from agentchat.ui.screens import ConversationPicker
 from agentchat.ui.widgets import MessageBubble
-
-
-def mock_settings(**overrides) -> Settings:
-    """The stub backend, explicitly. The app defaults to the real cluster
-    models; these tests are about the interface, not about inference, and must
-    run without a GPU."""
-    overrides.setdefault("backend", "mock")
-    # Without this every app test writes a real ./data/agentchat.db as a
-    # side effect.
-    overrides.setdefault("store", "memory")
-    return Settings(**overrides)
+from conftest import mock_settings
 
 
 async def _submit(pilot, text: str) -> None:
