@@ -1,7 +1,7 @@
 ---
 title: "test: isolate the suite from the real database and the real .env"
 date: 2026-08-10
-status: open
+status: done
 area: tests
 ---
 
@@ -102,3 +102,29 @@ depend on every test author remembering an override.
 - `tests/test_app.py` — drop the local `mock_settings`
 - `tests/test_core.py`, `tests/test_switching.py` — drop the local `fast_registry`
 - `AGENTCHAT.md` — note the test environment contract
+
+## Resolution
+
+Implemented as scoped above, with one refinement: `fast_registry` was also
+promoted to `conftest.py` (built on top of `mock_settings`) rather than left
+duplicated in `test_core.py` and `test_switching.py`, since it was the same
+near-duplicate the "three near-identical helpers" note already called out.
+
+- `tests/conftest.py` — two autouse fixtures (`_scrubbed_environment`,
+  `_guard_real_database`) plus `mock_settings` / `fast_registry` helpers.
+- `_scrubbed_environment` strips every `AGENTCHAT_*` var per test and pins
+  `AGENTCHAT_DATA_DIR` to `tmp_path`, so a bare `Settings()` never resolves to
+  the repo's `./data` even without an explicit override.
+- `_guard_real_database` monkeypatches `SqliteStore.__init__` to raise
+  `AssertionError` if a path under the real `data/` directory is ever opened —
+  a second layer for anything that bypasses the env redirect (e.g. an
+  explicit absolute path).
+- `AGENTS.md` documents the contract.
+
+Verified:
+- `uv run pytest` → 79 passed, 1 skipped, 0 failed, with `.env` present.
+- Same result with `.env` removed (previously: `test_local_backend_is_the_default`
+  failed with `assert 'mock' == 'local'`, caused by the checked-in `.env`).
+- `data/agentchat.db` byte-identical (md5 `af6ab668e99677a295d15b02d09b117b`)
+  before and after both runs.
+- Guard confirmed to raise for an explicit real-path `SqliteStore(...)` call.
