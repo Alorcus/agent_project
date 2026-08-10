@@ -12,6 +12,7 @@ import asyncio
 from textual.widgets import Input, Static
 
 from agentchat.config import Settings
+from agentchat.core.models import Conversation, Message
 from agentchat.ui.app import ChatApp
 from agentchat.ui.widgets import MessageBubble
 
@@ -132,3 +133,94 @@ async def test_thinking_toggle_is_user_controlled():
         await pilot.press("ctrl+t")
         await pilot.pause()
         assert app.options.thinking is True
+
+
+async def test_mount_builds_a_fresh_unsaved_conversation():
+    app = ChatApp(mock_settings())
+    pre_mount_id = app.conversation.id
+    async with app.run_test():
+        assert app.conversation.id != pre_mount_id
+        assert await app.chat.store.load(app.conversation.id) is None
+
+
+async def test_switch_to_restores_conversation_history():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await _submit(pilot, "hello")
+
+        for _ in range(200):
+            await pilot.pause()
+            if not app._generating:
+                break
+            await asyncio.sleep(0.05)
+
+        first_id = app.conversation.id
+
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        assert not list(app.query(MessageBubble))
+
+        await app._switch_to(first_id)
+        await pilot.pause()
+
+        bubbles = list(app.query(MessageBubble))
+        assert len(bubbles) == 2
+        assert bubbles[0].message.role == "user"
+        assert bubbles[0].message.content == "hello"
+        assert app.conversation.id == first_id
+
+
+async def test_show_conversation_falls_back_to_raw_model_id():
+    app = ChatApp(mock_settings())
+    async with app.run_test():
+        conversation = Conversation(
+            messages=[
+                Message(role="assistant", content="x", model_id="not-a-real-model")
+            ]
+        )
+        await app._show_conversation(conversation)
+
+        bubble = list(app.query(MessageBubble))[0]
+        assert "not-a-real-model" in bubble._header.content
+
+
+async def test_show_conversation_empty_shows_placeholder_and_no_bubbles():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await app._show_conversation(Conversation())
+        await pilot.pause()
+
+        assert not list(app.query(MessageBubble))
+        assert list(app.query(".placeholder"))
+
+
+async def test_switching_cancels_running_generation_and_keeps_partial_reply():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await _submit(pilot, "a long enough prompt to stream")
+        await asyncio.sleep(0.6)
+        assert app._generating, "should still be mid-generation"
+
+        old_conversation = app.conversation
+        target = Conversation()
+        await app.chat.store.save(target)
+
+        await app._switch_to(target.id)
+
+        for _ in range(60):
+            await pilot.pause()
+            if not app._generating:
+                break
+            await asyncio.sleep(0.05)
+
+        assert not app._generating
+        assert app.conversation.id == target.id
+        assert old_conversation.messages[-1].content.strip() != ""
+
+
+async def test_switch_to_unknown_id_notifies_and_leaves_conversation_unchanged():
+    app = ChatApp(mock_settings())
+    async with app.run_test():
+        current = app.conversation
+        await app._switch_to("does-not-exist")
+        assert app.conversation is current

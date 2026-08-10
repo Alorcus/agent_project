@@ -15,9 +15,9 @@ from textual.binding import Binding
 from textual.containers import Container, VerticalScroll
 from textual.widgets import Footer, Header, Input, Static
 
-from agentchat.config import Settings, build_registry
+from agentchat.config import Settings, build_registry, build_store
 from agentchat.core.chat import ChatService
-from agentchat.core.errors import AgentChatError
+from agentchat.core.errors import AgentChatError, ModelNotFoundError
 from agentchat.core.models import Conversation, Message
 from agentchat.llm.base import GenerationOptions
 from agentchat.ui.widgets import MessageBubble
@@ -41,7 +41,7 @@ class ChatApp(App[None]):
         super().__init__()
         self.settings = settings or Settings.from_env()
         self.registry = build_registry(self.settings)
-        self.chat = ChatService(self.registry)
+        self.chat = ChatService(self.registry, store=build_store(self.settings))
         self.conversation: Conversation = Conversation()
         self.options = GenerationOptions()
         self.status_text = ""
@@ -62,7 +62,8 @@ class ChatApp(App[None]):
         )
         yield Footer()
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
+        self.conversation = await self.chat.new_conversation()
         self.query_one("#prompt", Input).focus()
         self._refresh_status()
 
@@ -97,14 +98,46 @@ class ChatApp(App[None]):
 
     async def action_new_conversation(self) -> None:
         self.action_stop()
+        await self.chat.persist(self.conversation)
         self.conversation = await self.chat.new_conversation()
-        log = self.query_one("#chat-log", VerticalScroll)
-        await log.remove_children()
-        await log.mount(
-            Static("New conversation.", classes="placeholder")
-        )
+        await self._show_conversation(self.conversation)
         self._refresh_status()
         self.query_one("#prompt", Input).focus()
+
+    async def _switch_to(self, conversation_id: str) -> None:
+        # A live generation holds bubbles that _show_conversation is about to
+        # remove, and its finally block writes to them after cancellation —
+        # so generation must be stopped before the log is torn down.
+        self.action_stop()
+        try:
+            await self.chat.persist(self.conversation)
+            self.conversation = await self.chat.switch_conversation(conversation_id)
+        except AgentChatError as error:
+            self.notify(str(error), severity="error")
+            return
+        await self._show_conversation(self.conversation)
+        self._refresh_status()
+        self.query_one("#prompt", Input).focus()
+
+    async def _show_conversation(self, conversation: Conversation) -> None:
+        log = self.query_one("#chat-log", VerticalScroll)
+        await log.remove_children()
+        if not conversation.messages:
+            await log.mount(Static("New conversation.", classes="placeholder"))
+            return
+        for message in conversation.messages:
+            await log.mount(
+                MessageBubble(message, model_name=self._model_name_for(message))
+            )
+        log.scroll_end(animate=False)
+
+    def _model_name_for(self, message: Message) -> str | None:
+        if message.role != "assistant":
+            return None
+        try:
+            return self.registry.info(message.model_id).name
+        except ModelNotFoundError:
+            return message.model_id
 
     def action_cycle_model(self) -> None:
         """Takes effect on the next turn; a running generation keeps the
