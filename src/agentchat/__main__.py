@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from agentchat.config import Settings
 from agentchat.core.memory.tuning import Tuning, log_effective_tuning
 from agentchat.log import setup_logging
@@ -10,7 +12,7 @@ from agentchat.ui.app import ChatApp
 
 def main() -> None:
     settings = Settings.from_env()
-    setup_logging(settings.data_dir)
+    setup_logging(settings.data_dir,  logging.DEBUG)
     log_effective_tuning(Tuning.from_env())
     ChatApp(settings).run()
 

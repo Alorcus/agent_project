@@ -26,10 +26,11 @@ from typing import Any
 
 from agentchat.llm.base import GenerationOptions
 
+from .embed import pack
 from .models import FragmentCitation, FragmentSupport, MemoryFragment
 from .store import ApplyResult, FragmentWrite, MemoryStore, Watermark
-from .tuning import Tuning
-from .types import EvidenceItem, EvidenceSource, PromptTurn
+from .tuning import BY_NAME, Tuning
+from .types import EmbeddingProvider, EvidenceItem, EvidenceSource, PromptTurn
 
 _LOG = logging.getLogger(__name__)
 
@@ -112,8 +113,8 @@ class Claim:
 
     text: str
     kind: str = "fact"
-    importance: float = 5.0
-    confidence: float = 0.5
+    importance: float = BY_NAME["claim_importance_default"].default
+    confidence: float = BY_NAME["claim_confidence_default"].default
     evidence: tuple[EvidenceItem, ...] = ()
     reasoning: str | None = None
 
@@ -162,8 +163,13 @@ _WORD_RE = re.compile(r"\w+")
 
 
 def parse_claims(
-    reply: str, items: Sequence[EvidenceItem], *, thinking: bool = False
+    reply: str,
+    items: Sequence[EvidenceItem],
+    *,
+    thinking: bool = False,
+    tuning: Tuning | None = None,
 ) -> list[Claim]:
+    tuning = tuning or Tuning.from_env()
     body, trace = _split_thinking(reply)
     raw = _load_json_array(body)
     by_index = {i: item for i, item in enumerate(items, start=1)}
@@ -182,8 +188,12 @@ def parse_claims(
             Claim(
                 text=text.strip(),
                 kind=_as_str(obj.get("kind"), default="fact"),
-                importance=_clamp(obj.get("importance"), 1.0, 10.0, default=5.0),
-                confidence=_clamp(obj.get("confidence"), 0.0, 1.0, default=0.5),
+                importance=_clamp(
+                    obj.get("importance"), 1.0, 10.0, default=tuning.claim_importance_default
+                ),
+                confidence=_clamp(
+                    obj.get("confidence"), 0.0, 1.0, default=tuning.claim_confidence_default
+                ),
                 evidence=tuple(evidence),
                 reasoning=_reasoning(obj.get("why"), trace, thinking=thinking),
             )
@@ -367,10 +377,18 @@ class MemoryExtractor:
     """The six stages of rule 3, in order; `run()` composes them into one
     watermarked write."""
 
-    def __init__(self, store: MemoryStore, provider: Any, tuning: Tuning | None = None) -> None:
+    def __init__(
+        self,
+        store: MemoryStore,
+        provider: Any,
+        tuning: Tuning | None = None,
+        *,
+        encoder: EmbeddingProvider | None = None,
+    ) -> None:
         self._store = store
         self._provider = provider
         self._tuning = tuning or Tuning.from_env()
+        self._encoder = encoder
 
     async def run(self, source: EvidenceSource, *, thinking: bool = False) -> ApplyResult | None:
         scope_id = self._store.memory_scope(source.scope_id)
@@ -400,7 +418,7 @@ class MemoryExtractor:
     async def propose(self, items: Sequence[EvidenceItem], *, thinking: bool = False) -> list[Claim]:
         reply = await self._generate(EXTRACTION_PROMPT, render_evidence(items), thinking=thinking)
         _LOG.debug("propose reply: %s", reply)
-        return parse_claims(reply, items, thinking=thinking)
+        return parse_claims(reply, items, thinking=thinking, tuning=self._tuning)
 
     def retrieve(self, claims: Sequence[Claim], *, scope_id: str) -> list[Candidate]:
         if not claims:
@@ -437,6 +455,7 @@ class MemoryExtractor:
             for write in (self._write_for(d, scope_id=scope_id, source=source) for d in decisions)
             if write is not None
         ]
+        self._embed(writes)
         watermark = None
         if source.read_through is not None:
             extracted_at, extracted_id = source.read_through
@@ -446,6 +465,20 @@ class MemoryExtractor:
         return self._store.apply(writes, watermark=watermark)
 
     # -- helpers ---------------------------------------------------------
+
+    def _embed(self, writes: Sequence[FragmentWrite]) -> None:
+        """Encode every write's text, in `EMBED_BATCH` batches — the one
+        place extraction touches embeddings (§ 2 of the stage-3 plan).
+        Reinforcement leaves text alone, so it leaves the vector alone too."""
+        if self._encoder is None:
+            return
+        targets = [write for write in writes if not write.reinforce]
+        for start in range(0, len(targets), self._tuning.embed_batch):
+            batch = targets[start : start + self._tuning.embed_batch]
+            vectors = self._encoder.encode([write.fragment.text for write in batch])
+            for write, vector in zip(batch, vectors):
+                write.fragment.embedding = pack(vector)
+                write.fragment.embedding_model = self._encoder.model_id
 
     async def _revise(self, decision: Decision, *, thinking: bool) -> Decision:
         assert decision.candidate is not None

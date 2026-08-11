@@ -16,11 +16,15 @@ from datetime import datetime
 from pathlib import Path
 
 from agentchat.core.errors import StorageError
+from agentchat.core.memory import embed
+from agentchat.core.memory.embed import EmbeddingAudit
 from agentchat.core.memory.models import FragmentCitation, FragmentSupport, Group, MemoryFragment
+from agentchat.core.memory.rank import RankItem, core_order, fill, rank_and_select
 from agentchat.core.memory.store import ApplyResult, ConfidenceChange, FragmentWrite, Watermark
 from agentchat.core.memory.tuning import Tuning
-from agentchat.core.memory.types import Tier
+from agentchat.core.memory.types import EmbeddingProvider, Tier
 from agentchat.core.models import _now
+from agentchat.core.tokens import estimate_tokens
 from agentchat.storage import schema
 
 #: Words only — a user's own phrasing routed straight into FTS5 MATCH would
@@ -107,9 +111,12 @@ SELECT 1 FROM reach WHERE id = :fragment
 class SqliteMemoryStore:
     """Synchronous `MemoryStore` over the same file as `SqliteStore`."""
 
-    def __init__(self, path: Path, tuning: Tuning | None = None) -> None:
+    def __init__(
+        self, path: Path, tuning: Tuning | None = None, encoder: EmbeddingProvider | None = None
+    ) -> None:
         self.path = path  # public: tests and factories write through it
         self._tuning = tuning or Tuning.from_env()
+        self._encoder = encoder
         schema.ensure_schema(path)
 
     def memory_scope(self, group_id: str) -> str | None:
@@ -143,7 +150,14 @@ class SqliteMemoryStore:
         ]
 
     def stable_core(self, group_id: str, budget: int) -> list[MemoryFragment]:
-        raise NotImplementedError("stage 3")
+        pool = self._pool(group_id, Tier.CONSOLIDATED)
+        if not pool:
+            return []
+        items = [self._to_rank_item(fragment, {}) for fragment in pool]
+        ordered = core_order(items, now=_now(), tuning=self._tuning)
+        filled = fill(ordered, budget=budget, cost=estimate_tokens)
+        by_id = {fragment.id: fragment for fragment in pool}
+        return [by_id[item.id] for item in filled]
 
     def select(
         self,
@@ -153,7 +167,105 @@ class SqliteMemoryStore:
         *,
         tiers: Tier = Tier.EXTRACTED,
     ) -> list[MemoryFragment]:
-        raise NotImplementedError("stage 3")
+        if self._encoder is None:  # fail closed — no floor without an encoder
+            return []
+        (query_vector,) = self._encoder.encode([query])
+
+        pool = self._pool(group_id, tiers)
+        if not pool:
+            return []
+        bm25_ranks = self._bm25_ranks(group_id, query)
+        items = [self._to_rank_item(fragment, bm25_ranks) for fragment in pool]
+
+        chosen = rank_and_select(
+            items, query_vector, budget=budget, cost=estimate_tokens, now=_now(), tuning=self._tuning
+        )
+        by_id = {fragment.id: fragment for fragment in pool}
+        return [by_id[item.id] for item in chosen]
+
+    def embedding_audit(self, encoder_id: str | None) -> EmbeddingAudit:
+        with closing(schema.connect(self.path)) as conn:
+            total = conn.execute("SELECT COUNT(*) FROM memory_fragments").fetchone()[0]
+            missing = conn.execute(
+                "SELECT COUNT(*) FROM memory_fragments WHERE embedding_model IS NULL"
+            ).fetchone()[0]
+            usable = (
+                0
+                if encoder_id is None
+                else conn.execute(
+                    "SELECT COUNT(*) FROM memory_fragments WHERE embedding_model = ?", (encoder_id,)
+                ).fetchone()[0]
+            )
+        return EmbeddingAudit(total=total, usable=usable, missing=missing, stale=total - missing - usable)
+
+    def fragments_needing_embedding(self, encoder_id: str, limit: int) -> list[MemoryFragment]:
+        """Ordered by id, so a bounded pass is resumable and two passes never
+        re-encode the same row."""
+        sql = f"""
+            SELECT {_FRAGMENT_SELECT}
+              FROM memory_fragments f
+             WHERE f.embedding_model IS NULL OR f.embedding_model != ?
+             ORDER BY f.id
+             LIMIT ?
+        """
+        with closing(schema.connect(self.path)) as conn:
+            rows = conn.execute(sql, (encoder_id, limit)).fetchall()
+        return [_row_to_fragment(row) for row in rows]
+
+    def _pool(self, group_id: str, tiers: Tier) -> list[MemoryFragment]:
+        """The group's fragments in `tiers` with `confidence > 0` (I-13's
+        gate), freshest first, capped at `RECALL_POOL_K` — what both
+        `select()` and `stable_core()` rank over."""
+        values = [v for flag, v in ((Tier.EXTRACTED, 0), (Tier.CONSOLIDATED, 1)) if tiers & flag]
+        if not values:
+            return []
+        placeholders = ", ".join("?" * len(values))
+        sql = f"""
+            SELECT {_FRAGMENT_SELECT},
+                   s.citation_count, s.conversation_count, s.first_seen_at, s.last_seen_at
+              FROM memory_fragments f
+              LEFT JOIN fragment_support s ON s.fragment_id = f.id
+             WHERE f.group_id = ? AND f.confidence > 0 AND f.consolidated IN ({placeholders})
+             ORDER BY COALESCE(s.last_seen_at, f.created_at) DESC, f.id
+             LIMIT ?
+        """
+        with closing(schema.connect(self.path)) as conn:
+            rows = conn.execute(sql, (group_id, *values, self._tuning.recall_pool_k)).fetchall()
+        return [
+            _row_to_fragment(row[:_FRAGMENT_COLUMN_COUNT], _support_from(row[_FRAGMENT_COLUMN_COUNT:]))
+            for row in rows
+        ]
+
+    def _bm25_ranks(self, group_id: str, query: str) -> dict[int, int]:
+        match = _fts_match(query)
+        if match is None:
+            return {}
+        sql = """
+            SELECT f.id
+              FROM memory_fragments f
+              JOIN memory_fts ON memory_fts.rowid = f.id
+             WHERE f.group_id = ? AND memory_fts MATCH ?
+             ORDER BY bm25(memory_fts)
+        """
+        with closing(schema.connect(self.path)) as conn:
+            rows = conn.execute(sql, (group_id, match)).fetchall()
+        return {row[0]: position for position, row in enumerate(rows, start=1)}
+
+    def _to_rank_item(self, fragment: MemoryFragment, bm25_ranks: dict[int, int]) -> RankItem:
+        vector = None
+        if self._encoder is not None and fragment.embedding_model == self._encoder.model_id:
+            vector = embed.unpack(fragment.embedding)
+        support = fragment.support
+        return RankItem(
+            id=fragment.id,
+            text=fragment.text,
+            kind=fragment.kind,
+            importance=fragment.importance,
+            last_seen_at=support.last_seen_at if support is not None else fragment.created_at,
+            conversation_count=support.conversation_count if support is not None else 0,
+            embedding=vector,
+            bm25_rank=bm25_ranks.get(fragment.id),
+        )
 
     def purge_conversation(self, conversation_id: str) -> None:
         raise NotImplementedError("stage 4")
@@ -197,11 +309,16 @@ class SqliteMemoryStore:
             newly_inserted.append(is_new)
 
         inserted = [
-            ids[i] for i, w in enumerate(writes) if not w.reinforce and newly_inserted[i]
+            ids[i]
+            for i, w in enumerate(writes)
+            if not w.reinforce and not w.embedding_only and newly_inserted[i]
         ]
         revised = [
-            ids[i] for i, w in enumerate(writes) if not w.reinforce and not newly_inserted[i]
+            ids[i]
+            for i, w in enumerate(writes)
+            if not w.reinforce and not w.embedding_only and not newly_inserted[i]
         ]
+        reembedded = [ids[i] for i, w in enumerate(writes) if w.embedding_only]
 
         # Phases 2-3: citations, one at a time, then the reinforcement raise
         # for whatever in this write's batch turned out to be genuinely new.
@@ -230,6 +347,7 @@ class SqliteMemoryStore:
             revised=revised,
             citations_added=citations_added,
             confidence_changes=confidence_changes,
+            reembedded=reembedded,
         )
 
     def _upsert_fragment(
@@ -243,6 +361,18 @@ class SqliteMemoryStore:
                 "SELECT id FROM memory_fragments WHERE id = ?", (fragment.id,)
             ).fetchone()
             existing = row[0] if row is not None else None
+
+        if write.embedding_only:
+            if existing is None:
+                raise StorageError(
+                    "embedding_only=True requires an existing fragment row "
+                    f"(fragment.id={fragment.id!r})"
+                )
+            conn.execute(
+                "UPDATE memory_fragments SET embedding = ?, embedding_model = ? WHERE id = ?",
+                (fragment.embedding, fragment.embedding_model, existing),
+            )
+            return existing, False
 
         if write.reinforce:
             if existing is None:

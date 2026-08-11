@@ -59,10 +59,23 @@ CATALOGUE: tuple[Constant, ...] = (
              "how much of a turn a citation quotes for the inspector", "§ 2.1"),
     Constant("EXTRACT_CLOSE_TIMEOUT", "extract_close_timeout", 30.0, "guess",
              "seconds the flush-on-close waits before the app stops caring", "§ 2.1"),
+    Constant("CLAIM_IMPORTANCE_DEFAULT", "claim_importance_default", 5.0, "guess",
+             "importance for a claim the model did not score", "§ 2.1"),
+    Constant("CLAIM_CONFIDENCE_DEFAULT", "claim_confidence_default", 0.5, "guess",
+             "confidence for a claim the model did not score", "§ 2.1"),
     Constant("RECALL_FLOOR", "recall_floor", 0.35, "guess",
              "cosine admission gate; embedding-model specific", "§ 6.1"),
-    Constant("RECALL_FLOOR_MODEL", "recall_floor_model", "", "guess",
+    Constant("RECALL_FLOOR_MODEL", "recall_floor_model",
+             "sentence-transformers/all-MiniLM-L6-v2", "guess",
              "pinned encoder id the floor above is calibrated against", "§ 6.1"),
+    Constant("ENCODER_MODEL", "encoder_model", "sentence-transformers/all-MiniLM-L6-v2", "guess",
+             "the encoder recall embeds and queries with", "§ 1"),
+    Constant("EMBED_BATCH", "embed_batch", 16, "guess",
+             "texts per encoder call, extraction and re-embed alike", "§ 2"),
+    Constant("REEMBED_LIMIT", "reembed_limit", 64, "guess",
+             "stale fragments one background pass repairs", "§ 2"),
+    Constant("RECALL_POOL_K", "recall_pool_k", 200, "guess",
+             "fragments `select()` considers before the floor", "§ 4"),
     Constant("RRF_K", "rrf_k", 60, "borrowed",
              "standard reciprocal-rank-fusion constant", "§ 6"),
     Constant("DECAY_K", "decay_k", 2, "borrowed",
@@ -135,8 +148,18 @@ class Tuning:
     extract_close_timeout: float = field(
         default_factory=lambda: _resolve(BY_NAME["extract_close_timeout"])
     )
+    claim_importance_default: float = field(
+        default_factory=lambda: _resolve(BY_NAME["claim_importance_default"])
+    )
+    claim_confidence_default: float = field(
+        default_factory=lambda: _resolve(BY_NAME["claim_confidence_default"])
+    )
     recall_floor: float = field(default_factory=lambda: _resolve(BY_NAME["recall_floor"]))
     recall_floor_model: str = field(default_factory=lambda: _resolve(BY_NAME["recall_floor_model"]))
+    encoder_model: str = field(default_factory=lambda: _resolve(BY_NAME["encoder_model"]))
+    embed_batch: int = field(default_factory=lambda: _resolve(BY_NAME["embed_batch"]))
+    reembed_limit: int = field(default_factory=lambda: _resolve(BY_NAME["reembed_limit"]))
+    recall_pool_k: int = field(default_factory=lambda: _resolve(BY_NAME["recall_pool_k"]))
     rrf_k: int = field(default_factory=lambda: _resolve(BY_NAME["rrf_k"]))
     decay_k: int = field(default_factory=lambda: _resolve(BY_NAME["decay_k"]))
     alpha_decision: float = field(default_factory=lambda: _resolve(BY_NAME["alpha_decision"]))

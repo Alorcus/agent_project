@@ -28,6 +28,10 @@ class FragmentWrite:
     #: genuinely new. False means the fragment's own values are
     #: authoritative — new and revise.
     reinforce: bool = False
+    #: Refresh `embedding`/`embedding_model` on an existing row and nothing
+    #: else — not a revision, so no `revised_at` and no text change. Mutually
+    #: exclusive with `reinforce`.
+    embedding_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -50,6 +54,8 @@ class ApplyResult:
     revised: list[int] = field(default_factory=list)
     citations_added: int = 0
     confidence_changes: list[ConfidenceChange] = field(default_factory=list)
+    #: `embedding_only` writes — never in `inserted` or `revised`.
+    reembedded: list[int] = field(default_factory=list)
 
 
 class MemoryStore(Protocol):

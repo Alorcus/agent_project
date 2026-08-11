@@ -7,6 +7,7 @@ scrolling, switching models and stopping all stay live while tokens arrive.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 from textual import work
@@ -16,10 +17,12 @@ from textual.containers import Container, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Footer, Header, Input, Static
 
-from agentchat.config import Settings, build_memory_store, build_registry, build_store
+from agentchat.config import Settings, build_encoder, build_memory_store, build_registry, build_store
 from agentchat.core.chat import ChatService
+from agentchat.core.context import RecencyWindowStrategy
 from agentchat.core.errors import AgentChatError, ModelNotFoundError
-from agentchat.core.memory.strategy import ChatMemory
+from agentchat.core.memory.embed import check_encoder
+from agentchat.core.memory.strategy import ChatMemory, GroupMemoryStrategy
 from agentchat.core.memory.tuning import Tuning
 from agentchat.core.models import Conversation, Message
 from agentchat.llm.base import GenerationOptions
@@ -46,13 +49,32 @@ class ChatApp(App[None]):
         super().__init__()
         self.settings = settings or Settings.from_env()
         self.registry = build_registry(self.settings)
-        memory_store = build_memory_store(self.settings)
+        encoder = build_encoder(self.settings)
+        memory_store = build_memory_store(self.settings, encoder=encoder)
         memory = (
-            ChatMemory(memory_store, self.registry.active_provider)
+            ChatMemory(memory_store, self.registry.active_provider, encoder=encoder)
             if memory_store is not None
             else None
         )
-        self.chat = ChatService(self.registry, store=build_store(self.settings), memory=memory)
+        context_strategy = (
+            GroupMemoryStrategy(inner=RecencyWindowStrategy(), store=memory_store)
+            if memory_store is not None
+            else None
+        )
+        self.chat = ChatService(
+            self.registry,
+            store=build_store(self.settings),
+            memory=memory,
+            context_strategy=context_strategy,
+        )
+        if memory_store is not None:
+            audit = memory_store.embedding_audit(encoder.model_id if encoder else None)
+            check_encoder(
+                audit,
+                encoder_id=encoder.model_id if encoder else None,
+                tuning=Tuning.from_env(),
+                log=logging.getLogger(__name__),
+            )
         self.conversation: Conversation = Conversation()
         self.options = GenerationOptions()
         self.status_text = ""

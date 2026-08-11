@@ -298,6 +298,20 @@ reaches every fragment including dormant.
 
 ## Changelog
 
+- **2026-08-11** — Stage 3 landed. The read path: `rank.py`'s floor → RRF
+  fusion (four terms) → MMR, per-kind decay from `fragment_support.last_seen_at`;
+  the embedding lifecycle (`core/memory/embed.py` — pack/unpack/cosine,
+  `EmbeddingAudit`, `check_encoder`, `reembed`) written at extraction time and
+  repaired incrementally for what stage 2 left behind; `select()` and
+  `stable_core()` on `SqliteMemoryStore`, composing `rank.py` over rows;
+  `GroupMemoryStrategy` and § 2.2's two-block prompt layout, with budgets as
+  window fractions and `ContextDecision.recalled`/`.core`; the pinned CPU
+  sentence encoder (`sentence-transformers/all-MiniLM-L6-v2`, `llm/embed.py`'s
+  `LocalEncoder`) behind `EmbeddingProvider`, fail-closed when its weights are
+  absent; the startup guard § 9 asks for. `core/tokens.py` is new — the token
+  estimator moved out of `core/context.py` so `rank.py` can use it without
+  importing chat types (I-6). `embed.py` joins rule 2's persona-forward module
+  list, armed into the I-6 lint at this stage.
 - **2026-08-11** — Stage 2 landed. The extraction pipeline (`observe -> audit
   -> propose -> retrieve -> resolve -> apply`), the wire format and its three
   pure parsers, `candidates()`'s BM25 retrieval, the chat-side adapters

@@ -8,6 +8,7 @@ nowhere else.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -16,7 +17,10 @@ from dotenv import find_dotenv, load_dotenv
 
 from agentchat.core.errors import AgentChatError
 from agentchat.core.memory.store import MemoryStore
+from agentchat.core.memory.tuning import Tuning
+from agentchat.core.memory.types import EmbeddingProvider
 from agentchat.llm.base import ModelInfo
+from agentchat.llm.embed import LocalEncoder, default_encoder_path
 from agentchat.llm.local import DEFAULT_MODEL_ROOT, TransformersProvider
 from agentchat.llm.local import default_models as local_models
 from agentchat.llm.mock import MockProvider
@@ -27,6 +31,8 @@ from agentchat.storage.memory import SqliteMemoryStore
 from agentchat.storage.sqlite import SqliteStore
 
 ENV_PREFIX = "AGENTCHAT_"
+
+_LOG = logging.getLogger(__name__)
 
 # Walks up from the cwd for a `.env` and merges it into os.environ. Real
 # environment variables always win — load_dotenv() never overwrites a key
@@ -103,6 +109,18 @@ class Settings:
             _env("MODEL_ROOT", str(DEFAULT_MODEL_ROOT)) or str(DEFAULT_MODEL_ROOT)
         )
     )
+    #: Where the pinned sentence encoder's weights live. Defaults under
+    #: ``model_root``, like every other checkpoint.
+    encoder_path: Path = field(
+        default_factory=lambda: Path(
+            _env("ENCODER_PATH")
+            or str(
+                default_encoder_path(
+                    Path(_env("MODEL_ROOT", str(DEFAULT_MODEL_ROOT)) or str(DEFAULT_MODEL_ROOT))
+                )
+            )
+        )
+    )
     #: Model id selected at startup; falls back to the first registered.
     default_model: str | None = field(default_factory=lambda: _env("MODEL"))
     #: Cap every model's context window — the escape hatch for a smaller GPU.
@@ -157,13 +175,34 @@ def build_store(settings: Settings) -> ConversationStore:
     return SqliteStore(settings.data_dir / "agentchat.db")
 
 
-def build_memory_store(settings: Settings) -> MemoryStore | None:
+def build_memory_store(
+    settings: Settings, encoder: EmbeddingProvider | None = None
+) -> MemoryStore | None:
     """`None` when the conversation store is non-durable — memory lives in the
     same file, and there is no in-memory implementation of `apply()`."""
     _require_choice("STORE", settings.store, STORES)
     if settings.store == "memory":
         return None
-    return SqliteMemoryStore(settings.data_dir / "agentchat.db")
+    return SqliteMemoryStore(settings.data_dir / "agentchat.db", encoder=encoder)
+
+
+def build_encoder(settings: Settings) -> EmbeddingProvider | None:
+    """The single wiring point for the sentence encoder. `None` — with a
+    `WARNING` naming the path it looked in — when the weights are absent or
+    fail to load, because a missing encoder must degrade recall, not stop the
+    app."""
+    tuning = Tuning.from_env()
+    path = settings.encoder_path
+    if not path.is_dir():
+        _LOG.warning("no encoder weights at %s — recall will run without a floor", path)
+        return None
+    encoder = LocalEncoder(tuning.encoder_model, path=path)
+    try:
+        encoder.load()
+    except Exception as error:  # noqa: BLE001 — a bad checkpoint degrades recall, not the app
+        _LOG.warning("failed to load the encoder from %s: %s", path, error)
+        return None
+    return encoder
 
 
 def _register_local(registry: ModelRegistry, settings: Settings) -> None:

@@ -3,6 +3,7 @@ domain model they share. See ``docs/plans/memory-and-groups.md``."""
 
 from __future__ import annotations
 
+from .embed import EmbeddingAudit, check_encoder, cosine, pack, reembed, unpack
 from .extract import (
     EXTRACTION_PROMPT,
     RESOLUTION_PROMPT,
@@ -17,14 +18,42 @@ from .extract import (
     parse_revision,
 )
 from .models import FragmentCitation, FragmentSupport, Group, MemoryFragment
+from .rank import (
+    RankItem,
+    Ranked,
+    admit,
+    core_order,
+    decay_factor,
+    diversify,
+    fill,
+    fuse,
+    rank_and_select,
+)
 from .store import ApplyResult, ConfidenceChange, FragmentWrite, MemoryStore, Watermark
-from .strategy import ChatMemory, ConversationEvidence, MessageEvidence
+from .strategy import (
+    CORE_BLOCK_TITLE,
+    RECALL_BLOCK_TITLE,
+    ChatMemory,
+    ConversationEvidence,
+    GroupMemoryStrategy,
+    MessageEvidence,
+    render_block,
+)
 from .tuning import CATALOGUE, Tuning, log_effective_tuning
-from .types import KNOWN_KINDS, EvidenceItem, EvidenceSource, FragmentKind, PromptTurn, Tier
+from .types import (
+    KNOWN_KINDS,
+    EmbeddingProvider,
+    EvidenceItem,
+    EvidenceSource,
+    FragmentKind,
+    PromptTurn,
+    Tier,
+)
 
 __all__ = [
     "ApplyResult",
     "CATALOGUE",
+    "CORE_BLOCK_TITLE",
     "Candidate",
     "ChatMemory",
     "Claim",
@@ -32,6 +61,8 @@ __all__ = [
     "ConversationEvidence",
     "Decision",
     "EXTRACTION_PROMPT",
+    "EmbeddingAudit",
+    "EmbeddingProvider",
     "EvidenceItem",
     "EvidenceSource",
     "FragmentCitation",
@@ -39,6 +70,7 @@ __all__ = [
     "FragmentSupport",
     "FragmentWrite",
     "Group",
+    "GroupMemoryStrategy",
     "KNOWN_KINDS",
     "MemoryExtractor",
     "MemoryFragment",
@@ -46,13 +78,29 @@ __all__ = [
     "MessageEvidence",
     "Outcome",
     "PromptTurn",
+    "RECALL_BLOCK_TITLE",
     "RESOLUTION_PROMPT",
     "REWRITE_PROMPT",
+    "RankItem",
+    "Ranked",
     "Tier",
     "Tuning",
     "Watermark",
+    "admit",
+    "check_encoder",
+    "core_order",
+    "cosine",
+    "decay_factor",
+    "diversify",
+    "fill",
+    "fuse",
     "log_effective_tuning",
+    "pack",
     "parse_claims",
     "parse_decisions",
     "parse_revision",
+    "rank_and_select",
+    "reembed",
+    "render_block",
+    "unpack",
 ]

@@ -56,6 +56,22 @@ token. `AGENTCHAT_MAX_CONTEXT` lowers them further for a smaller GPU.
 of gigabytes into `~/.cache/huggingface` per model, per user; a missing
 checkpoint fails loudly instead.
 
+**Chat memory's recall floor needs a sentence encoder** —
+`sentence-transformers/all-MiniLM-L6-v2`, pinned, ~90 MB, runs on the CPU in
+milliseconds. Same rule as the chat models: read by path with
+`local_files_only=True`, never downloaded at runtime. Fetch it once:
+
+```bash
+hf download sentence-transformers/all-MiniLM-L6-v2 \
+  --local-dir "$AGENTCHAT_MODEL_ROOT/sentence-transformers/all-MiniLM-L6-v2" \
+  --include "*.json" "*.txt" "model.safetensors"
+```
+
+The `--include` matters: the repo also ships ONNX, OpenVINO and TensorFlow
+copies of the same weights, and the app loads none of them. Without the
+weights, recall fails closed — the app runs, `select()` returns nothing, and a
+startup warning says so.
+
 ## Keys
 
 | Key | Action |
@@ -77,6 +93,7 @@ Environment variables, all prefixed `AGENTCHAT_`:
 |---|---|---|
 | `AGENTCHAT_BACKEND` | `local` | `local` for real weights, `mock` for the stub |
 | `AGENTCHAT_MODEL_ROOT` | `/sc/projects/sci-lippert/intelligent-agents/model_checkpoints` | Where the checkpoints live |
+| `AGENTCHAT_ENCODER_PATH` | `$AGENTCHAT_MODEL_ROOT/sentence-transformers/all-MiniLM-L6-v2` | Where the recall encoder's weights live |
 | `AGENTCHAT_MODEL` | first registered | Model selected at startup (`phi-4-mini`, `qwen3-14b`) |
 | `AGENTCHAT_MAX_CONTEXT` | unset | Cap every model's context window, for a smaller GPU |
 | `AGENTCHAT_STORE` | `sqlite` | `sqlite` for durable storage, `memory` for the non-durable stub |

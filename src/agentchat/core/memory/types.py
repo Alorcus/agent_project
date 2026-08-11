@@ -12,6 +12,16 @@ from typing import Protocol, runtime_checkable
 
 
 @runtime_checkable
+class EmbeddingProvider(Protocol):
+    """What `rank.py` and the store need from an encoder — never the model
+    itself, so no torch object crosses this seam."""
+
+    model_id: str
+
+    def encode(self, texts: Sequence[str]) -> list[tuple[float, ...]]: ...
+
+
+@runtime_checkable
 class EvidenceItem(Protocol):
     """What extraction consumes. The chat pipeline binds it to a message, the
     future persona pipeline to an email."""

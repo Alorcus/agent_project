@@ -101,6 +101,7 @@ class ChatService:
         decision = self.context_strategy.build(
             conversation.messages,
             context_window=provider.info.context_window,
+            conversation=conversation,
         )
 
         reply = conversation.add(

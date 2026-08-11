@@ -411,7 +411,12 @@ treats them identically. A null `last_consolidated_at` means "never consolidated
 and § 2.6 sums from the beginning.
 `ContextDecision.recalled` is the one addition to the existing dataclass — without
 it the UI cannot show what memory contributed, which NFR-CTX-05 asks for and § 8
-designs.
+designs. **Stage 3 adds `ContextDecision.core`** alongside it: § 8.1 shows the
+query-selected fragments per turn and the stable core once, so the two blocks are
+reported separately rather than concatenated. `ContextStrategy.build` and
+`GroupMemoryStrategy.build` also gain a keyword `conversation: Conversation |
+None = None` — `memory_scope` needs a group id, and the strategy is what holds
+the conversation that carries one; `RecencyWindowStrategy` accepts and ignores it.
 
 **Implementation note (stage 2).** `MemoryFragment.support` is the code-side name
 for the `1 -- 1` derived association already drawn above: populated by reads that
@@ -1231,8 +1236,13 @@ rank position only: the top fragment scores ~4/(k+1) whether it is a perfect mat
 or the least-bad of three irrelevant claims. Thresholding there would measure
 *agreement between the four rankings*, not relevance. BM25 is out for the reason
 already given above — unbounded and corpus-dependent — which leaves cosine as the
-only absolutely-calibrated signal in the stack. The embeddings are already computed
-for § 2.1's match step, so the gate costs nothing new.
+only absolutely-calibrated signal in the stack. **Stage 3 correction:** § 2.1's
+match step (`candidates()`) is BM25, not an embedding comparison — that diagram
+label was aspirational. The floor's vectors are written separately, at extraction
+time, for exactly this gate's benefit, and queried again on every recall turn; the
+gate is not free, it costs one encoder pass per written fragment and one per turn,
+both cheap enough on the pinned CPU encoder (§ 1 of the stage-3 plan) to sit on the
+reply path.
 
 **Not a judge.** An LLM relevance call was considered and rejected twice over. It
 reintroduces exactly what the scope section cuts — "an always-on, every-turn memory
@@ -1330,6 +1340,12 @@ Select iteratively until the budget is reached. This is GUM's approach (§ 2.1),
 which makes it citable rather than invented, and it subsumes the shared-citation
 problem: fragments resting on the same message are textually similar, so the
 diversity term suppresses them without needing a separate rule.
+
+**Stage 3 addition: `r̃ᵢ` is the fused RRF score normalised by the top score**,
+not the raw score. An un-normalised RRF score and a cosine similarity are not on
+the same scale — RRF scores cluster around `4/(k+1) ≈ 0.066` for `RRF_K = 60`, so
+the diversity term would dominate every comparison unless relevance is rescaled
+into the same `(0, 1]` range first.
 
 ---
 
@@ -1468,8 +1484,14 @@ it.
 | `EXTRACT_TEMPERATURE` | 0.0 | `guess` | greedy — the same turns should extract the same claims twice | § 2.1 |
 | `QUOTE_MAX_CHARS` | 240 | `guess` | how much of a turn a citation quotes for the inspector | § 2.1 |
 | `EXTRACT_CLOSE_TIMEOUT` | 30.0 | `guess` | seconds the flush-on-close waits before the app stops caring | § 2.1 |
+| `CLAIM_IMPORTANCE_DEFAULT` | 5.0 | `guess` | importance for a claim the model did not score | § 2.1 |
+| `CLAIM_CONFIDENCE_DEFAULT` | 0.5 | `guess` | confidence for a claim the model did not score | § 2.1 |
 | `RECALL_FLOOR` | 0.35 | `guess` | cosine admission gate; **embedding-model specific** | § 6.1 |
-| `RECALL_FLOOR_MODEL` | *empty (unpinned)* | `guess` | pinned encoder id the floor above is calibrated against | § 6.1 |
+| `RECALL_FLOOR_MODEL` | *changed:* `sentence-transformers/all-MiniLM-L6-v2` (was empty/unpinned) | `guess` | pinned encoder id the floor above is calibrated against | § 6.1 |
+| `ENCODER_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | `guess` | the encoder recall embeds and queries with | § 1 (stage-3 plan) |
+| `EMBED_BATCH` | 16 | `guess` | texts per encoder call, extraction and re-embed alike | § 2 (stage-3 plan) |
+| `REEMBED_LIMIT` | 64 | `guess` | stale fragments one background pass repairs | § 2 (stage-3 plan) |
+| `RECALL_POOL_K` | 200 | `guess` | fragments `select()` considers before the floor | § 4 (stage-3 plan) |
 | `RRF_K` | 60 | `borrowed` | standard reciprocal-rank-fusion constant | § 6 |
 | `DECAY_K` | 2 | `borrowed` | exponent multiplier, GUM | § 6.2 |
 | `ALPHA_DECISION`, `ALPHA_CONSTRAINT` | 0.01 | `guess` | ~35-day half-life | § 6.2 |
@@ -1482,6 +1504,16 @@ it.
 | `CONSOLIDATE_QUESTIONS` | 2 | `scaled` | theirs: 3 | § 2.6 |
 | `CONSOLIDATE_INSIGHTS` | 3 | `scaled` | theirs: 5 | § 2.6 |
 | `CONSOLIDATE_RECENT_N` | 30 | `scaled` | theirs: 100 | § 2.6 |
+
+`CLAIM_IMPORTANCE_DEFAULT`/`CLAIM_CONFIDENCE_DEFAULT` are stage 2's fallbacks for
+a claim the model left unscored, promoted here per rule 6 rather than staying
+inlined in `extract.py`. The four encoder/recall-sizing constants
+(`ENCODER_MODEL`, `EMBED_BATCH`, `REEMBED_LIMIT`, `RECALL_POOL_K`) and the
+`RECALL_FLOOR_MODEL` default are stage 3's addition — see
+`2026-08-11-006-memory-stage-3-read-path.md` § 1 for why
+`sentence-transformers/all-MiniLM-L6-v2` was picked and where its weights come
+from (read by path, `local_files_only=True`, fetched once with `hf download`;
+see `README.md`).
 
 **Budgets are fractions of the context window, not token counts.** NFR-CTX-04 asks
 that assembly survive a switch to a smaller model; absolute token budgets do not,
@@ -1535,6 +1567,21 @@ from now, the first question is which of these was in force.
 
 ## Changelog
 
+- **2026-08-11** — Stage 3 fold-back (`2026-08-11-006-memory-stage-3-read-path.md`).
+  `select()` and `stable_core()` are real: floor → RRF fusion (four terms) → MMR,
+  with per-kind decay from `fragment_support.last_seen_at`. § 1.3's
+  `ContextStrategy` and `GroupMemoryStrategy.build` gain a keyword
+  `conversation`; `ContextDecision` gains `core` beside `recalled`, reported
+  separately per § 8.1's two-block split. § 6.1's "the embeddings are already
+  computed for § 2.1's match step" is corrected — `candidates()` is BM25, and
+  the floor's vectors are a separate cost, paid once per written fragment and
+  once per turn. § 6.3 gains MMR's relevance-term normalisation. § 9 gains
+  seven constants — `ENCODER_MODEL`, `RECALL_FLOOR_MODEL` (now pinned to
+  `sentence-transformers/all-MiniLM-L6-v2` rather than empty), `EMBED_BATCH`,
+  `REEMBED_LIMIT`, `RECALL_POOL_K`, and stage 2's promoted
+  `CLAIM_IMPORTANCE_DEFAULT`/`CLAIM_CONFIDENCE_DEFAULT` — plus a startup guard
+  that warns on an unpinned or mismatched encoder and counts the fragments a
+  swap invalidates. `embed.py` joins rule 2's persona-forward module list.
 - **2026-08-10** — Stage 0 fold-back (`2026-08-10-003-memory-stage-0-scaffolding.md`).
   Added `RECALL_FLOOR_MODEL` to § 9 (`guess`, § 6.1) — required by § 6.1's prose but
   missing from the table. Folded the skeleton's `select(tiers=Tier.EXTRACTED)`
