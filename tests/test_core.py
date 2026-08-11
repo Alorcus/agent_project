@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from agentchat.config import ConfigurationError, Settings, build_registry, build_store
+from agentchat.config import ConfigurationError, Settings, build_store
 from agentchat.core.chat import ChatService
 from agentchat.core.context import RecencyWindowStrategy
 from agentchat.core.errors import ModelNotFoundError, ProviderError
@@ -13,16 +13,7 @@ from agentchat.llm.base import GenerationOptions, ModelInfo
 from agentchat.llm.mock import MockProvider
 from agentchat.storage.base import InMemoryStore
 from agentchat.storage.sqlite import SqliteStore
-
-
-def fast_registry(**overrides):
-    # Pinned to the stub backend on purpose: these tests are about orchestration
-    # (streaming, cancellation, residency), and they must not depend on a GPU or
-    # on the cluster's checkpoints being mounted.
-    overrides.setdefault("backend", "mock")
-    settings = Settings(**overrides)
-    registry = build_registry(settings)
-    return registry
+from conftest import fast_registry
 
 
 async def test_mock_provider_streams_multiple_chunks():
@@ -95,7 +86,9 @@ async def test_chat_service_records_both_turns_and_provenance():
 
 
 async def test_stopping_mid_stream_keeps_the_partial_reply():
-    registry = fast_registry()
+    # Needs a real mid-generation gap to cancel into — fast_registry()'s
+    # default near-zero delay would finish before the sleep below.
+    registry = fast_registry(mock_chunk_delay=None, mock_load_delay=None)
     chat = ChatService(registry)
     conversation = await chat.new_conversation()
 

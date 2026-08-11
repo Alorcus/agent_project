@@ -67,6 +67,18 @@ def _env_int(name: str) -> int | None:
         ) from None
 
 
+def _env_float(name: str) -> float | None:
+    raw = _env(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        raise ConfigurationError(
+            f"{ENV_PREFIX}{name} must be a number, got {raw!r}"
+        ) from None
+
+
 @dataclass
 class Settings:
     data_dir: Path = field(
@@ -96,6 +108,15 @@ class Settings:
     #: Simulate an unavailable backend, to exercise error handling.
     simulate_failure: bool = field(
         default_factory=lambda: _env_flag("SIMULATE_FAILURE")
+    )
+    #: Override the mock backend's per-chunk / load delay (only meaningful
+    #: when ``backend == "mock"``). ``None`` keeps ``mock.default_models()``'s
+    #: realistic per-model timing; tests use this to run near-instantly.
+    mock_chunk_delay: float | None = field(
+        default_factory=lambda: _env_float("MOCK_CHUNK_DELAY")
+    )
+    mock_load_delay: float | None = field(
+        default_factory=lambda: _env_float("MOCK_LOAD_DELAY")
     )
 
     @classmethod
@@ -149,7 +170,10 @@ def _register_local(registry: ModelRegistry, settings: Settings) -> None:
 
 
 def _register_mock(registry: ModelRegistry, settings: Settings) -> None:
-    for index, (info, kwargs) in enumerate(mock_models()):
+    models = mock_models(
+        chunk_delay=settings.mock_chunk_delay, load_delay=settings.mock_load_delay
+    )
+    for index, (info, kwargs) in enumerate(models):
         fail = settings.simulate_failure and index == 1
         info = _capped(info, settings.max_context)
         registry.register(
