@@ -1,6 +1,6 @@
 # Memory & Groups — implementation model
 
-**Status: v4 — confidence-based revision, immutable group binding, memory hierarchy.**
+**Status: v5 — consolidation modelled on Generative Agents reflection.**
 **Stage: prototype, single user. Schema changes are free; see "Relationship to plan 001".**
 
 Scope: the **chat memory mechanism** (NFR-S-02) and the **grouping** it is scoped
@@ -85,12 +85,12 @@ erDiagram
         text uuid UK
         text group_id FK "the scope — NOT NULL"
         text origin_conversation_id FK "provenance hint only, SET NULL"
-        int height "messages are 0, fragments 1 and up"
+        int consolidated "0 = extracted from messages, 1 = built from fragments"
         text kind "fact decision constraint open_question artefact"
         text text "self-contained claim, rewritten on revision"
         real confidence "0-1, revised. 0 = dormant, never evicted"
+        real importance "1-10 poignancy, set at creation. Drives the § 2.6 trigger"
         real decay "alpha — per-fragment staleness rate"
-        real salience
         blob embedding
         text reasoning "nullable — only when thinking mode was on"
         text created_at
@@ -108,18 +108,19 @@ erDiagram
 
 ## 1.1.1 The memory hierarchy
 
-Citations are polymorphic: a fragment cites **either** a message **or** a
-lower-height fragment. `CHECK` enforces exactly one of the two source columns is
-non-null. Messages are leaves at height 0; fragments are inner nodes.
+Citations are polymorphic: a fragment cites **either** a message **or** another
+fragment. `CHECK` enforces exactly one of the two source columns is non-null.
+Messages are leaves; fragments are inner nodes. This is *Generative Agents*'
+reflection tree (§ 2.6), applied to chat memory.
 
 ```mermaid
 flowchart BT
-    m1["message · h=0"]
-    m2["message · h=0"]
-    m3["message · h=0"]
-    f1["fragment · h=1<br/>we chose SQLite for storage"]
-    f2["fragment · h=1<br/>WAL, single writer"]
-    f3["fragment · h=2<br/>the storage approach is settled"]
+    m1["message"]
+    m2["message"]
+    m3["message"]
+    f1["extracted<br/>we chose SQLite for storage"]
+    f2["extracted<br/>WAL, single writer"]
+    f3["consolidated<br/>the storage approach is settled"]
     m1 --> f1
     m2 --> f1
     m2 --> f2
@@ -128,12 +129,17 @@ flowchart BT
     f2 --> f3
 ```
 
-**monotonic id ordering.** A fragment may only cite nodes with a
-strictly smaller creation id. Since ids are assigned monotonically, creation
+**Acyclicity by monotonic id ordering (I-8).** A fragment may only cite nodes with
+a strictly smaller creation id. Since ids are assigned monotonically, creation
 satisfies this automatically and revision needs one comparison. No column, no
 maintenance, no recomputation, and it is a total order so it is strictly stronger
 than needed — which costs nothing, because nothing wants to cite *forward* in time
 anyway.
+
+Depth is therefore **unbounded and unlabelled**: a consolidated fragment can itself
+be consolidated, exactly as reflections in *Generative Agents* can reflect on
+reflections. `consolidated` is a flag, not a level — it answers "was this built
+from fragments or from messages", which is the only distinction § 2.2 needs.
 
 - **The orphan sweep is transitive.** Deleting a message can sweep the fragments
   resting on it, which can sweep the fragments resting on *those*. Iterate to a
@@ -183,7 +189,7 @@ This reverses v1, which derived `group_id` by JOIN precisely because chats could
 move. Two v4 decisions force the change together: immutable binding makes the copy
 *safe*, and the hierarchy makes it *necessary* — a fragment at h ≥ 2 consolidating
 claims from four conversations has no meaningful origin conversation, so
-`conversation_id` cannot carry scope at every height. `group_id` is now the only
+`conversation_id` cannot carry scope at every tier. `group_id` is now the only
 scope key that works for all fragments.
 
 *Scope versus provenance versus evidence.* Three distinct jobs that v1 conflated
@@ -191,7 +197,7 @@ into `conversation_id`:
 
 | Column | Job |
 |---|---|
-| `group_id` | the scope. What NFR-S-02 bounds recall by. NOT NULL at every height. |
+| `group_id` | the scope. What NFR-S-02 bounds recall by. NOT NULL at every tier. |
 | `origin_conversation_id` | provenance hint for the UI — "this started in *Picker rewrite*". Nullable, `SET NULL` on delete, carries no cascade. |
 | `fragment_citations` | the evidence. What the fragment lives or dies by (I-4). |
 
@@ -284,12 +290,12 @@ classDiagram
         +uuid: str
         +group_id: str
         +origin_conversation_id: str
-        +height: int
+        +consolidated: bool
         +kind: FragmentKind
         +text: str
         +confidence: float
+        +importance: float
         +decay: float
-        +salience: float
         +reasoning: str
         +embedding: bytes
     }
@@ -358,7 +364,7 @@ classDiagram
 ```
 
 `FragmentCitation` hangs off `MemoryFragment` **and** off either a `Message` or a
-lower-height `MemoryFragment` — that is the polymorphic many-to-many of § 1.1.1.
+another `MemoryFragment` — that is the polymorphic many-to-many of § 1.1.1.
 No parent owns it.
 
 `origin_conversation_id`, `reasoning`, `embedding`, `quote`, `source_message_id`,
@@ -524,10 +530,16 @@ closely enough to be worth following deliberately rather than reinventing.
 | **Retrieve** | `candidates()` | BM25 → LLM rerank as identical / similar / unrelated. Their footnote 5 explicitly sanctions swapping BM25 for neural embeddings |
 | **Revise** | reinforce / revise | adopted in v4 — see below |
 
-**Adopted from GUM in v4.** No hard supersede: revision rewrites and regenerates
+**Adopted from GUM.** No hard supersede: revision rewrites and regenerates
 confidence, contradiction lowers it, and nothing is ever evicted. Per-fragment
 decay (§ 6). MMR for diversity (§ 6). Reasoning traces (§ 2.1, gated on thinking
-mode). Propositions built on propositions — the hierarchy of § 1.1.1.
+mode).
+
+**Not from GUM, contrary to v4.** The hierarchy of § 1.1.1 — fragments citing
+fragments — is *not* in that paper. GUM propositions are grounded only in
+observations, and it has no consolidation, enrichment or batching step of any kind
+(`consolidat`, `enrich`, `batch`, `hierarch` all appear zero times in the text).
+That mechanism comes from *Generative Agents* instead; see § 2.6.
 
 **Where the analogy is weaker.** GUM *infers* about a user from indirect
 observation, so confidence carries real weight there. Chat memory mostly records
@@ -565,7 +577,7 @@ sequenceDiagram
     else project group
         Store-->>GMS: group_id
         GMS->>Store: stable_core(group_id, core_budget)
-        Store-->>GMS: highest-height fragments, no query
+        Store-->>GMS: consolidated fragments, no query
         GMS->>Store: select(group_id, query=latest turn, sel_budget)
         Store->>Store: fuse bm25, decay-adjusted recency, support
         Store->>Store: MMR for diversity, drop confidence = 0
@@ -587,7 +599,7 @@ would invalidate the KV cache on every message.
 
 ```mermaid
 flowchart LR
-    A["system prompt"] --> B["stable group core<br/>highest-height fragments"]
+    A["system prompt"] --> B["stable group core<br/>consolidated fragments"]
     B --> C["conversation history<br/>from RecencyWindowStrategy"]
     C --> D["query-selected fragments"]
     D --> E["latest user turn"]
@@ -607,11 +619,11 @@ Two blocks, two jobs: the stable core is context **compression** (NFR-CTX-01), t
 query-selected block is context **selection by relevance** (NFR-CTX-03). Both are
 MUSTs, so both blocks are needed regardless of the cache argument.
 
-**Height splits them cleanly.** The stable core wants consolidated, general
-fragments — the h ≥ 2 layer, which literally *is* compression, built by folding
-lower nodes together. The query-selected block wants specific ones — the h = 1
-layer, closest to what was actually said. So the two blocks draw from different
-heights rather than competing for the same rows.
+**The `consolidated` flag splits them cleanly.** The stable core wants general
+fragments — the consolidated ones, which literally *are* compression, built by
+folding others together (§ 2.6). The query-selected block wants specific ones —
+those extracted directly from messages, closest to what was actually said. The two
+blocks draw from different tiers rather than competing for the same rows.
 
 ## 2.3 Fragment lifecycle
 
@@ -685,6 +697,69 @@ The loop is the one new cost: the hierarchy means a sweep can orphan the layer
 above, so it iterates to a fixpoint. One recursive CTE does it in a single
 statement.
 
+## 2.6 Consolidation — reflection over fragments
+
+Modelled directly on *Generative Agents* § 4.2 (Park et al., UIST '23,
+[doi:10.1145/3586183.3606763](https://doi.org/10.1145/3586183.3606763)). Their
+reflection step is the closest published thing to what this design needs, and it
+is where the hierarchy of § 1.1.1 comes from — **not** from GUM, which has no
+consolidation and whose propositions are only ever grounded in observations.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Store as MemoryStore
+    participant Con as Consolidator
+    participant LLM as LLMProvider
+
+    Note over Store: accumulated importance since the<br/>last consolidation crosses the threshold
+    Store-)Con: trigger(group_id)
+    Con->>Store: recent(group_id, n)
+    Store-->>Con: n most recent fragments
+
+    Con->>LLM: "what are the 3 most salient high-level<br/>questions we can answer about these?"
+    LLM-->>Con: candidate questions
+
+    loop per question
+        Con->>Store: select(group_id, query=question)
+        Store-->>Con: relevant fragments — extracted and consolidated alike
+        Con->>LLM: "what high-level insights follow?<br/>cite the statements used"
+        LLM-->>Con: insights, each citing statement indices
+    end
+
+    Con->>Con: resolve each insight as new / reinforce / revise
+    Con->>Store: write consolidated fragments,<br/>citing the fragments named as evidence
+    Con->>Store: sync memory_fts
+```
+
+**The trigger is accumulated importance, not a fragment count.** Generative Agents
+fires when the summed importance of recent events crosses a threshold (150 in
+theirs, reflecting two or three times a day). That self-regulates in a way a count
+cannot: fifteen turns of throat-clearing do not trigger, three decisions do. Chat
+turns vary in significance at least as much as their agents' observations do, so
+the same argument applies here.
+
+**The evidence citation is the mechanism, not a nicety.** Their insight prompt asks
+for output in the form `insight (because of 1, 5, 3)`, indices into the statement
+list given in the prompt. Parsing those indices is exactly how a consolidated
+fragment's `fragment_citations` rows get written — the LLM names its evidence and
+we store the pointers. Without it, consolidated fragments would have no
+provenance and I-4 could not hold for them.
+
+Starting numbers, from their implementation: **3 questions, 5 insights each**, over
+the *n* most recent fragments. Ours should start lower — a chat group accumulates
+far more slowly than 25 agents living in a simulated town.
+
+**Where we deviate deliberately:** Generative Agents pools reflections and
+observations in one retrieval, scoring them together. § 2.2 keeps consolidated
+fragments in the stable core and extracted ones in the query-selected block. Theirs
+is simpler; ours buys the KV-cache split and a cleaner mapping onto
+NFR-CTX-01 vs NFR-CTX-03. Worth revisiting if the split proves fussy.
+
+⏸ Their recency decays over time since a memory was **last retrieved**, not since
+it was created — so frequently-recalled memories stay hot. That is a nicer model
+than § 6's age-based decay, at the cost of a write on every retrieval. § 7 #15.
+
 ## 2.5 Conversations do not move between groups
 
 A conversation is assigned to its group at creation and **bound to it for life**.
@@ -718,7 +793,7 @@ to get it right.
 | I-5 | Fragment text is self-contained — no unresolved pronouns or references. | Extraction prompt; unenforceable in schema |
 | I-6 | Memory code never reads persona data, and persona code never reads fragments. | Package boundary; if they ever meet it is at prompt assembly, explicitly |
 | I-7 | A (fragment, source) pair is cited at most once. | Two partial unique indexes (§ 1.1.1) |
-| I-8 | The citation graph is acyclic. | § 1.1.1 — mechanism still open |
+| I-8 | The citation graph is acyclic. | A fragment cites only strictly smaller ids (§ 1.1.1) |
 | I-9 | A fragment cites either a message or a fragment, never both and never neither. | `CHECK` on the citation row |
 | I-10 | Confidence-0 fragments are retained, not deleted. | Sweep keys on citations only, never on confidence |
 
@@ -772,7 +847,7 @@ what to cut first if the schedule tightens. Listed most-cuttable first.
 | KV-cache-aware prompt split | Slower per turn. Both blocks are still required; only their placement is an optimisation. |
 
 Cutting the hierarchy removes § 1.1.1 entirely, along with the transitive sweep,
-I-8 and I-9, and the height-splits-the-two-blocks argument in § 2.2. It does
+I-8 and I-9, and the consolidated-vs-extracted split in § 2.2. It does
 **not** collapse the many-to-many: one message can support several fragments
 within a single conversation too.
 
@@ -784,7 +859,8 @@ Fusion over ranks, not scores. BM25 values are unbounded and corpus-dependent, s
 weights tuned on one group are wrong for the next.
 
 ```
-score(f) = 1/(k + rank_bm25(f)) + 1/(k + rank_recency(f)) + 1/(k + rank_support(f))
+score(f) = 1/(k + rank_bm25(f))    + 1/(k + rank_recency(f))
+         + 1/(k + rank_support(f)) + 1/(k + rank_importance(f))
 k ≈ 60
 ```
 
@@ -798,6 +874,11 @@ k ≈ 60
   `rank_recency` is the ordering of `r̃`. `kind` already correlates with decay
   (`decision` slow, `open_question` fast), so `α` can start as a per-kind constant
   before asking the model for it.
+- `rank_importance` orders by the 1–10 poignancy set at creation. Generative
+  Agents scores retrieval as recency + importance + relevance, so having the field
+  for the § 2.6 trigger and *not* using it to rank would be the odd choice. It is
+  the one term that is constant per fragment — the others all move — which is
+  exactly what keeps a mundane but recent claim from crowding out a decision.
 - `rank_support` orders by `conversation_count`, not `citation_count`, and
   saturates: `log(1 + conversation_count)`. Two messages five turns apart in one
   session is usually the user rephrasing, not independent confirmation.
@@ -865,7 +946,7 @@ Three reasons for collapsed-by-default rather than the always-visible grey block
 - Recall is background reassurance most of the time and forensic detail
   occasionally. Collapsed serves the first, one keypress serves the second.
 
-Textual's `Collapsible` does this natively. ⏸ Whether the collapsed line appears on
+Textual's `Collapsible` does this natively. Collapsed line appears on
 turns where nothing was recalled — an explicit "0 memories" is honest and makes
 absence visible, but adds a line to every turn in a default-group chat where recall
 never happens. § 7 #13.
@@ -909,9 +990,11 @@ has no way to know their memory is being built in a degraded mode.
 
 | # | Question | Blocks |
 |---|---|---|
-| ⏸ 13 | Does the recall line appear on turns where nothing was recalled? Explicit "0 memories" makes absence visible but adds a line to every turn in a default-group chat. | § 8.1 |
-| ⏸ 14 | What triggers consolidation into a higher fragment — a fragment-count threshold, a schedule, or `stable_core` overflowing its budget? Demand-driven has the most natural trigger. | § 1.1.1, § 2.2 |
-| ⏸ 3 | Salience: model-assigned at extraction, or derived from support and recency alone? A derived value is one less thing for a small model to get wrong. Now overlaps confidence — possibly one of the two should go. | § 6 |
+| ✔ 13 | *Resolved.* Recall line on turns where nothing was recalled — "0 memories". | § 8.1 |
+| ✔ 3 | *Resolved.* Keep both. `salience` renamed `importance` (Generative Agents' term); it drives the § 2.6 trigger and joins the § 6 fusion. `confidence` is a separate axis and carries revision. | § 1.1, § 2.6, § 6 |
+| ⏸ 15 | Recency by age, or by time since last *retrieval*? Generative Agents decays from last access, so frequently-recalled fragments stay hot. Better model; costs a write on every retrieval. | § 6, § 2.6 |
+| ⏸ 16 | Consolidation threshold and fan-out. Theirs: 150 accumulated importance, 3 questions, 5 insights, over the 100 most recent records. A chat group accumulates far more slowly, so these want scaling down — and the numbers are guesses until there is a real group to watch. | § 2.6 |
+| ✔ 14 | *Resolved.* Consolidation follows *Generative Agents* reflection: importance-threshold trigger, generate salient questions, retrieve per question, generate insights citing their evidence, feed back through new/reinforce/revise. | § 2.6 |
 | ⏸ 5 | Backfill trigger. Chats predating the feature and failed extractions both need one; is it manual or on-open? | § 2.1 |
 | ⏸ 7 | Does the extractor get told which messages it already cited for a candidate fragment? Without it, reinforce decisions may re-cite the same message — harmless (I-7 dedupes) but wasteful of prompt budget. | § 2.1 |
 | ⏸ 11 | Is `α` (decay rate) a per-`kind` constant or model-generated per fragment? Per-kind is free and has no failure mode; model-generated is more expressive and is what GUM does. | § 6 |
@@ -927,6 +1010,19 @@ has no way to know their memory is being built in a degraded mode.
 
 ## Changelog
 
+- **2026-08-10** — v5.1. Resolved #13 (no recall line when nothing was recalled)
+  and #3 (`salience` → `importance`, kept alongside `confidence`). `rank_importance`
+  added as a fourth fusion term, matching Generative Agents' recency + importance +
+  relevance.
+- **2026-08-10** — v5. Consolidation designed against *Generative Agents* § 4.2
+  (Park et al., UIST '23) — importance-threshold trigger, salient-question
+  generation, per-question retrieval, insights citing their own evidence. Corrected
+  v4's claim that the fragment-cites-fragment hierarchy came from GUM: it does not,
+  and GUM has no consolidation step at all. `height` removed in favour of the
+  `consolidated` flag, with acyclicity by id ordering (#12 resolved). Added § 2.6.
+  **Reopened #3** — dropping `salience` conflicts with the importance-weighted
+  trigger; recommend keeping it as `importance` alongside `confidence`. New #15,
+  #16.
 - **2026-08-10** — v4. Four decisions and their knock-ons.
   (1) `superseded_by` replaced by confidence-based revision — outcomes are now
   new / reinforce / revise / ignore, nothing is evicted, and the worst failure mode
