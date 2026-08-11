@@ -25,6 +25,38 @@ in this file (a protocol signature, a stage boundary, an invariant), stop; the
 skeleton is redrafted first, with a changelog entry, and the affected detail
 plan is regenerated. Contract changes never happen silently inside a stage.
 
+## The per-stage flow
+
+Stage N runs in five steps, and every test edit in the cycle happens in steps
+1–2, nowhere else. `tests/` is planner-owned at every moment; implementer
+commits never touch it. Deleting a `@stage(N)` skip marker **is** a test edit
+and therefore planner work — it happens when the tests are armed, not inside
+implementation.
+
+1. **Plan** (Opus). The detail plan for stage N, including its test manifest:
+   which skipped invariant tests activate (markers to delete) and which new
+   acceptance tests are added.
+2. **Arm the tests** (Opus, same working session). Delete the stage-N markers,
+   write the new tests, run the suite. Every activated or new test must fail
+   **for a substantive reason** — a missing module, table, or behaviour — not a
+   typo or a stale API guess. Skipped tests were written blind against
+   contracts, so this first execution is precisely where a mismatch surfaces;
+   a test found broken here is fixed here, because this is the last moment a
+   test edit is legal.
+3. **Record the red baseline** in the plan: the list of tests now failing and
+   why. That list is the implementer's target, verbatim.
+4. **Implement** (Sonnet). Make the baseline green. No edits under `tests/`;
+   a test that looks wrong is escalated to the planner, never adjusted.
+5. **Gate** (coordinator, independently — not from the implementer's report).
+   Zero failed; remaining skips all read `stage M` with M > N; every
+   previously active test still green; the plan's manual verification steps
+   run.
+
+Confusion about this flow is itself an entrance for drift: an agent unsure who
+owns an edit will guess, and the guess becomes precedent. When a step here is
+ambiguous for a concrete case, the answer is decided in this file first, not
+improvised in a working session.
+
 ## Cross-cutting rules (bind every stage)
 
 1. **Dependency direction** stays `ui → core → llm/storage` (AGENTS.md). No
@@ -104,8 +136,9 @@ never shrinks.
 - The `EvidenceItem` protocol, `Tier` flag, and empty `core/memory/` package
   skeleton with the stage boundaries of rule 3 as named no-op functions.
 - **The invariant test suite, written now, mostly xfail/skip:** one test per
-  I-1..I-13, keyed to the table below. Tests activate as stages land; a test
-  that cannot yet run is `skip("stage N")`, never deleted.
+  I-1..I-13, keyed to the table below. Tests activate as stages land — by the
+  planner, at arming time, per the per-stage flow above; a test that cannot
+  yet run is `skip("stage N")`, never deleted.
 - Test factories for building groups/conversations/messages/fragments/citations
   directly at the store level, so later stages can construct hierarchies
   without the LLM.
@@ -239,6 +272,12 @@ reaches every fragment including dormant.
 
 ## Changelog
 
+- **2026-08-11** — v1.1. Added "The per-stage flow": five explicit steps with
+  test ownership pinned. Resolves an ambiguity the stage-1 planning session
+  surfaced — who deletes a `@stage(N)` marker, and when. Answer: the planner,
+  at arming time (step 2), because marker deletion is a test edit and the
+  implementer never makes those. This also runs blind-written tests at the
+  earliest possible moment, where a contract mismatch is cheapest to fix.
 - **2026-08-10** — Stage 0 landed. Tuning surface, `EvidenceItem`/`Tier`
   protocols, memory domain dataclasses, the six-stage extraction skeleton, and
   the cumulative invariant suite (2 active, 15 skipped) are in. The
