@@ -104,24 +104,33 @@ async def test_i2_default_group_extracts_nothing(tmp_path: Path, monkeypatch):
         assert conn.execute("SELECT COUNT(*) FROM memory_fragments").fetchone()[0] == 0
 
 
-@stage(3)
 def test_i2_default_group_recalls_nothing(tmp_path: Path):
     from agentchat.core.context import RecencyWindowStrategy
     from agentchat.core.memory.strategy import GroupMemoryStrategy
     from agentchat.storage.memory import SqliteMemoryStore
 
-    from factories import GraphBuilder, make_group, write
+    from factories import GraphBuilder, ScriptedEncoder, embedded, make_group, write
 
-    store = SqliteMemoryStore(tmp_path / "chat.db")
+    # The same question in both groups, and a fragment that answers it sitting
+    # squarely above the floor — so an empty `recalled` can only come from the
+    # group's kind, which is what I-2 is about.
+    question = "What did we pick for storage?"
+    encoder = ScriptedEncoder({question: (1.0, 0.0)})
+    store = SqliteMemoryStore(tmp_path / "chat.db", encoder=encoder)
 
     project = GraphBuilder(make_group(kind="project"))
     project_chat = project.conversation()
-    project.extracted(project.message(project_chat, content="We chose SQLite."))
+    project.extracted(
+        project.message(project_chat, content="We chose SQLite."),
+        text="The project stores conversations in SQLite.",
+        **embedded((1.0, 0.0)),
+    )
+    project.message(project_chat, content=question)
     write(store, project.build())
 
     default = GraphBuilder(make_group(kind="default"))
     chat = default.conversation()
-    default.message(chat, content="What did we pick for storage?")
+    default.message(chat, content=question)
     write(store, default.build())
 
     strategy = GroupMemoryStrategy(inner=RecencyWindowStrategy(), store=store)
@@ -129,6 +138,15 @@ def test_i2_default_group_recalls_nothing(tmp_path: Path):
 
     assert decision.recalled == []
     assert [m.content for m in decision.messages] == [m.content for m in chat.messages]
+
+    # The positive control: the same store, the same question, a group that is
+    # a memory scope.
+    in_project = strategy.build(
+        project_chat.messages, context_window=4096, conversation=project_chat
+    )
+    assert [f.text for f in in_project.recalled] == [
+        "The project stores conversations in SQLite."
+    ]
 
 
 @stage(4)
@@ -264,8 +282,10 @@ def test_i6_memory_modules_never_import_chat_types():
     )
     forbidden_names = ("Message", "Conversation")
 
-    # strategy.py is licensed to know both worlds and is not checked.
-    for filename in ("extract.py", "rank.py", "consolidate.py"):
+    # strategy.py is licensed to know both worlds and is not checked. `embed.py`
+    # joins the three rule 2 names at stage 3: the encoder seam and the vector
+    # format are as persona-facing as the ranking that reads them.
+    for filename in ("extract.py", "rank.py", "consolidate.py", "embed.py"):
         path = MEMORY_PACKAGE / filename
         assert path.exists(), f"{path} is missing — a rename must not empty this lint"
 
@@ -432,25 +452,59 @@ def test_i10_dormant_fragments_survive_the_sweep(tmp_path: Path):
     assert row[0] == 0.0
 
 
-@stage(3)
-def test_i11_floor_is_applied_before_fusion(tmp_path: Path, monkeypatch):
+def test_i11_floor_is_applied_before_fusion(tmp_path: Path):
+    """The literal case: a fragment fusion ranks **first** — top BM25, freshest,
+    best supported, highest importance — sits below the floor by cosine and is
+    absent from `select()`, while a fragment fusion ranks last is returned.
+    Stage 0 wrote this against an unclearable floor because no encoder existed;
+    that shortcut proved only that an empty result is reachable."""
+    from datetime import timedelta
+
+    from agentchat.core.memory.tuning import Tuning
+    from agentchat.core.models import _now
     from agentchat.storage.memory import SqliteMemoryStore
 
-    from factories import GraphBuilder, write
+    from factories import GraphBuilder, ScriptedEncoder, embedded, write
 
-    # A floor no fragment can clear: whatever fusion would rank first is still
-    # never admitted, which is the ordering the invariant is about.
-    monkeypatch.setenv("AGENTCHAT_MEMORY_RECALL_FLOOR", "1.0")
+    query = "which database did we choose for storage"
+    encoder = ScriptedEncoder({query: (1.0, 0.0)})
 
-    store = SqliteMemoryStore(tmp_path / "chat.db")
+    path = tmp_path / "chat.db"
     builder = GraphBuilder()
-    chat = builder.conversation()
-    builder.extracted(builder.message(chat, content="We chose SQLite."))
-    write(store, builder.build())
+    first, second, third = (builder.conversation(title=t) for t in ("a", "b", "c"))
+    now = _now()
 
-    query = "which database did we choose"
-    assert store.candidates(builder.group.id, query, 10) != []
-    assert store.select(builder.group.id, query, 512) == []
+    # Every fusion term at its maximum, and orthogonal to the query.
+    top = builder.extracted(
+        builder.message(first, content="Which database do we choose for storage?"),
+        builder.message(second, content="We choose the database for storage."),
+        builder.message(third, content="Storage, and which database."),
+        text="We choose a database for storage in this project.",
+        importance=10.0,
+        observed_at=now,
+        **embedded((0.0, 1.0)),
+    )
+    # Weak on every term, and a perfect cosine match.
+    quiet = builder.extracted(
+        builder.message(first, content="Not much happened."),
+        text="Storage runs on SQLite in WAL mode.",
+        importance=1.0,
+        observed_at=now - timedelta(days=60),
+        **embedded((1.0, 0.0)),
+    )
+    write(SqliteMemoryStore(path, encoder=encoder), builder.build())
+
+    # Floor open: fusion's own ordering, with nothing gated out.
+    unfloored = SqliteMemoryStore(path, tuning=Tuning(recall_floor=0.0), encoder=encoder)
+    ranked = [f.id for f in unfloored.select(builder.group.id, query, 512)]
+    assert ranked[0] == top.id, "the test's premise: fusion ranks `top` first"
+    assert quiet.id in ranked
+
+    # Floor in place: the same fusion, run after admission.
+    store = SqliteMemoryStore(path, encoder=encoder)
+    selected = [f.id for f in store.select(builder.group.id, query, 512)]
+    assert top.id not in selected
+    assert selected == [quiet.id]
 
 
 async def test_i12_watermark_advances_only_with_its_writes(tmp_path: Path):
@@ -497,24 +551,37 @@ async def test_i12_watermark_advances_only_with_its_writes(tmp_path: Path):
         assert message.id in cited or past
 
 
-@stage(3)
 def test_i13_dormant_is_reachable_by_candidates_not_select(tmp_path: Path):
     from agentchat.storage.memory import SqliteMemoryStore
 
-    from factories import GraphBuilder, write
+    from factories import GraphBuilder, ScriptedEncoder, embedded, write
 
-    store = SqliteMemoryStore(tmp_path / "chat.db")
+    query = "which database did we choose"
+    encoder = ScriptedEncoder({query: (1.0, 0.0)})
+    store = SqliteMemoryStore(tmp_path / "chat.db", encoder=encoder)
+
     builder = GraphBuilder()
     chat = builder.conversation()
+    # Identical but for confidence, and both a perfect cosine match: only
+    # dormancy can separate them.
     dormant = builder.extracted(
         builder.message(chat, content="We chose SQLite."),
+        text="The database we chose is SQLite.",
         confidence=0.0,
+        **embedded((1.0, 0.0)),
+    )
+    live = builder.extracted(
+        builder.message(chat, content="We chose WAL mode."),
+        text="The database we chose runs in WAL mode.",
+        confidence=0.6,
+        **embedded((1.0, 0.0)),
     )
     write(store, builder.build())
 
-    query = "which database did we choose"
     assert dormant.id in [f.id for f in store.candidates(builder.group.id, query, 10)]
-    assert dormant.id not in [f.id for f in store.select(builder.group.id, query, 512)]
+    selected = [f.id for f in store.select(builder.group.id, query, 512)]
+    assert dormant.id not in selected
+    assert live.id in selected
 
 
 def test_every_invariant_has_a_test():

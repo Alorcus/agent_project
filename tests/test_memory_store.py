@@ -26,6 +26,7 @@ from agentchat.core.errors import StorageError
 from agentchat.core.memory.tuning import Tuning
 from agentchat.storage.sqlite import SqliteStore
 
+from conftest import expires
 from factories import GraphBuilder, make_citation, make_fragment, make_group, write
 
 
@@ -471,17 +472,14 @@ def test_opening_a_pre_memory_database_raises_naming_the_file(tmp_path: Path):
         assert str(path) in str(error.value)
 
 
+@expires(stage=4)
 def test_unimplemented_methods_name_the_stage_that_owns_them(tmp_path: Path):
-    # An empty-list stub would let the skipped I-11 and I-13 tests pass for the
-    # wrong reason the day someone activates them early. `candidates` was here
-    # too until stage 2 implemented it; `tests/test_extraction.py` holds its
-    # tests now.
+    # An empty-list stub would let a skipped invariant test pass for the wrong
+    # reason the day someone activates it early. `candidates` was here until
+    # stage 2 implemented it, `select`/`stable_core` until stage 3;
+    # `tests/test_extraction.py` and `tests/test_recall.py` hold their tests now.
     _, store = fresh(tmp_path)
 
-    with pytest.raises(NotImplementedError, match="stage 3"):
-        store.select("g", "which database did we choose", 512)
-    with pytest.raises(NotImplementedError, match="stage 3"):
-        store.stable_core("g", 512)
     with pytest.raises(NotImplementedError, match="stage 4"):
         store.purge_conversation("c")
     with pytest.raises(NotImplementedError, match="stage 4"):

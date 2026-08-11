@@ -8,6 +8,7 @@ by hand still exercises the I-7 and I-8 paths a real extraction run would.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -73,15 +74,52 @@ def make_citation(
     message: Message | None = None,
     source: MemoryFragment | None = None,
     quote: str | None = None,
+    observed_at: datetime | None = None,
 ) -> FragmentCitation:
     from agentchat.core.memory.models import FragmentCitation
 
-    return FragmentCitation(
+    # `observed_at` is what `fragment_support.last_seen_at` aggregates, so a
+    # test that wants a stale fragment sets it here rather than by waiting.
+    fields = dict(
         fragment_id=fragment.id,
         source_message_id=message.id if message is not None else None,
         source_fragment_id=source.id if source is not None else None,
         quote=quote,
     )
+    if observed_at is not None:
+        fields["observed_at"] = observed_at
+    return FragmentCitation(**fields)
+
+
+def embedded(vector: Sequence[float], *, model_id: str = "test-encoder") -> dict:
+    """The two fragment columns an embedding occupies, ready to splat into a
+    builder call: `builder.extracted(m, **embedded((1.0, 0.0)))`."""
+    from agentchat.core.memory.embed import pack
+
+    return {"embedding": pack(vector), "embedding_model": model_id}
+
+
+class ScriptedEncoder:
+    """An `EmbeddingProvider` with a fixed text → vector table, so a recall
+    test states similarity outright instead of hoping an encoder agrees.
+    Anything not in the table encodes to the zero vector, which clears no
+    positive floor."""
+
+    def __init__(
+        self,
+        vectors: dict[str, Sequence[float]] | None = None,
+        *,
+        model_id: str = "test-encoder",
+        dimension: int = 2,
+    ) -> None:
+        self.model_id = model_id
+        self.calls: list[list[str]] = []
+        self._vectors = {text: tuple(float(x) for x in v) for text, v in (vectors or {}).items()}
+        self._zero = (0.0,) * dimension
+
+    def encode(self, texts: Sequence[str]) -> list[tuple[float, ...]]:
+        self.calls.append(list(texts))
+        return [self._vectors.get(text, self._zero) for text in texts]
 
 
 @dataclass
@@ -120,16 +158,24 @@ class GraphBuilder:
         self.messages.append(message)
         return message
 
-    def extracted(self, *sources: Message, **overrides) -> MemoryFragment:
+    def extracted(
+        self, *sources: Message, observed_at: datetime | None = None, **overrides
+    ) -> MemoryFragment:
         fragment = self._fragment(consolidated=False, **overrides)
         for message in sources:
-            self.citations.append(make_citation(fragment, message=message))
+            self.citations.append(
+                make_citation(fragment, message=message, observed_at=observed_at)
+            )
         return fragment
 
-    def consolidated(self, *sources: MemoryFragment, **overrides) -> MemoryFragment:
+    def consolidated(
+        self, *sources: MemoryFragment, observed_at: datetime | None = None, **overrides
+    ) -> MemoryFragment:
         fragment = self._fragment(consolidated=True, **overrides)
         for source in sources:
-            self.citations.append(make_citation(fragment, source=source))
+            self.citations.append(
+                make_citation(fragment, source=source, observed_at=observed_at)
+            )
         return fragment
 
     def build(self) -> MemoryGraph:
