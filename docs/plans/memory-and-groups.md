@@ -1,6 +1,8 @@
 # Memory & Groups — implementation model
 
-**Status: v5 — consolidation modelled on Generative Agents reflection.**
+**Status: v5.4 — consolidation modelled on Generative Agents reflection; recall
+gated by a relevance floor; extraction driven by a durable watermark; every guessed
+constant collected in § 9.**
 **Stage: prototype, single user. Schema changes are free; see "Relationship to plan 001".**
 
 Scope: the **chat memory mechanism** (NFR-S-02) and the **grouping** it is scoped
@@ -35,13 +37,16 @@ database and recreate it, not to version and migrate it. There is no
 `PRAGMA user_version` and none is proposed. If that stops being true — a second
 user, or data anyone minds losing — this is the first thing that has to change.
 
-Two knock-on corrections to shipped code:
+Three knock-on corrections to shipped code:
 
 - `conversations.group_id` becomes NOT NULL with an FK to `groups`, so the
   database cannot represent a state I-1 forbids.
 - `ConversationStore.list_conversations(group_id=None)` currently overloads null to
   mean "every conversation". That is the nullable ambiguity I-1 exists to remove;
   the unfiltered case wants its own method rather than a null argument.
+- `conversations` gains `extracted_through`, the extraction watermark (§ 2.1). New
+  column, nullable, no backfill needed — null already means the correct thing for
+  every existing row.
 
 ---
 
@@ -69,6 +74,7 @@ erDiagram
         text id PK
         text title
         text group_id FK "NOT NULL, immutable, RESTRICT"
+        text extracted_through "nullable watermark — last extracted message"
         text created_at
         text updated_at
     }
@@ -274,6 +280,7 @@ classDiagram
         +id: str
         +title: str
         +group_id: str
+        +extracted_through: datetime
         +messages: list~Message~
     }
 
@@ -368,7 +375,10 @@ another `MemoryFragment` — that is the polymorphic many-to-many of § 1.1.1.
 No parent owns it.
 
 `origin_conversation_id`, `reasoning`, `embedding`, `quote`, `source_message_id`,
-`source_fragment_id` and `model_id` are nullable; Mermaid has no notation for it.
+`source_fragment_id`, `extracted_through` and `model_id` are nullable; Mermaid has
+no notation for it. A null `extracted_through` means "nothing extracted yet", which
+is both a fresh conversation and one predating the feature — § 2.1 treats them
+identically.
 `ContextDecision.recalled` is the one addition to the existing dataclass — without
 it the UI cannot show what memory contributed, which NFR-CTX-05 asks for and § 8
 designs.
@@ -391,8 +401,8 @@ sequenceDiagram
     participant LLM as LLMProvider
 
     Chat->>Chat: assistant turn completes
-    Note over Chat: batched — fires every N turns,<br/>and on close or switch
-    Chat-)Ex: schedule(conversation, turns since last extraction)
+    Note over Chat: batched — fires once N messages sit<br/>past the watermark, and on close or switch
+    Chat-)Ex: schedule(conversation)
     Note over Chat,Ex: fire-and-forget, cancellable worker
 
     Ex->>Store: memory_scope(conversation)
@@ -401,9 +411,12 @@ sequenceDiagram
         Note over Ex: no extraction — ungrouped chats<br/>do not accumulate fragments
     else project group
         Store-->>Ex: group_id
+        Ex->>Store: messages after extracted_through
+        Store-->>Ex: the unextracted range
         Ex->>Store: candidates(group_id, new_text, k)
         Store->>Store: BM25 over memory_fts, scoped to group
-        Store-->>Ex: k candidate fragments
+        Store-->>Ex: k candidates + fragment_support counts
+        Note over Ex: counts, not citation rows — § 7 #7
 
         Ex->>LLM: decide(new turns, candidates, thinking?)
         LLM-->>Ex: zero or more resolved claims
@@ -425,6 +438,8 @@ sequenceDiagram
         end
 
         Ex->>Store: sync memory_fts
+        Ex->>Store: advance extracted_through
+        Note over Ex,Store: last step, same transaction.<br/>Failure leaves it unmoved — the range<br/>is simply retried next run.
     end
 ```
 
@@ -433,19 +448,64 @@ pays a second call, because only it rewrites text.
 
 ### When extraction runs
 
-Extraction is **batched over a configurable number of turns**
-(`AGENTCHAT_MEMORY_EXTRACT_EVERY`, turns since the last run) rather than firing on
+Extraction is **batched** (`AGENTCHAT_MEMORY_EXTRACT_EVERY`) rather than firing on
 every turn. Per-turn extraction pays an LLM call for turns that usually carry no
 durable claim; too large a batch makes the extractor hold many claims at once and
 delays recall of things just said.
 
-A counter alone is not sufficient — it loses the tail. Extraction must **also flush
-on conversation switch and on close**, or the last N-1 turns before you navigate
-away are never extracted. The counter is an optimisation; the flush is what makes
-the invariant "every turn in a project group is eventually extracted" true.
+It must **also flush on conversation switch and on close**, or the last N-1 turns
+before you navigate away wait indefinitely. Batching is the optimisation; the flush
+is what keeps the invariant "every turn in a project group is eventually extracted"
+close to true in practice.
 
 Batching does not weaken provenance: the many-to-many in § 1.1 lets a claim drawn
 from a five-turn window cite every message that supports it.
+
+### The watermark, and why there is no retry mechanism
+
+What defines the batch is **`conversations.extracted_through`** — a durable
+watermark holding the timestamp of the last message successfully extracted. Every
+run processes "messages after the watermark" and advances it as its final step,
+inside the same transaction as the writes.
+
+This is deliberately not an in-memory counter of turns since the last run, and the
+difference is what removes an entire mechanism from the design:
+
+- **Failure needs no handling.** A crashed, cancelled or errored run leaves the
+  watermark unmoved, so the next run picks the same range up again. There is no
+  retry queue, no error state on the conversation, and no backfill trigger for
+  failed extractions — the case the § 7 #5 question was half about simply does not
+  arise.
+- **It survives restarts.** A counter does not. Flush-on-switch and flush-on-close
+  cover navigation, but nothing covered a crash, which was the real hole in the
+  invariant above.
+- **It is the only state.** "Turns since the last run" becomes a derived count of
+  messages past the watermark, so there is one durable fact instead of one durable
+  fact and one volatile one that can disagree.
+
+Extraction must therefore be **idempotent over a range**, since a range can be
+retried after a partial failure. It already is: I-7's partial unique indexes dedupe
+re-citation, and a claim re-extracted verbatim resolves as `identical` → reinforce,
+which touches only confidence. Worth stating because the watermark is what makes it
+load-bearing rather than incidental.
+
+### Backfilling historical conversations
+
+A null watermark means "nothing extracted yet", which describes both a brand-new
+conversation and one that predates the feature. They take the same code path, so
+backfill is not a separate mechanism either — only a separate *trigger*.
+
+**That trigger is an explicit user action, per group, from the memory inspector,
+with visible progress.** Not on-open. Two reasons:
+
+- **On-open makes recall quality depend on browsing history.** Some conversations
+  in a group would be extracted and others not, with nothing in the UI
+  distinguishing them, so the digest would silently reflect wherever the user
+  happened to click. Invisible inconsistency is the failure mode § 8 exists to
+  prevent.
+- **The cost is large and lumpy.** A project group holding forty old conversations
+  turns one click into a long run of LLM calls. Extraction being off the reply path
+  (NFR-U-04) keeps it from blocking, but does not make it free or unsurprising.
 
 ### What the four outcomes are decided on
 
@@ -491,6 +551,24 @@ unclear edge still routes to `new`, since a duplicate is the cheapest mistake.
 
 **One rule survives:** at most one resolution per claim. If several candidates
 match, take the highest-ranked; do not revise against each.
+
+### What a candidate looks like in the prompt
+
+Each candidate carries its text, `kind`, `confidence`, and its `fragment_support`
+aggregates — `citation_count`, `conversation_count`, `last_seen_at`. **It does not
+carry its citation rows.**
+
+The case for sending the citations was to stop the extractor re-citing a message
+it had already cited. That is not worth paying for: I-7's partial unique indexes
+already reduce a duplicate to a no-op insert, and with the watermark above, a
+message falls in exactly one extraction range unless a backfill overlaps. The cost
+on the other side is real — k candidates × several citations × a `quote` each is a
+large share of the extraction prompt.
+
+The signal actually worth having from the citation graph is *how well established
+a claim already is*, since a claim resting on five messages across three
+conversations should bias toward reinforce rather than revise. That compresses to
+three values from a view § 1.1 already defines. Counts, not rows.
 
 ### Reasoning traces follow the thinking toggle
 
@@ -579,9 +657,10 @@ sequenceDiagram
         GMS->>Store: stable_core(group_id, core_budget)
         Store-->>GMS: consolidated fragments, no query
         GMS->>Store: select(group_id, query=latest turn, sel_budget)
-        Store->>Store: fuse bm25, decay-adjusted recency, support
-        Store->>Store: MMR for diversity, drop confidence = 0
-        Store-->>GMS: selected fragments
+        Store->>Store: drop confidence = 0, drop below relevance floor
+        Store->>Store: fuse bm25, decay-adjusted recency, support, importance
+        Store->>Store: MMR for diversity
+        Store-->>GMS: selected fragments — possibly none
         GMS->>Inner: build(messages, remaining budget)
         Inner-->>GMS: ContextDecision
         GMS->>GMS: splice memory blocks, record recalled
@@ -747,8 +826,10 @@ we store the pointers. Without it, consolidated fragments would have no
 provenance and I-4 could not hold for them.
 
 Starting numbers, from their implementation: **3 questions, 5 insights each**, over
-the *n* most recent fragments. Ours should start lower — a chat group accumulates
-far more slowly than 25 agents living in a simulated town.
+the *n* most recent fragments. Ours start lower — a chat group accumulates far more
+slowly than 25 agents living in a simulated town — which makes every consolidation
+constant `scaled` in § 9's sense: borrowed from a workload unlike ours, then
+adjusted by feel. Both halves are unvalidated. See § 9 and § 7 #16.
 
 **Where we deviate deliberately:** Generative Agents pools reflections and
 observations in one retrieval, scoring them together. § 2.2 keeps consolidated
@@ -796,6 +877,8 @@ to get it right.
 | I-8 | The citation graph is acyclic. | A fragment cites only strictly smaller ids (§ 1.1.1) |
 | I-9 | A fragment cites either a message or a fragment, never both and never neither. | `CHECK` on the citation row |
 | I-10 | Confidence-0 fragments are retained, not deleted. | Sweep keys on citations only, never on confidence |
+| I-11 | No fragment below the relevance floor reaches the prompt. | Admission gate inside `select()`, applied *before* fusion (§ 6.1) — not a post-filter on ranked output |
+| I-12 | Every message in a project group is either extracted or sits past its conversation's watermark. | `extracted_through` advances only on success, in the same transaction as the writes (§ 2.1) |
 
 I-2 is the one that earns its keep. Making the default group a real memory scope
 would pool every unrelated one-off chat into one invisible digest — a leak that is
@@ -818,6 +901,7 @@ worthless once detached from its turn, and nothing in the schema can catch it.
 | Reasoning traces gated on the existing thinking toggle | NFR-U-08 | MUST |
 | Recall shown inline; extraction shown in the status line (§ 8) | NFR-CTX-05, NFR-Q-01 | SHOULD / MUST |
 | Symbols not colour alone for memory actions (§ 8) | NFR-P-04 | SHOULD |
+| Budgets as fractions of the context window, not token counts (§ 9) | NFR-CTX-04 | MUST |
 | SQLite, single file, inspectable | NFR-S-01, NFR-S-03 | MUST / SHOULD |
 | Stable group core | NFR-CTX-01 | MUST |
 | Query-selected block, ranked not recency-only | NFR-CTX-03 | MUST |
@@ -825,6 +909,7 @@ worthless once detached from its turn, and nothing in the schema can catch it.
 | `ContextDecision.recalled` plus memory indicator in the UI | NFR-CTX-05, NFR-Q-01 | SHOULD / MUST |
 | Citation rows with quotes — evidence is attributable to its message | NFR-CTX-05 | SHOULD |
 | Extraction off the reply path, cancellable worker | NFR-U-04 | MUST |
+| Durable extraction watermark — no turn is lost to a crash or a failed run | NFR-S-04 | SHOULD |
 | Group picker as a modal, no drag-and-drop | NFR-P-03 | MUST |
 | Move-to-default on group delete, with confirmation | NFR-U-06 | SHOULD |
 
@@ -840,6 +925,7 @@ what to cut first if the schedule tightens. Listed most-cuttable first.
 | `quote` on the citation row | The memory inspector can name the message but not highlight the span. Cheap to keep. |
 | `reasoning` traces | Fragments cannot explain themselves in the inspector. Only costs tokens when thinking is on. |
 | MMR diversity | One dense message can dominate the digest. Only bites once messages are commonly multi-cited. |
+| Relevance floor (§ 6.1) | `sel_budget` reverts to a fill target, so every turn in a project group is enriched whether or not anything matches. Weak fragments crowd a real budget and the recall indicator loses its meaning. Cheap to keep — one comparison on embeddings already computed. |
 | Support-count rank fusion | Corroboration stops influencing ranking. BM25 + decay alone still satisfies NFR-CTX-03. |
 | Per-fragment decay | Falls back to a flat recency ordinal. Noticeably worse once a group mixes durable decisions with transient status. |
 | **The hierarchy** (fragments citing fragments) | `stable_core` degenerates to top-N truncation, which is selection wearing compression's clothes — NFR-CTX-01 is a MUST, so something has to fill the gap. This is the largest single cut available and the one to think hardest about. |
@@ -869,11 +955,10 @@ k ≈ 60
   would make its stale claims look freshest.
 - **Decay is per fragment, not global** — GUM's move, and a better one than a flat
   recency ordinal. "We decided SQLite" decays slowly; "I'm debugging the picker
-  right now" decays fast. With a per-fragment decay rate `α`, relevance becomes
+  right now" decays fast. With a decay rate `α`, relevance becomes
   `r̃ᵢ = rᵢ · exp(−αᵢ · k · age(dᵢ))` with `k = 2` and age in days, and
-  `rank_recency` is the ordering of `r̃`. `kind` already correlates with decay
-  (`decision` slow, `open_question` fast), so `α` can start as a per-kind constant
-  before asking the model for it.
+  `rank_recency` is the ordering of `r̃`. **`α` is a constant per `kind`, not
+  generated per fragment** — see below.
 - `rank_importance` orders by the 1–10 poignancy set at creation. Generative
   Agents scores retrieval as recency + importance + relevance, so having the field
   for the § 2.6 trigger and *not* using it to rank would be the odd choice. It is
@@ -888,6 +973,102 @@ k ≈ 60
   term of its own until there's evidence it separates anything.
 - The fusion is deterministic and each term is inspectable, which is what makes
   the recall indicator in § 8 able to explain itself (NFR-CTX-05).
+
+## 6.1 The relevance floor — admission before fusion
+
+Ranking alone does not answer *whether anything should be recalled at all*. With a
+fixed `sel_budget` and no floor, a group holding three weakly-related fragments
+still contributes its top-k to every prompt, because something always ranks first.
+The floor is what makes the query-selected block able to return nothing.
+
+The pipeline is therefore **floor → fuse → MMR**: the floor decides membership,
+fusion orders the admitted set, MMR spreads the selection out.
+
+**The floor is a cosine-similarity threshold on the query embedding, not a
+threshold on the fused score.** This is the whole design decision, and the reason
+is that RRF scores carry no information about match quality. Score is a function of
+rank position only: the top fragment scores ~4/(k+1) whether it is a perfect match
+or the least-bad of three irrelevant claims. Thresholding there would measure
+*agreement between the four rankings*, not relevance. BM25 is out for the reason
+already given above — unbounded and corpus-dependent — which leaves cosine as the
+only absolutely-calibrated signal in the stack. The embeddings are already computed
+for § 2.1's match step, so the gate costs nothing new.
+
+**Not a judge.** An LLM relevance call was considered and rejected twice over. It
+reintroduces exactly what the scope section cuts — "an always-on, every-turn memory
+lookup must not pay for a judge loop" is the sentence separating memory from
+Adaptive RAG. And unlike extraction, recall is *synchronous*: it sits between the
+user pressing Enter and the first token, which is the one place in this design a
+blocking LLM call must never go (NFR-U-04).
+
+**The threshold is configuration, not a derivable constant** — `RECALL_FLOOR` in
+§ 9, and the one value there that gets a startup guard. It is specific to the
+embedding model, since modern encoders compress their similarity range badly with
+everything landing in a narrow band, so **changing the embedding model invalidates
+the number** and it has to be re-tuned. § 8.1's recall line is the instrument for
+tuning it: it exists so the user can see what was admitted, which is also how the
+developer sees whether the floor sits in the right place.
+
+Two consequences to implement deliberately:
+
+- **The floor applies only to the query-selected block.** `stable_core` is not
+  query-driven — there is no query for it to be relevant to — so its budget stays a
+  fill target.
+- **`sel_budget` becomes a ceiling, not a target.** Recalling fewer fragments than
+  the budget allows is the correct outcome, not a shortfall to be topped up.
+
+⏸ A flat floor may prove too blunt across query types. The refinement is a
+*relative* drop-off — cut the tail where similarity falls away sharply from the top
+hit — but that is a second mechanism with its own constant, so start flat and add
+it only against an observed failure. § 7 #17.
+
+## 6.2 Decay rates are per `kind`, not per fragment
+
+GUM generates a decay rate per item. Here `α` is a **constant per `kind`**, held in
+config, and the reason is not only that per-kind is cheaper.
+
+**A model-generated `α` is set once and never revisited.** Confidence has a
+correction path — every reinforce and revise recomputes it — but nothing ever
+revisits a decay rate. A value set too aggressively makes a fragment quietly stop
+surfacing, and no signal distinguishes that from the fragment genuinely being
+stale. That is the same shape as the supersede mechanism dropped in v4: a one-shot
+judgement, silently wrong, with no way back.
+
+Two supporting arguments:
+
+- **§ 2.1's GUM caveat transfers.** Per-item expressiveness is earned there by
+  genuine inferential uncertainty about a user observed indirectly. Chat memory
+  mostly records what was said outright, and § 6 already concedes that `kind`
+  carries most of the decay signal anyway.
+- **Per-kind stays tunable.** Five numbers in config can be corrected after
+  watching a real group. Per-fragment values are frozen into rows and only fixable
+  by re-extraction — a bad trade while every constant here is still a guess.
+
+**The correction path comes free.** A revise may change a fragment's `kind`, and
+`α` follows automatically: a `decision` demoted to `open_question` starts decaying
+faster with no extra mechanism and no extra column.
+
+Starting values, given as half-lives (`ln2 / (α·k)`, `k = 2`). All five are
+guesses and configurable per § 9 — the half-life column is the one to reason
+about, since it is the interpretable form:
+
+| `kind` | `α` | half-life |
+|---|---|---|
+| `decision`, `constraint` | 0.01 | ~35 days |
+| `fact`, `artefact` | 0.03 | ~12 days |
+| `open_question` | 0.15 | ~2 days |
+
+Fast decay on `open_question` is not as aggressive as it looks: age runs from
+`fragment_support.last_seen_at`, so a question still being discussed stays hot and
+only one that has gone quiet drops away — which is the desired reading of an open
+question nobody has mentioned in a week.
+
+The `decay` column stays on `memory_fragments` rather than being looked up from
+`kind` at query time. It costs one real per row and leaves the door open to
+per-fragment override without a schema change, which is the cheap half of the
+option that was rejected.
+
+## 6.3 Diversity, and what is deliberately not ranked
 
 **Message density is deliberately not a ranking signal.** The many-to-many makes
 "how many fragments does this message support" cheap to compute, and it is
@@ -946,10 +1127,21 @@ Three reasons for collapsed-by-default rather than the always-visible grey block
 - Recall is background reassurance most of the time and forensic detail
   occasionally. Collapsed serves the first, one keypress serves the second.
 
-Textual's `Collapsible` does this natively. Collapsed line appears on
-turns where nothing was recalled — an explicit "0 memories" is honest and makes
-absence visible, but adds a line to every turn in a default-group chat where recall
-never happens. § 7 #13.
+Textual's `Collapsible` does this natively.
+
+**The line appears on every turn of a project-group chat, including turns where
+nothing was recalled** — `▸ 0 memories recalled`, in the same dim style. Silence on
+a zero-recall turn is indistinguishable from the feature being broken, and with the
+relevance floor of § 6.1 in place, zero recall stops being an edge case: a small or
+off-topic group will legitimately contribute nothing, and the user needs to see
+that this was a decision rather than a failure. Visibility into the system is worth
+one dim line.
+
+**Default-group chats are the exception: no line at all.** There, recall is not
+merely empty but structurally impossible (I-2), so "0 memories" would report the
+absence of a mechanism rather than the outcome of one — every turn, forever. The
+missing line *is* the signal that this conversation has no memory scope; the
+conversation header carries the same fact in a place that does not repeat.
 
 ## 8.2 Extraction — what changed in the store
 
@@ -986,18 +1178,89 @@ has no way to know their memory is being built in a degraded mode.
 
 ---
 
+# 9 — Tuning surface
+
+Almost every number in this document is a guess. Some are borrowed from papers
+whose workload is nothing like ours, the rest were invented to have something to
+implement against. None has been validated against a real group, because no real
+group exists yet.
+
+**The risk is not that they are wrong — it is that they are wrong invisibly.** A
+constant inlined in `rank.py` reads as a fact about the design six weeks after it
+was typed, and nobody remembers it was a placeholder. § 7 tracks decisions we know
+are open; this section does the same job for numbers, and the mechanism is the same
+in both cases: write down that we don't know.
+
+**Every value below is configuration, not a literal.** They live in one place —
+`core/memory/tuning.py` — rather than at their point of use, so the full set is
+readable at once and nothing has to be hunted for. Overridable by environment
+variable, prefix `AGENTCHAT_MEMORY_`.
+
+Each carries a **status**, which is the part that matters:
+
+| Status | Meaning |
+|---|---|
+| `borrowed` | Taken from a cited paper, unvalidated here. May be fine; nobody has checked. |
+| `scaled` | Borrowed, then adjusted because our workload is known to differ. Doubly unvalidated — both the original and the adjustment are unchecked. |
+| `guess` | Invented. No basis beyond seeming reasonable. |
+| `tuned` | Validated against observed behaviour. Record what it was tuned against. |
+
+Nothing is `tuned` yet. That is the honest current state and the table should show
+it.
+
+| Constant | Default | Status | Origin | § |
+|---|---|---|---|---|
+| `EXTRACT_EVERY` | 6 | `guess` | balance of LLM cost against recall latency | § 2.1 |
+| `CANDIDATE_POOL_K` | 10 | `guess` | how many fragments the extractor resolves against | § 2.1 |
+| `RECALL_FLOOR` | 0.35 | `guess` | cosine admission gate; **embedding-model specific** | § 6.1 |
+| `RRF_K` | 60 | `borrowed` | standard reciprocal-rank-fusion constant | § 6 |
+| `DECAY_K` | 2 | `borrowed` | exponent multiplier, GUM | § 6.2 |
+| `ALPHA_DECISION`, `ALPHA_CONSTRAINT` | 0.01 | `guess` | ~35-day half-life | § 6.2 |
+| `ALPHA_FACT`, `ALPHA_ARTEFACT` | 0.03 | `guess` | ~12-day half-life | § 6.2 |
+| `ALPHA_OPEN_QUESTION` | 0.15 | `guess` | ~2-day half-life | § 6.2 |
+| `MMR_LAMBDA` | 0.5 | `borrowed` | GUM | § 6.3 |
+| `CORE_BUDGET_FRACTION` | 0.10 | `guess` | share of context window for the stable core | § 2.2 |
+| `SEL_BUDGET_FRACTION` | 0.10 | `guess` | ceiling, not a target (§ 6.1) | § 2.2 |
+| `CONSOLIDATE_THRESHOLD` | 40 | `scaled` | Generative Agents use 150 for 25 agents in a town | § 2.6 |
+| `CONSOLIDATE_QUESTIONS` | 2 | `scaled` | theirs: 3 | § 2.6 |
+| `CONSOLIDATE_INSIGHTS` | 3 | `scaled` | theirs: 5 | § 2.6 |
+| `CONSOLIDATE_RECENT_N` | 30 | `scaled` | theirs: 100 | § 2.6 |
+
+**Budgets are fractions of the context window, not token counts.** NFR-CTX-04 asks
+that assembly survive a switch to a smaller model; absolute token budgets do not,
+and would silently crowd out conversation history on a small window.
+
+Two things this section requires beyond a config file:
+
+- **The recall floor is pinned to its embedding model.** It is the one constant with
+  a silent failure mode — swap the encoder and the same number means something
+  different, with no error and no visible symptom beyond recall quietly getting
+  worse. Store `RECALL_FLOOR_MODEL` alongside it and **warn at startup when the
+  configured embedding model differs from the one the floor was set against**. This
+  is the only value that gets a guard, because it is the only one whose meaning
+  depends on a component that can change underneath it.
+- **The effective values are visible in the memory inspector**, read-only, with
+  their status shown. § 8 exists so the user can see what memory did; seeing the
+  constants that produced it is the same argument one level down, and it is what
+  makes tuning possible without reading the source. A `guess` badge next to a
+  number is a standing invitation to change it.
+
+Log the full effective set once at startup. When behaviour looks wrong three weeks
+from now, the first question is which of these was in force.
+
 # 7 — Open decisions
 
 | # | Question | Blocks |
 |---|---|---|
-| ✔ 13 | *Resolved.* Recall line on turns where nothing was recalled — "0 memories". | § 8.1 |
+| ✔ 13 | *Resolved.* The recall line renders on every turn of a project-group chat, showing "0 memories recalled" when nothing was recalled — visibility into the system beats one saved line. Default-group chats show no line, since there the absence is structural rather than an outcome. | § 8.1 |
+| ⏸ 17 | Flat relevance floor, or a relative drop-off from the top hit? Flat is one constant and ships now; relative adapts across query types but adds a second constant and a failure mode of its own. Revisit against observed recall, not in advance. | § 6.1 |
 | ✔ 3 | *Resolved.* Keep both. `salience` renamed `importance` (Generative Agents' term); it drives the § 2.6 trigger and joins the § 6 fusion. `confidence` is a separate axis and carries revision. | § 1.1, § 2.6, § 6 |
 | ⏸ 15 | Recency by age, or by time since last *retrieval*? Generative Agents decays from last access, so frequently-recalled fragments stay hot. Better model; costs a write on every retrieval. | § 6, § 2.6 |
-| ⏸ 16 | Consolidation threshold and fan-out. Theirs: 150 accumulated importance, 3 questions, 5 insights, over the 100 most recent records. A chat group accumulates far more slowly, so these want scaling down — and the numbers are guesses until there is a real group to watch. | § 2.6 |
+| ⏸ 16 | Consolidation threshold and fan-out. Theirs: 150 accumulated importance, 3 questions, 5 insights, over the 100 most recent records. A chat group accumulates far more slowly, so these want scaling down — and the numbers are guesses until there is a real group to watch. Provisional values are in § 9, marked `scaled`. | § 2.6, § 9 |
 | ✔ 14 | *Resolved.* Consolidation follows *Generative Agents* reflection: importance-threshold trigger, generate salient questions, retrieve per question, generate insights citing their evidence, feed back through new/reinforce/revise. | § 2.6 |
-| ⏸ 5 | Backfill trigger. Chats predating the feature and failed extractions both need one; is it manual or on-open? | § 2.1 |
-| ⏸ 7 | Does the extractor get told which messages it already cited for a candidate fragment? Without it, reinforce decisions may re-cite the same message — harmless (I-7 dedupes) but wasteful of prompt budget. | § 2.1 |
-| ⏸ 11 | Is `α` (decay rate) a per-`kind` constant or model-generated per fragment? Per-kind is free and has no failure mode; model-generated is more expressive and is what GUM does. | § 6 |
+| ✔ 5 | *Resolved, and half of it dissolved.* The question bundled two problems. Failed extractions need no trigger at all: a durable `extracted_through` watermark means a failed run leaves it unmoved and the range is retried next run. Historical chats are an explicit per-group action from the memory inspector — never on-open, which would make recall quality depend on browsing history. | § 2.1 |
+| ✔ 7 | *Resolved.* No. Candidates carry `fragment_support` counts, not citation rows — the re-citation the question worried about is already a no-op under I-7, while the signal actually worth having (how well established the claim is) compresses to three integers. | § 2.1 |
+| ✔ 11 | *Resolved.* Per-`kind` constant. Model-generated `α` is set once and never revisited, so a wrong value silently buries a fragment with no correction path — the shape of mistake v4 removed elsewhere. Changing `kind` on revise moves `α` for free. | § 6.2 |
 | ✔ 1 | *Resolved.* Ungrouped chats do not accumulate fragments. Since conversations never move (§ 2.5), a default-group chat can never be promoted, so its fragments could never become reachable. | § 2.1 |
 | ✔ 2 | *Resolved.* The strict/lenient question dissolved. Splitting scope from provenance means the cascade runs through citations alone, so "a claim survives while evidence for it survives" is structural rather than a judgement call. | § 2.4 |
 | ✔ 4 | *Resolved.* `stable_core` is the consolidated layer — stored higher fragments, not an ephemeral summarisation pass. | § 1.1.1, § 2.2 |
@@ -1010,6 +1273,39 @@ has no way to know their memory is being built in a degraded mode.
 
 ## Changelog
 
+- **2026-08-10** — v5.4. Added § 9, collecting every tuning constant that had been
+  scattered through the prose as an inline literal. Each carries a status —
+  `borrowed` / `scaled` / `guess` / `tuned` — so the table records *how much we
+  don't know* about each value, not just the value. Nothing is `tuned`. Budgets
+  restated as fractions of the context window rather than token counts, which is
+  what NFR-CTX-04 actually requires. `RECALL_FLOOR` gets a startup guard against
+  embedding-model drift, being the one constant whose meaning changes silently
+  underneath it. Effective values surface read-only in the memory inspector and are
+  logged once at startup.
+- **2026-08-10** — v5.3. Resolved the three items that were decidable without a
+  running system. **#5** — the question bundled two problems; the failure half
+  dissolves under a durable `conversations.extracted_through` watermark, which
+  replaces the volatile turn counter, survives crashes, and needs no retry
+  mechanism because a failed run simply does not advance it. Historical backfill is
+  an explicit per-group action, not on-open, since on-open would make recall
+  quality depend on which chats the user happened to visit. **#7** — candidates
+  carry `fragment_support` counts, not citation rows. **#11** — `α` is a per-`kind`
+  constant; model-generated decay is a one-shot judgement with no correction path,
+  and changing `kind` on revise moves `α` for free. New invariant I-12, third
+  knock-on correction to plan 001, § 6 split into 6.1–6.3.
+- **2026-08-10** — v5.2. Added the relevance floor (§ 6.1): a cosine-similarity
+  admission gate running *before* fusion, not a threshold on the fused score —
+  RRF scores are a function of rank position and carry no match-quality signal, so
+  a floor there would measure ranking agreement instead of relevance. An LLM judge
+  was rejected: it reintroduces the judge loop the scope section excludes, and
+  recall is synchronous on the reply path. `sel_budget` is now a ceiling rather than
+  a fill target, so the query-selected block may legitimately return nothing. New
+  invariant I-11, new § 5 cut row, new parked item #17 (flat floor vs relative
+  drop-off). **Corrected #13**, whose v5.1 row and changelog entry contradicted each
+  other: the recall line renders on every project-group turn including zero-recall
+  ones, and is suppressed only in default-group chats where the absence is
+  structural. § 2.2's read-path diagram updated to show the gate and the
+  `importance` term.
 - **2026-08-10** — v5.1. Resolved #13 (no recall line when nothing was recalled)
   and #3 (`salience` → `importance`, kept alongside `confidence`). `rank_importance`
   added as a fourth fusion term, matching Generative Agents' recency + importance +
