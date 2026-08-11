@@ -71,6 +71,22 @@ Recall (§ 2.2) uses the default; consolidation (§ 2.6) passes
 confidence-0 gate (I-11, I-13 asymmetry lives in `candidates()` vs `select()`,
 not in the tier flag). Fold this back into `memory-and-groups.md`.
 
+Two further contract points, surfaced by the stage-0 test author and ratified
+here rather than left implicit in test files:
+
+- **`MemoryStore` is synchronous.** `ContextStrategy.build` is sync and recall
+  sits on the reply path by design; SQLite reads are fast enough not to earn an
+  async surface. `ConversationStore` stays async. Stage 3 may renegotiate only
+  via a skeleton redraft.
+- **`GroupMemoryStrategy.build` takes the conversation.** `memory_scope()`
+  needs it and the `ContextStrategy` protocol carries only messages; the
+  strategy accepts a keyword `conversation` argument. The design doc's § 1.3
+  protocol does not show this and should gain it at the stage-3 fold-back.
+- **Known weakening to repay:** the stage-0 I-11 test uses an unclearable
+  floor (`RECALL_FLOOR=1.0`) because no encoder exists yet. Stage 3's detail
+  plan must strengthen it to the literal case — a fragment fusion would rank
+  first sitting below the floor — once embeddings are real.
+
 ---
 
 ## Stages
@@ -223,6 +239,11 @@ reaches every fragment including dormant.
 
 ## Changelog
 
+- **2026-08-10** — Stage 0 landed. Tuning surface, `EvidenceItem`/`Tier`
+  protocols, memory domain dataclasses, the six-stage extraction skeleton, and
+  the cumulative invariant suite (2 active, 15 skipped) are in. The
+  `select(tiers=Tier.EXTRACTED)` fold-back promised below is done, in
+  `memory-and-groups.md`.
 - **2026-08-10** — v1. Six stages plus stage 0; cumulative invariant suite;
   persona-forward rules (EvidenceItem/scope protocols, no-op audit stage, open
   `kind`) bound as cross-cutting constraints; `select()` tier ambiguity between

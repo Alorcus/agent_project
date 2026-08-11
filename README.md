@@ -84,6 +84,12 @@ Environment variables, all prefixed `AGENTCHAT_`:
 | `AGENTCHAT_CORPUS_DIR` | `./corpus` | RAG ingestion source (not yet used) |
 | `AGENTCHAT_SIMULATE_FAILURE` | `0` | Make the second model fail on load, to exercise error handling |
 
+Chat memory (extraction, recall, consolidation) has its own tuning surface,
+prefixed `AGENTCHAT_MEMORY_` — e.g. `AGENTCHAT_MEMORY_RECALL_FLOOR`. Every
+constant, its default and its status (`borrowed`/`scaled`/`guess`/`tuned`)
+live in `src/agentchat/core/memory/tuning.py`'s `CATALOGUE`; that file is the
+source of truth, not this table.
+
 Variables can also go in a `.env` file at the project root (copy
 `.env.example`) instead of being exported in the shell. Real environment
 variables take precedence over `.env`.

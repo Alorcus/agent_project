@@ -7,21 +7,10 @@ from pathlib import Path
 import pytest
 
 from agentchat.core.errors import StorageError
-from agentchat.core.models import Conversation, Message
+from agentchat.core.models import Message
 from agentchat.storage.sqlite import SqliteStore
 
-
-def make_conversation(**overrides) -> Conversation:
-    defaults = dict(
-        title="Trip planning",
-        group_id="g1",
-        messages=[
-            Message(role="user", content="Where should I go?"),
-            Message(role="assistant", content="Try Kyoto.", model_id="qwen"),
-        ],
-    )
-    defaults.update(overrides)
-    return Conversation(**defaults)
+from factories import make_conversation
 
 
 async def test_round_trip_title_group_messages_and_model_id(tmp_path: Path):

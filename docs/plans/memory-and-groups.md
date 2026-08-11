@@ -356,7 +356,7 @@ classDiagram
         +memory_scope(conversation) str
         +candidates(group_id, query, k) list~MemoryFragment~
         +stable_core(group_id, budget) list~MemoryFragment~
-        +select(group_id, query, budget) list~MemoryFragment~
+        +select(group_id, query, budget, tiers) list~MemoryFragment~
         +apply(decisions) None
         +purge_conversation(conversation_id) None
         +purge_group(group_id) None
@@ -419,6 +419,13 @@ that cannot be called without violating an invariant is worse than a missing one
 because it reads as permission. Replaced by `purge_group`, which is what § 2.4.1
 actually needs. **`apply(decisions)` is the only write method**, and § 2.1 explains
 why that matters: it is the transaction boundary, and nothing else may open one.
+
+`select`'s `tiers` keyword resolves the contradiction between § 2.2 (which wants
+extracted fragments only) and § 2.6 (which wants both tiers as consolidation
+input): `select(group_id, query, budget, *, tiers=Tier.EXTRACTED)`. § 2.2's recall
+path uses the default; § 2.6's consolidation path passes
+`Tier.EXTRACTED | Tier.CONSOLIDATED`. Both still apply the floor and the
+confidence-0 gate regardless of `tiers`.
 
 ---
 
@@ -740,7 +747,7 @@ sequenceDiagram
         Store-->>GMS: group_id
         GMS->>Store: stable_core(group_id, core_budget)
         Store-->>GMS: consolidated fragments, no query
-        GMS->>Store: select(group_id, query=latest turn, sel_budget)
+        GMS->>Store: select(group_id, query=latest turn, sel_budget, tiers=EXTRACTED)
         Store->>Store: drop confidence = 0, drop below relevance floor
         Store->>Store: fuse bm25, decay-adjusted recency, support, importance
         Store->>Store: MMR for diversity
@@ -1001,7 +1008,7 @@ sequenceDiagram
     LLM-->>Con: candidate questions
 
     loop per question
-        Con->>Store: select(group_id, query=question)
+        Con->>Store: select(group_id, query=question, tiers=EXTRACTED|CONSOLIDATED)
         Store-->>Con: relevant fragments — extracted and consolidated alike
         Con->>LLM: "what high-level insights follow?<br/>cite the statements used"
         LLM-->>Con: insights, each citing statement indices
@@ -1431,6 +1438,7 @@ it.
 | `REINFORCE_STEP` | 0.1 | `guess` | confidence raise per genuinely new citation | § 2.1 |
 | `CANDIDATE_POOL_K` | 10 | `guess` | how many fragments the extractor resolves against | § 2.1 |
 | `RECALL_FLOOR` | 0.35 | `guess` | cosine admission gate; **embedding-model specific** | § 6.1 |
+| `RECALL_FLOOR_MODEL` | *empty (unpinned)* | `guess` | pinned encoder id the floor above is calibrated against | § 6.1 |
 | `RRF_K` | 60 | `borrowed` | standard reciprocal-rank-fusion constant | § 6 |
 | `DECAY_K` | 2 | `borrowed` | exponent multiplier, GUM | § 6.2 |
 | `ALPHA_DECISION`, `ALPHA_CONSTRAINT` | 0.01 | `guess` | ~35-day half-life | § 6.2 |
@@ -1496,6 +1504,11 @@ from now, the first question is which of these was in force.
 
 ## Changelog
 
+- **2026-08-10** — Stage 0 fold-back (`2026-08-10-003-memory-stage-0-scaffolding.md`).
+  Added `RECALL_FLOOR_MODEL` to § 9 (`guess`, § 6.1) — required by § 6.1's prose but
+  missing from the table. Folded the skeleton's `select(tiers=Tier.EXTRACTED)`
+  contract back into § 1.3's `MemoryStore` signature and the § 2.2/§ 2.6 call
+  sites, resolving the contradiction between those two sections' readings.
 - **2026-08-10** — v6. External review. Three logical errors and six gaps.
   **Group delete contradicted § 2.5** — shipping "move-to-default" while claiming
   conversations never move made the immutability premise false in exactly one path,
