@@ -7,6 +7,7 @@ scrolling, switching models and stopping all stay live while tokens arrive.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 from textual import work
@@ -16,9 +17,13 @@ from textual.containers import Container, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Footer, Header, Input, Static
 
-from agentchat.config import Settings, build_registry, build_store
+from agentchat.config import Settings, build_encoder, build_memory_store, build_registry, build_store
 from agentchat.core.chat import ChatService
+from agentchat.core.context import RecencyWindowStrategy
 from agentchat.core.errors import AgentChatError, ModelNotFoundError
+from agentchat.core.memory.embed import check_encoder
+from agentchat.core.memory.strategy import ChatMemory, GroupMemoryStrategy
+from agentchat.core.memory.tuning import Tuning
 from agentchat.core.models import Conversation, Message
 from agentchat.llm.base import GenerationOptions
 from agentchat.ui.screens import ConversationPicker
@@ -44,11 +49,39 @@ class ChatApp(App[None]):
         super().__init__()
         self.settings = settings or Settings.from_env()
         self.registry = build_registry(self.settings)
-        self.chat = ChatService(self.registry, store=build_store(self.settings))
+        encoder = build_encoder(self.settings)
+        memory_store = build_memory_store(self.settings, encoder=encoder)
+        memory = (
+            ChatMemory(memory_store, self.registry.active_provider, encoder=encoder)
+            if memory_store is not None
+            else None
+        )
+        context_strategy = (
+            GroupMemoryStrategy(inner=RecencyWindowStrategy(), store=memory_store)
+            if memory_store is not None
+            else None
+        )
+        self.chat = ChatService(
+            self.registry,
+            store=build_store(self.settings),
+            memory=memory,
+            context_strategy=context_strategy,
+        )
+        if memory_store is not None:
+            audit = memory_store.embedding_audit(encoder.model_id if encoder else None)
+            check_encoder(
+                audit,
+                encoder_id=encoder.model_id if encoder else None,
+                tuning=Tuning.from_env(),
+                log=logging.getLogger(__name__),
+            )
         self.conversation: Conversation = Conversation()
         self.options = GenerationOptions()
         self.status_text = ""
         self._generating = False
+        # A background flush on close gets this long before the app stops
+        # waiting for it — unbounded, a 14B model's last batch hangs the quit.
+        self._extract_close_timeout = Tuning().extract_close_timeout
 
     # -- composition ------------------------------------------------------
 
@@ -69,6 +102,14 @@ class ChatApp(App[None]):
         self.conversation = await self.chat.new_conversation()
         self._chat_screen.query_one("#prompt", Input).focus()
         self._refresh_status()
+
+    async def on_unmount(self) -> None:
+        try:
+            await asyncio.wait_for(
+                self.chat.flush_extraction(self.conversation), timeout=self._extract_close_timeout
+            )
+        except asyncio.TimeoutError:
+            pass
 
     @property
     def _chat_screen(self) -> Screen:
@@ -109,6 +150,7 @@ class ChatApp(App[None]):
     async def action_new_conversation(self) -> None:
         self.action_stop()
         await self.chat.persist(self.conversation)
+        await self.chat.flush_extraction(self.conversation)
         self.conversation = await self.chat.new_conversation()
         await self._show_conversation(self.conversation)
         self._refresh_status()
@@ -118,7 +160,7 @@ class ChatApp(App[None]):
     async def action_open_conversations(self) -> None:
         # Bare @work (not the generation group, not exclusive): opening the
         # picker must never cancel a running generation.
-        conversations = await self.chat.list_conversations()
+        conversations = await self.chat.list_all_conversations()
         result = await self.push_screen_wait(
             ConversationPicker(conversations, self.conversation.id)
         )
@@ -149,7 +191,7 @@ class ChatApp(App[None]):
             # so swap in a fresh, unsaved one first — persist already skips
             # conversations with no messages.
             self.conversation = Conversation()
-            remaining = await self.chat.list_conversations()
+            remaining = await self.chat.list_all_conversations()
             if remaining:
                 await self._switch_to(remaining[0].id)
             else:
@@ -157,7 +199,7 @@ class ChatApp(App[None]):
         # Escape during the store work leaves nothing to refresh.
         if self.screen is picker:
             await picker.refresh_conversations(
-                await self.chat.list_conversations(), self.conversation.id
+                await self.chat.list_all_conversations(), self.conversation.id
             )
 
     async def _switch_to(self, conversation_id: str) -> None:
@@ -167,6 +209,7 @@ class ChatApp(App[None]):
         self.action_stop()
         try:
             await self.chat.persist(self.conversation)
+            await self.chat.flush_extraction(self.conversation)
             self.conversation = await self.chat.switch_conversation(conversation_id)
         except AgentChatError as error:
             self.notify(str(error), severity="error")

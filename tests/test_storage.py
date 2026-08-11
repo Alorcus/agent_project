@@ -7,21 +7,10 @@ from pathlib import Path
 import pytest
 
 from agentchat.core.errors import StorageError
-from agentchat.core.models import Conversation, Message
+from agentchat.core.models import Message
 from agentchat.storage.sqlite import SqliteStore
 
-
-def make_conversation(**overrides) -> Conversation:
-    defaults = dict(
-        title="Trip planning",
-        group_id="g1",
-        messages=[
-            Message(role="user", content="Where should I go?"),
-            Message(role="assistant", content="Try Kyoto.", model_id="qwen"),
-        ],
-    )
-    defaults.update(overrides)
-    return Conversation(**defaults)
+from factories import make_conversation
 
 
 async def test_round_trip_title_group_messages_and_model_id(tmp_path: Path):
@@ -33,7 +22,7 @@ async def test_round_trip_title_group_messages_and_model_id(tmp_path: Path):
 
     assert loaded is not None
     assert loaded.title == "Trip planning"
-    assert loaded.group_id == "g1"
+    assert loaded.group_id == "default"
     assert [m.role for m in loaded.messages] == ["user", "assistant"]
     assert [m.content for m in loaded.messages] == ["Where should I go?", "Try Kyoto."]
     assert loaded.messages[1].model_id == "qwen"
@@ -131,13 +120,16 @@ async def test_list_conversations_orders_most_recently_updated_first(tmp_path: P
 
 
 async def test_list_conversations_filters_by_group_id(tmp_path: Path):
-    store = SqliteStore(tmp_path / "chat.db")
-    in_group = make_conversation(title="in-group", group_id="g1")
-    other_group = make_conversation(title="other-group", group_id="g2")
-    await store.save(in_group)
-    await store.save(other_group)
+    from factories import make_group
 
-    items = await store.list_conversations("g1")
+    store = SqliteStore(tmp_path / "chat.db")
+    wanted, other = make_group(name="wanted"), make_group(name="other")
+    await store.save_group(wanted)
+    await store.save_group(other)
+    await store.save(make_conversation(title="in-group", group_id=wanted.id))
+    await store.save(make_conversation(title="other-group", group_id=other.id))
+
+    items = await store.list_conversations(wanted.id)
 
     assert [c.title for c in items] == ["in-group"]
 
@@ -173,3 +165,85 @@ async def test_unwritable_path_raises_storage_error(tmp_path: Path):
             SqliteStore(readonly_dir / "chat.db")
     finally:
         readonly_dir.chmod(0o700)
+
+
+# -- groups and the watermark (stage 1) ----------------------------------
+#
+# Every `agentchat` import below sits inside a test body: these describe the
+# schema of `2026-08-10-004-memory-stage-1-schema-and-stores.md`, and a
+# module-level import of a name that does not exist yet would fail collection
+# for the whole file, taking the tests above down with it.
+
+
+async def test_default_group_is_seeded_and_is_not_a_memory_scope(tmp_path: Path):
+    store = SqliteStore(tmp_path / "chat.db")
+
+    groups = await store.list_groups()
+
+    assert [group.kind for group in groups] == ["default"]
+    assert (await store.default_group()).is_memory_scope() is False
+
+
+async def test_groups_round_trip_with_the_default_group_first(tmp_path: Path):
+    from factories import make_group
+
+    store = SqliteStore(tmp_path / "chat.db")
+    project = make_group(name="Picker rewrite")
+
+    await store.save_group(project)
+
+    groups = await store.list_groups()
+    assert [group.kind for group in groups] == ["default", "project"]
+    assert groups[1].name == "Picker rewrite"
+
+
+async def test_saving_a_conversation_into_an_unknown_group_raises(tmp_path: Path):
+    store = SqliteStore(tmp_path / "chat.db")
+
+    with pytest.raises(StorageError):
+        await store.save(make_conversation(group_id="no-such-group"))
+
+
+async def test_list_all_conversations_spans_groups_and_scoped_listing_does_not(tmp_path: Path):
+    from agentchat.core.models import DEFAULT_GROUP_ID
+
+    from factories import make_group
+
+    store = SqliteStore(tmp_path / "chat.db")
+    project = make_group()
+    await store.save_group(project)
+    await store.save(make_conversation(title="scoped", group_id=project.id))
+    await store.save(make_conversation(title="unscoped", group_id=DEFAULT_GROUP_ID))
+
+    scoped = await store.list_conversations(project.id)
+    everything = await store.list_all_conversations()
+
+    assert [c.title for c in scoped] == ["scoped"]
+    assert {c.title for c in everything} == {"scoped", "unscoped"}
+
+
+async def test_watermark_round_trips_on_the_conversation(tmp_path: Path):
+    from agentchat.core.models import DEFAULT_GROUP_ID
+
+    store = SqliteStore(tmp_path / "chat.db")
+    conversation = make_conversation(group_id=DEFAULT_GROUP_ID)
+    marker = conversation.messages[-1]
+    conversation.extracted_at = marker.created_at
+    conversation.extracted_id = marker.id
+    await store.save(conversation)
+
+    loaded = await store.load(conversation.id)
+
+    assert loaded is not None
+    assert (loaded.extracted_at, loaded.extracted_id) == (marker.created_at, marker.id)
+
+
+async def test_in_memory_store_holds_i1_too():
+    from agentchat.core.models import DEFAULT_GROUP_ID
+    from agentchat.storage.base import InMemoryStore
+
+    store = InMemoryStore()
+
+    with pytest.raises(StorageError):
+        await store.save(make_conversation(group_id="no-such-group"))
+    await store.save(make_conversation(group_id=DEFAULT_GROUP_ID))

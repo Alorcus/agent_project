@@ -19,6 +19,21 @@ from agentchat.storage.sqlite import SqliteStore
 _REAL_DATA_DIR = (Path(__file__).parent.parent / "data").resolve()
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "expires(stage): this test pins placeholder behaviour that stage N "
+        "replaces; arming stage N retires it. `pytest -m expires` lists them.",
+    )
+
+
+def expires(stage: int):
+    """The counterpart of `test_invariants.stage(N)` — born-at versus dies-at.
+    Does not skip: the assertion is true until stage N, and retiring it is the
+    planner's job at stage N's arming."""
+    return pytest.mark.expires(stage=stage)
+
+
 @pytest.fixture(autouse=True)
 def _scrubbed_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Strip `AGENTCHAT_*` so `Settings()` reflects the code's own defaults,

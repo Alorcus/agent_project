@@ -9,6 +9,10 @@ from typing import Any, Literal
 
 Role = Literal["system", "user", "assistant"]
 
+#: The group every conversation lands in until it is moved — the one the
+#: schema seeds and the one `Group.is_memory_scope()` excludes (I-2).
+DEFAULT_GROUP_ID = "default"
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -42,11 +46,16 @@ class Conversation:
 
     id: str = field(default_factory=_new_id)
     title: str = "New conversation"
-    #: Project-folder handle; unused today, reserved for scoping memory recall.
-    group_id: str | None = None
+    #: Project-folder handle; NOT NULL at the schema level (I-1) — every
+    #: conversation belongs to a group, even if only the seeded default one.
+    group_id: str = DEFAULT_GROUP_ID
     created_at: datetime = field(default_factory=_now)
     updated_at: datetime = field(default_factory=_now)
     messages: list[Message] = field(default_factory=list)
+    #: How far extraction has read this conversation, advanced only inside
+    #: `MemoryStore.apply`'s transaction (I-12).
+    extracted_at: datetime | None = None
+    extracted_id: str | None = None
 
     def add(self, message: Message) -> Message:
         self.messages.append(message)

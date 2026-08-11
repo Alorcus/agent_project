@@ -56,6 +56,22 @@ token. `AGENTCHAT_MAX_CONTEXT` lowers them further for a smaller GPU.
 of gigabytes into `~/.cache/huggingface` per model, per user; a missing
 checkpoint fails loudly instead.
 
+**Chat memory's recall floor needs a sentence encoder** —
+`sentence-transformers/all-MiniLM-L6-v2`, pinned, ~90 MB, runs on the CPU in
+milliseconds. Same rule as the chat models: read by path with
+`local_files_only=True`, never downloaded at runtime. Fetch it once:
+
+```bash
+hf download sentence-transformers/all-MiniLM-L6-v2 \
+  --local-dir "$AGENTCHAT_MODEL_ROOT/sentence-transformers/all-MiniLM-L6-v2" \
+  --include "*.json" "*.txt" "model.safetensors"
+```
+
+The `--include` matters: the repo also ships ONNX, OpenVINO and TensorFlow
+copies of the same weights, and the app loads none of them. Without the
+weights, recall fails closed — the app runs, `select()` returns nothing, and a
+startup warning says so.
+
 ## Keys
 
 | Key | Action |
@@ -77,6 +93,7 @@ Environment variables, all prefixed `AGENTCHAT_`:
 |---|---|---|
 | `AGENTCHAT_BACKEND` | `local` | `local` for real weights, `mock` for the stub |
 | `AGENTCHAT_MODEL_ROOT` | `/sc/projects/sci-lippert/intelligent-agents/model_checkpoints` | Where the checkpoints live |
+| `AGENTCHAT_ENCODER_PATH` | `$AGENTCHAT_MODEL_ROOT/sentence-transformers/all-MiniLM-L6-v2` | Where the recall encoder's weights live |
 | `AGENTCHAT_MODEL` | first registered | Model selected at startup (`phi-4-mini`, `qwen3-14b`) |
 | `AGENTCHAT_MAX_CONTEXT` | unset | Cap every model's context window, for a smaller GPU |
 | `AGENTCHAT_STORE` | `sqlite` | `sqlite` for durable storage, `memory` for the non-durable stub |
@@ -84,9 +101,22 @@ Environment variables, all prefixed `AGENTCHAT_`:
 | `AGENTCHAT_CORPUS_DIR` | `./corpus` | RAG ingestion source (not yet used) |
 | `AGENTCHAT_SIMULATE_FAILURE` | `0` | Make the second model fail on load, to exercise error handling |
 
+Chat memory (extraction, recall, consolidation) has its own tuning surface,
+prefixed `AGENTCHAT_MEMORY_` — e.g. `AGENTCHAT_MEMORY_RECALL_FLOOR`. Every
+constant, its default and its status (`borrowed`/`scaled`/`guess`/`tuned`)
+live in `src/agentchat/core/memory/tuning.py`'s `CATALOGUE`; that file is the
+source of truth, not this table.
+
 Variables can also go in a `.env` file at the project root (copy
 `.env.example`) instead of being exported in the shell. Real environment
 variables take precedence over `.env`.
+
+**No migrations.** `agentchat.db`'s schema only ever grows by hand-written
+`CREATE TABLE IF NOT EXISTS` statements; there is no upgrade path from an
+older schema. A database written before chat memory landed is refused, not
+silently rewritten — the app raises naming the file. Delete it and restart to
+get a fresh one: `rm data/agentchat.db` (or whatever `AGENTCHAT_DATA_DIR`
+points at).
 
 ## Layout
 
@@ -98,6 +128,7 @@ src/agentchat/
     chat.py        turn orchestration — the only thing that knows how a reply is made
     context.py     ContextStrategy seam (context-management elective)
     errors.py      every failure the UI is expected to render
+    memory/        group-scoped chat memory: MemoryStore protocol + apply()'s payloads
   llm/
     base.py        LLMProvider protocol — the app/backend boundary
     registry.py    model catalogue, residency, runtime switching
@@ -105,7 +136,9 @@ src/agentchat/
     mock.py        the stub backend
   storage/
     base.py        ConversationStore protocol + in-memory implementation
-    sqlite.py      durable implementation — two tables, one save per turn
+    schema.py      the DDL both stores share, and the old-database guard
+    sqlite.py      durable ConversationStore
+    memory.py      durable MemoryStore — fragments, citations, apply()
   ui/
     app.py         Textual application
     widgets.py     message bubbles

@@ -1,7 +1,8 @@
 """SQLite-backed `ConversationStore`: conversations survive process restarts.
 
 Each method offloads its synchronous sqlite3 body to a worker thread via
-`asyncio.to_thread`, so storage I/O never blocks the event loop.
+`asyncio.to_thread`, so storage I/O never blocks the event loop. The schema
+itself lives in `storage.schema` — `SqliteMemoryStore` opens the same file.
 """
 
 from __future__ import annotations
@@ -14,21 +15,10 @@ from datetime import datetime
 from pathlib import Path
 
 from agentchat.core.errors import StorageError
-from agentchat.core.models import Conversation, Message
-from agentchat.storage.base import by_recency
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS conversations (
-  id TEXT PRIMARY KEY, title TEXT NOT NULL, group_id TEXT,
-  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS messages (
-  id TEXT PRIMARY KEY,
-  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-  ordinal INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
-  created_at TEXT NOT NULL, model_id TEXT, metadata TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS idx_messages_conversation
-  ON messages(conversation_id, ordinal);
-"""
+from agentchat.core.memory.models import Group
+from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, Message
+from agentchat.storage import schema
+from agentchat.storage.base import by_default_first, by_recency
 
 
 class SqliteStore:
@@ -36,24 +26,26 @@ class SqliteStore:
 
     def __init__(self, path: Path) -> None:
         self._path = path
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            with closing(self._connect()) as conn, conn:
-                conn.executescript(_SCHEMA)
-        except sqlite3.Error as exc:
-            raise StorageError(f"could not open database at {path}") from exc
+        schema.ensure_schema(path)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._path)
-        # Per-connection setting: without it ON DELETE CASCADE is silently
-        # ignored and delete() would orphan message rows.
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
+        return schema.connect(self._path)
 
-    async def list_conversations(
-        self, group_id: str | None = None
-    ) -> list[Conversation]:
+    async def list_conversations(self, group_id: str = DEFAULT_GROUP_ID) -> list[Conversation]:
         return await asyncio.to_thread(self._list_conversations, group_id)
+
+    async def list_all_conversations(self) -> list[Conversation]:
+        return await asyncio.to_thread(self._list_conversations, None)
+
+    async def list_groups(self) -> list[Group]:
+        return await asyncio.to_thread(self._list_groups)
+
+    async def save_group(self, group: Group) -> None:
+        await asyncio.to_thread(self._save_group, group)
+
+    async def default_group(self) -> Group:
+        groups = await self.list_groups()
+        return groups[0]
 
     async def load(self, conversation_id: str) -> Conversation | None:
         return await asyncio.to_thread(self._load, conversation_id)
@@ -82,6 +74,52 @@ class SqliteStore:
         items = [c for c in items if c is not None]
         return by_recency(items)
 
+    def _list_groups(self) -> list[Group]:
+        try:
+            with closing(self._connect()) as conn, conn:
+                rows = conn.execute(
+                    "SELECT id, name, kind, last_consolidated_at, created_at FROM groups"
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError("failed to list groups") from exc
+        groups = [
+            Group(
+                id=id_,
+                name=name,
+                kind=kind,
+                last_consolidated_at=(
+                    datetime.fromisoformat(last_consolidated_at)
+                    if last_consolidated_at is not None
+                    else None
+                ),
+                created_at=datetime.fromisoformat(created_at),
+            )
+            for id_, name, kind, last_consolidated_at, created_at in rows
+        ]
+        return by_default_first(groups)
+
+    def _save_group(self, group: Group) -> None:
+        try:
+            with closing(self._connect()) as conn, conn:
+                conn.execute(
+                    "INSERT INTO groups (id, name, kind, last_consolidated_at, created_at) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET "
+                    "name = excluded.name, kind = excluded.kind, "
+                    "last_consolidated_at = excluded.last_consolidated_at",
+                    (
+                        group.id,
+                        group.name,
+                        group.kind,
+                        group.last_consolidated_at.isoformat()
+                        if group.last_consolidated_at is not None
+                        else None,
+                        group.created_at.isoformat(),
+                    ),
+                )
+        except sqlite3.Error as exc:
+            raise StorageError(f"failed to save group {group.id}") from exc
+
     def _load(self, conversation_id: str) -> Conversation | None:
         try:
             with closing(self._connect()) as conn, conn:
@@ -91,7 +129,7 @@ class SqliteStore:
 
     def _load_conn(self, conn: sqlite3.Connection, conversation_id: str) -> Conversation | None:
         row = conn.execute(
-            "SELECT id, title, group_id, created_at, updated_at "
+            "SELECT id, title, group_id, extracted_at, extracted_id, created_at, updated_at "
             "FROM conversations WHERE id = ?",
             (conversation_id,),
         ).fetchone()
@@ -113,11 +151,13 @@ class SqliteStore:
             )
             for m_id, role, content, created_at, model_id, metadata in message_rows
         ]
-        _, title, group_id, created_at, updated_at = row
+        _, title, group_id, extracted_at, extracted_id, created_at, updated_at = row
         return Conversation(
             id=conversation_id,
             title=title,
             group_id=group_id,
+            extracted_at=datetime.fromisoformat(extracted_at) if extracted_at else None,
+            extracted_id=extracted_id,
             created_at=datetime.fromisoformat(created_at),
             updated_at=datetime.fromisoformat(updated_at),
             messages=messages,
@@ -127,15 +167,21 @@ class SqliteStore:
         try:
             with closing(self._connect()) as conn, conn:
                 conn.execute(
-                    "INSERT INTO conversations (id, title, group_id, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?) "
+                    "INSERT INTO conversations "
+                    "(id, title, group_id, extracted_at, extracted_id, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(id) DO UPDATE SET "
                     "title = excluded.title, group_id = excluded.group_id, "
+                    "extracted_at = excluded.extracted_at, extracted_id = excluded.extracted_id, "
                     "created_at = excluded.created_at, updated_at = excluded.updated_at",
                     (
                         conversation.id,
                         conversation.title,
                         conversation.group_id,
+                        conversation.extracted_at.isoformat()
+                        if conversation.extracted_at is not None
+                        else None,
+                        conversation.extracted_id,
                         conversation.created_at.isoformat(),
                         conversation.updated_at.isoformat(),
                     ),

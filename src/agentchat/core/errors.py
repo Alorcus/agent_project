@@ -22,3 +22,7 @@ class ContextOverflowError(AgentChatError):
 
 class StorageError(AgentChatError):
     """Persisting or loading conversation state failed."""
+
+
+class TuningError(AgentChatError):
+    """A memory tuning environment variable could not be parsed."""

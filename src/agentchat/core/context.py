@@ -10,16 +10,26 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
-from agentchat.core.models import Message
+from agentchat.core.models import Conversation, Message
+from agentchat.core.tokens import CHARS_PER_TOKEN, estimate_tokens
 
-#: Rough characters-per-token. Replaced by the real tokenizer with the backend.
-CHARS_PER_TOKEN = 4
+if TYPE_CHECKING:
+    from agentchat.core.memory.models import MemoryFragment
 
+__all__ = [
+    "CHARS_PER_TOKEN",
+    "MIN_CONTEXT_BUDGET",
+    "ContextDecision",
+    "ContextStrategy",
+    "RecencyWindowStrategy",
+    "estimate_tokens",
+]
 
-def estimate_tokens(text: str) -> int:
-    return max(1, len(text) // CHARS_PER_TOKEN)
+#: The floor `build()` never trims a budget below, however small the window or
+#: however much a caller reserves for the response.
+MIN_CONTEXT_BUDGET = 256
 
 
 @dataclass
@@ -32,6 +42,11 @@ class ContextDecision:
     estimated_tokens: int = 0
     budget: int = 0
     notes: list[str] = field(default_factory=list)
+    #: The query-selected block and the stable core `GroupMemoryStrategy`
+    #: spliced in, reported separately per § 8.1 — empty for any strategy
+    #: with no memory store behind it.
+    recalled: list["MemoryFragment"] = field(default_factory=list)
+    core: list["MemoryFragment"] = field(default_factory=list)
 
     @property
     def was_trimmed(self) -> bool:
@@ -45,6 +60,7 @@ class ContextStrategy(Protocol):
         *,
         context_window: int,
         reserve_for_response: int = 512,
+        conversation: Conversation | None = None,
     ) -> ContextDecision: ...
 
 
@@ -61,8 +77,9 @@ class RecencyWindowStrategy:
         *,
         context_window: int,
         reserve_for_response: int = 512,
+        conversation: Conversation | None = None,
     ) -> ContextDecision:
-        budget = max(256, context_window - reserve_for_response)
+        budget = max(MIN_CONTEXT_BUDGET, context_window - reserve_for_response)
         system = [m for m in messages if m.role == "system"]
         rest = [m for m in messages if m.role != "system"]
 

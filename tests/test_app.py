@@ -594,3 +594,49 @@ async def test_delete_conversation_storage_error_notifies_and_keeps_running():
 
         await pilot.press("escape")
         await pilot.pause()
+
+
+# -- memory: the flush points the extractor's batching depends on ---------
+
+
+def _flush_spy(app) -> list[str]:
+    """Record which conversation each flush was asked for, and still run it."""
+    seen: list[str] = []
+    original = app.chat.flush_extraction
+
+    async def spy(conversation, **kwargs):
+        seen.append(conversation.id)
+        return await original(conversation, **kwargs)
+
+    app.chat.flush_extraction = spy
+    return seen
+
+
+async def test_starting_a_new_conversation_flushes_the_pending_range():
+    """Batching holds the last turns back; navigating away is one of the two
+    moments that has to let them go (§ 2.1), or they wait indefinitely."""
+    app = ChatApp(mock_settings(store="sqlite"))
+    async with app.run_test() as pilot:
+        flushed = _flush_spy(app)
+        await _submit(pilot, "first")
+        await _wait_until_done(pilot, app)
+        leaving = app.conversation.id
+
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+
+        assert flushed == [leaving]
+
+
+async def test_quitting_flushes_the_pending_range():
+    app = ChatApp(mock_settings(store="sqlite"))
+    async with app.run_test() as pilot:
+        flushed = _flush_spy(app)
+        await _submit(pilot, "first")
+        await _wait_until_done(pilot, app)
+        leaving = app.conversation.id
+
+        await pilot.press("ctrl+d")
+        await pilot.pause()
+
+    assert flushed == [leaving]
