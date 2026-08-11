@@ -94,6 +94,13 @@ Variables can also go in a `.env` file at the project root (copy
 `.env.example`) instead of being exported in the shell. Real environment
 variables take precedence over `.env`.
 
+**No migrations.** `agentchat.db`'s schema only ever grows by hand-written
+`CREATE TABLE IF NOT EXISTS` statements; there is no upgrade path from an
+older schema. A database written before chat memory landed is refused, not
+silently rewritten — the app raises naming the file. Delete it and restart to
+get a fresh one: `rm data/agentchat.db` (or whatever `AGENTCHAT_DATA_DIR`
+points at).
+
 ## Layout
 
 ```
@@ -104,6 +111,7 @@ src/agentchat/
     chat.py        turn orchestration — the only thing that knows how a reply is made
     context.py     ContextStrategy seam (context-management elective)
     errors.py      every failure the UI is expected to render
+    memory/        group-scoped chat memory: MemoryStore protocol + apply()'s payloads
   llm/
     base.py        LLMProvider protocol — the app/backend boundary
     registry.py    model catalogue, residency, runtime switching
@@ -111,7 +119,9 @@ src/agentchat/
     mock.py        the stub backend
   storage/
     base.py        ConversationStore protocol + in-memory implementation
-    sqlite.py      durable implementation — two tables, one save per turn
+    schema.py      the DDL both stores share, and the old-database guard
+    sqlite.py      durable ConversationStore
+    memory.py      durable MemoryStore — fragments, citations, apply()
   ui/
     app.py         Textual application
     widgets.py     message bubbles

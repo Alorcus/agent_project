@@ -55,7 +55,9 @@ class MemoryFragment:
 
 @dataclass
 class FragmentCitation:
-    fragment_id: int
+    #: `None` until `apply()` mints the fragment's id and fills this in — the
+    #: state a citation built before its fragment's insert is always in.
+    fragment_id: int | None
     id: int | None = None
     source_message_id: str | None = None
     source_fragment_id: int | None = None

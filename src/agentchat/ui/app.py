@@ -118,7 +118,7 @@ class ChatApp(App[None]):
     async def action_open_conversations(self) -> None:
         # Bare @work (not the generation group, not exclusive): opening the
         # picker must never cancel a running generation.
-        conversations = await self.chat.list_conversations()
+        conversations = await self.chat.list_all_conversations()
         result = await self.push_screen_wait(
             ConversationPicker(conversations, self.conversation.id)
         )
@@ -149,7 +149,7 @@ class ChatApp(App[None]):
             # so swap in a fresh, unsaved one first — persist already skips
             # conversations with no messages.
             self.conversation = Conversation()
-            remaining = await self.chat.list_conversations()
+            remaining = await self.chat.list_all_conversations()
             if remaining:
                 await self._switch_to(remaining[0].id)
             else:
@@ -157,7 +157,7 @@ class ChatApp(App[None]):
         # Escape during the store work leaves nothing to refresh.
         if self.screen is picker:
             await picker.refresh_conversations(
-                await self.chat.list_conversations(), self.conversation.id
+                await self.chat.list_all_conversations(), self.conversation.id
             )
 
     async def _switch_to(self, conversation_id: str) -> None:

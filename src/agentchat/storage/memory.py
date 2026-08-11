@@ -1,0 +1,256 @@
+"""`SqliteMemoryStore`: the synchronous `MemoryStore` over the same file
+`SqliteStore` writes conversations to.
+
+Synchronous by the skeleton's ratified contract: recall sits on the reply
+path, `ContextStrategy.build` is sync, and SQLite reads are fast enough not
+to earn an async surface.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from collections.abc import Sequence
+from contextlib import closing
+from datetime import datetime
+from pathlib import Path
+
+from agentchat.core.errors import StorageError
+from agentchat.core.memory.models import FragmentCitation, Group, MemoryFragment
+from agentchat.core.memory.store import ApplyResult, ConfidenceChange, FragmentWrite, Watermark
+from agentchat.core.memory.tuning import Tuning
+from agentchat.core.memory.types import Tier
+from agentchat.core.models import _now
+from agentchat.storage import schema
+
+# The reachability check behind I-8: does `source` already (transitively)
+# cite `fragment`? A hit means the proposed edge would close a cycle. Run
+# inside the write transaction so it sees the batch's own earlier edges too.
+_REACHABLE = """
+WITH RECURSIVE reach(id) AS (
+  SELECT :source
+  UNION
+  SELECT fc.source_fragment_id FROM fragment_citations fc
+    JOIN reach r ON fc.fragment_id = r.id
+   WHERE fc.source_fragment_id IS NOT NULL)
+SELECT 1 FROM reach WHERE id = :fragment
+"""
+
+
+class SqliteMemoryStore:
+    """Synchronous `MemoryStore` over the same file as `SqliteStore`."""
+
+    def __init__(self, path: Path, tuning: Tuning | None = None) -> None:
+        self.path = path  # public: tests and factories write through it
+        self._tuning = tuning or Tuning.from_env()
+        schema.ensure_schema(path)
+
+    def memory_scope(self, group_id: str) -> str | None:
+        with closing(schema.connect(self.path)) as conn:
+            row = conn.execute("SELECT kind FROM groups WHERE id = ?", (group_id,)).fetchone()
+        if row is None:
+            return None
+        # The kind comparison stays in Group.is_memory_scope() (I-2's single
+        # decision point) rather than being repeated here.
+        return group_id if Group(kind=row[0]).is_memory_scope() else None
+
+    def candidates(self, group_id: str, query: str, k: int) -> list[MemoryFragment]:
+        raise NotImplementedError("stage 2")
+
+    def stable_core(self, group_id: str, budget: int) -> list[MemoryFragment]:
+        raise NotImplementedError("stage 3")
+
+    def select(
+        self,
+        group_id: str,
+        query: str,
+        budget: int,
+        *,
+        tiers: Tier = Tier.EXTRACTED,
+    ) -> list[MemoryFragment]:
+        raise NotImplementedError("stage 3")
+
+    def purge_conversation(self, conversation_id: str) -> None:
+        raise NotImplementedError("stage 4")
+
+    def purge_group(self, group_id: str) -> None:
+        raise NotImplementedError("stage 4")
+
+    def apply(
+        self, writes: Sequence[FragmentWrite], *, watermark: Watermark | None = None
+    ) -> ApplyResult:
+        try:
+            with closing(schema.connect(self.path)) as conn:
+                with conn:
+                    result = self._apply(conn, writes)
+                    if watermark is not None:
+                        conn.execute(
+                            "UPDATE conversations SET extracted_at = ?, extracted_id = ?"
+                            " WHERE id = ?",
+                            (
+                                watermark.extracted_at.isoformat(),
+                                watermark.extracted_id,
+                                watermark.conversation_id,
+                            ),
+                        )
+        except sqlite3.Error as exc:
+            raise StorageError(str(exc)) from exc
+        return result
+
+    def _apply(self, conn: sqlite3.Connection, writes: Sequence[FragmentWrite]) -> ApplyResult:
+        now = _now()
+
+        # Phase 1: every fragment row in the batch exists before the first
+        # citation is inserted — a citation may name a fragment that appears
+        # later in the same batch.
+        ids: list[int] = []
+        newly_inserted: list[bool] = []
+        for write in writes:
+            fragment_id, is_new = self._upsert_fragment(conn, write, now)
+            write.fragment.id = fragment_id
+            ids.append(fragment_id)
+            newly_inserted.append(is_new)
+
+        inserted = [
+            ids[i] for i, w in enumerate(writes) if not w.reinforce and newly_inserted[i]
+        ]
+        revised = [
+            ids[i] for i, w in enumerate(writes) if not w.reinforce and not newly_inserted[i]
+        ]
+
+        # Phases 2-3: citations, one at a time, then the reinforcement raise
+        # for whatever in this write's batch turned out to be genuinely new.
+        citations_added = 0
+        confidence_changes: list[ConfidenceChange] = []
+        for i, write in enumerate(writes):
+            fragment_id = ids[i]
+            new_count = 0
+            for citation in write.citations:
+                if self._insert_citation(conn, fragment_id, citation, now):
+                    citations_added += 1
+                    new_count += 1
+            if write.reinforce and new_count:
+                (before,) = conn.execute(
+                    "SELECT confidence FROM memory_fragments WHERE id = ?", (fragment_id,)
+                ).fetchone()
+                after = min(1.0, before + new_count * self._tuning.reinforce_step)
+                conn.execute(
+                    "UPDATE memory_fragments SET confidence = ? WHERE id = ?",
+                    (after, fragment_id),
+                )
+                confidence_changes.append(ConfidenceChange(fragment_id, before, after))
+
+        return ApplyResult(
+            inserted=inserted,
+            revised=revised,
+            citations_added=citations_added,
+            confidence_changes=confidence_changes,
+        )
+
+    def _upsert_fragment(
+        self, conn: sqlite3.Connection, write: FragmentWrite, now: datetime
+    ) -> tuple[int, bool]:
+        """Insert or revise `write.fragment`'s row. Returns `(id, is_new)`."""
+        fragment = write.fragment
+        existing = None
+        if fragment.id is not None:
+            row = conn.execute(
+                "SELECT id FROM memory_fragments WHERE id = ?", (fragment.id,)
+            ).fetchone()
+            existing = row[0] if row is not None else None
+
+        if write.reinforce:
+            if existing is None:
+                raise StorageError(
+                    "reinforce=True requires an existing fragment row "
+                    f"(fragment.id={fragment.id!r})"
+                )
+            return existing, False
+
+        if existing is not None:
+            # The revise path is authoritative: the caller's text and
+            # confidence win outright, and revised_at is stamped by the
+            # store so no caller can forget it.
+            conn.execute(
+                "UPDATE memory_fragments SET kind = ?, text = ?, confidence = ?,"
+                " importance = ?, decay = ?, embedding = ?, embedding_model = ?,"
+                " reasoning = ?, revised_at = ? WHERE id = ?",
+                (
+                    fragment.kind,
+                    fragment.text,
+                    fragment.confidence,
+                    fragment.importance,
+                    fragment.decay,
+                    fragment.embedding,
+                    fragment.embedding_model,
+                    fragment.reasoning,
+                    now.isoformat(),
+                    existing,
+                ),
+            )
+            return existing, False
+
+        cursor = conn.execute(
+            "INSERT INTO memory_fragments (id, uuid, group_id, origin_conversation_id,"
+            " consolidated, kind, text, confidence, importance, decay, embedding,"
+            " embedding_model, reasoning, created_at, revised_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            (
+                fragment.id,
+                fragment.uuid,
+                fragment.group_id,
+                fragment.origin_conversation_id,
+                int(fragment.consolidated),
+                fragment.kind,
+                fragment.text,
+                fragment.confidence,
+                fragment.importance,
+                fragment.decay,
+                fragment.embedding,
+                fragment.embedding_model,
+                fragment.reasoning,
+                fragment.created_at.isoformat(),
+            ),
+        )
+        new_id = fragment.id if fragment.id is not None else cursor.lastrowid
+        return new_id, True
+
+    def _insert_citation(
+        self,
+        conn: sqlite3.Connection,
+        fragment_id: int,
+        citation: FragmentCitation,
+        now: datetime,
+    ) -> bool:
+        """Insert `citation` against `fragment_id`. Returns whether the row
+        was genuinely new (`False` for a repeat — I-7)."""
+        if citation.source_fragment_id is not None:
+            self._reject_cycle(conn, fragment_id, citation.source_fragment_id)
+
+        observed_at = (citation.observed_at or now).isoformat()
+        row = conn.execute(
+            "INSERT INTO fragment_citations"
+            " (fragment_id, source_message_id, source_fragment_id, observed_at, quote)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT DO NOTHING RETURNING id",
+            (
+                fragment_id,
+                citation.source_message_id,
+                citation.source_fragment_id,
+                observed_at,
+                citation.quote,
+            ),
+        ).fetchone()
+        citation.fragment_id = fragment_id
+        if row is not None:
+            citation.id = row[0]
+        return row is not None
+
+    def _reject_cycle(self, conn: sqlite3.Connection, fragment_id: int, source_id: int) -> None:
+        # Self-citation is the degenerate case: reach seeds at `source_id`,
+        # so `fragment_id == source_id` matches on the seed row itself — no
+        # separate check needed. Per § 1.1.1, id order is not a fast path.
+        hit = conn.execute(_REACHABLE, {"source": source_id, "fragment": fragment_id}).fetchone()
+        if hit is not None:
+            raise StorageError(
+                f"citing fragment {source_id} from {fragment_id} would close a cycle"
+            )
