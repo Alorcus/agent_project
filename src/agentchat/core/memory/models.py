@@ -43,6 +43,9 @@ class MemoryFragment:
     reasoning: str | None = None
     created_at: datetime = field(default_factory=_now)
     revised_at: datetime | None = None
+    #: Populated by reads that join `fragment_support` (§ 1.3's derived
+    #: association); never written back — `apply()` ignores it outright.
+    support: FragmentSupport | None = None
 
     @property
     def tier(self) -> Tier:

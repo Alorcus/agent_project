@@ -8,6 +8,7 @@ to earn an async surface.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Sequence
 from contextlib import closing
@@ -15,12 +16,79 @@ from datetime import datetime
 from pathlib import Path
 
 from agentchat.core.errors import StorageError
-from agentchat.core.memory.models import FragmentCitation, Group, MemoryFragment
+from agentchat.core.memory.models import FragmentCitation, FragmentSupport, Group, MemoryFragment
 from agentchat.core.memory.store import ApplyResult, ConfidenceChange, FragmentWrite, Watermark
 from agentchat.core.memory.tuning import Tuning
 from agentchat.core.memory.types import Tier
 from agentchat.core.models import _now
 from agentchat.storage import schema
+
+#: Words only — a user's own phrasing routed straight into FTS5 MATCH would
+#: let a stray quote or the bare token `NEAR` raise a syntax error on the
+#: reply path, so every token is quoted and OR-joined instead of passed raw.
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+#: `f.`-qualified so a caller can join `memory_fragments` under other aliases
+#: without rewriting this list — the order `_row_to_fragment` unpacks by.
+_FRAGMENT_SELECT = (
+    "f.id, f.uuid, f.group_id, f.origin_conversation_id, f.consolidated, f.kind,"
+    " f.text, f.confidence, f.importance, f.decay, f.embedding, f.embedding_model,"
+    " f.reasoning, f.created_at, f.revised_at"
+)
+_FRAGMENT_COLUMN_COUNT = 15
+
+
+def _row_to_fragment(row: Sequence, support: FragmentSupport | None = None) -> MemoryFragment:
+    """The row -> `MemoryFragment` mapper `candidates()` and (stage 3's)
+    `select()`/`stable_core()` all need identically — one place that knows
+    the column order above."""
+    (
+        id_, uuid_, group_id, origin_conversation_id, consolidated, kind, text,
+        confidence, importance, decay, embedding, embedding_model, reasoning,
+        created_at, revised_at,
+    ) = row
+    return MemoryFragment(
+        id=id_,
+        uuid=uuid_,
+        group_id=group_id,
+        origin_conversation_id=origin_conversation_id,
+        consolidated=bool(consolidated),
+        kind=kind,
+        text=text,
+        confidence=confidence,
+        importance=importance,
+        decay=decay,
+        embedding=embedding,
+        embedding_model=embedding_model,
+        reasoning=reasoning,
+        created_at=datetime.fromisoformat(created_at),
+        revised_at=datetime.fromisoformat(revised_at) if revised_at else None,
+        support=support,
+    )
+
+
+def _support_from(row: Sequence) -> FragmentSupport | None:
+    """`fragment_support` is a `LEFT JOIN`: a fragment somehow cited by
+    nothing (I-4 should already forbid it) reads as `None` rather than a
+    `FragmentSupport` of zeroes with no timestamps to put in it."""
+    citation_count, conversation_count, first_seen_at, last_seen_at = row
+    if citation_count is None:
+        return None
+    return FragmentSupport(
+        citation_count=citation_count,
+        conversation_count=conversation_count,
+        first_seen_at=datetime.fromisoformat(first_seen_at),
+        last_seen_at=datetime.fromisoformat(last_seen_at),
+    )
+
+
+def _fts_match(query: str) -> str | None:
+    """`None` when `query` has no usable token, so a caller can skip the
+    database entirely rather than run an empty `MATCH`."""
+    tokens = dict.fromkeys(_WORD_RE.findall(query))  # dedup, order-preserving
+    if not tokens:
+        return None
+    return " OR ".join(f'"{token}"' for token in tokens)
 
 # The reachability check behind I-8: does `source` already (transitively)
 # cite `fragment`? A hit means the proposed edge would close a cycle. Run
@@ -54,7 +122,25 @@ class SqliteMemoryStore:
         return group_id if Group(kind=row[0]).is_memory_scope() else None
 
     def candidates(self, group_id: str, query: str, k: int) -> list[MemoryFragment]:
-        raise NotImplementedError("stage 2")
+        match = _fts_match(query)
+        if match is None:
+            return []
+        sql = f"""
+            SELECT {_FRAGMENT_SELECT},
+                   s.citation_count, s.conversation_count, s.first_seen_at, s.last_seen_at
+              FROM memory_fragments f
+              JOIN memory_fts ON memory_fts.rowid = f.id
+              LEFT JOIN fragment_support s ON s.fragment_id = f.id
+             WHERE f.group_id = ? AND f.consolidated = 0 AND memory_fts MATCH ?
+             ORDER BY bm25(memory_fts)
+             LIMIT ?
+        """
+        with closing(schema.connect(self.path)) as conn:
+            rows = conn.execute(sql, (group_id, match, k)).fetchall()
+        return [
+            _row_to_fragment(row[:_FRAGMENT_COLUMN_COUNT], _support_from(row[_FRAGMENT_COLUMN_COUNT:]))
+            for row in rows
+        ]
 
     def stable_core(self, group_id: str, budget: int) -> list[MemoryFragment]:
         raise NotImplementedError("stage 3")

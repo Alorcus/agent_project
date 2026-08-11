@@ -15,6 +15,7 @@ from pathlib import Path
 from dotenv import find_dotenv, load_dotenv
 
 from agentchat.core.errors import AgentChatError
+from agentchat.core.memory.store import MemoryStore
 from agentchat.llm.base import ModelInfo
 from agentchat.llm.local import DEFAULT_MODEL_ROOT, TransformersProvider
 from agentchat.llm.local import default_models as local_models
@@ -22,6 +23,7 @@ from agentchat.llm.mock import MockProvider
 from agentchat.llm.mock import default_models as mock_models
 from agentchat.llm.registry import ModelRegistry
 from agentchat.storage.base import ConversationStore, InMemoryStore
+from agentchat.storage.memory import SqliteMemoryStore
 from agentchat.storage.sqlite import SqliteStore
 
 ENV_PREFIX = "AGENTCHAT_"
@@ -153,6 +155,15 @@ def build_store(settings: Settings) -> ConversationStore:
     if settings.store == "memory":
         return InMemoryStore()
     return SqliteStore(settings.data_dir / "agentchat.db")
+
+
+def build_memory_store(settings: Settings) -> MemoryStore | None:
+    """`None` when the conversation store is non-durable — memory lives in the
+    same file, and there is no in-memory implementation of `apply()`."""
+    _require_choice("STORE", settings.store, STORES)
+    if settings.store == "memory":
+        return None
+    return SqliteMemoryStore(settings.data_dir / "agentchat.db")
 
 
 def _register_local(registry: ModelRegistry, settings: Settings) -> None:

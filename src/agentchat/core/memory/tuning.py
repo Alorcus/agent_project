@@ -51,6 +51,14 @@ CATALOGUE: tuple[Constant, ...] = (
              "confidence raise per genuinely new citation", "§ 2.1"),
     Constant("CANDIDATE_POOL_K", "candidate_pool_k", 10, "guess",
              "how many fragments the extractor resolves against", "§ 2.1"),
+    Constant("EXTRACT_MAX_TOKENS", "extract_max_tokens", 2048, "guess",
+             "must fit a reasoning trace and the JSON array", "§ 2.1"),
+    Constant("EXTRACT_TEMPERATURE", "extract_temperature", 0.0, "guess",
+             "greedy — the same turns should extract the same claims twice", "§ 2.1"),
+    Constant("QUOTE_MAX_CHARS", "quote_max_chars", 240, "guess",
+             "how much of a turn a citation quotes for the inspector", "§ 2.1"),
+    Constant("EXTRACT_CLOSE_TIMEOUT", "extract_close_timeout", 30.0, "guess",
+             "seconds the flush-on-close waits before the app stops caring", "§ 2.1"),
     Constant("RECALL_FLOOR", "recall_floor", 0.35, "guess",
              "cosine admission gate; embedding-model specific", "§ 6.1"),
     Constant("RECALL_FLOOR_MODEL", "recall_floor_model", "", "guess",
@@ -121,6 +129,12 @@ class Tuning:
     extract_every: int = field(default_factory=lambda: _resolve(BY_NAME["extract_every"]))
     reinforce_step: float = field(default_factory=lambda: _resolve(BY_NAME["reinforce_step"]))
     candidate_pool_k: int = field(default_factory=lambda: _resolve(BY_NAME["candidate_pool_k"]))
+    extract_max_tokens: int = field(default_factory=lambda: _resolve(BY_NAME["extract_max_tokens"]))
+    extract_temperature: float = field(default_factory=lambda: _resolve(BY_NAME["extract_temperature"]))
+    quote_max_chars: int = field(default_factory=lambda: _resolve(BY_NAME["quote_max_chars"]))
+    extract_close_timeout: float = field(
+        default_factory=lambda: _resolve(BY_NAME["extract_close_timeout"])
+    )
     recall_floor: float = field(default_factory=lambda: _resolve(BY_NAME["recall_floor"]))
     recall_floor_model: str = field(default_factory=lambda: _resolve(BY_NAME["recall_floor_model"]))
     rrf_k: int = field(default_factory=lambda: _resolve(BY_NAME["rrf_k"]))

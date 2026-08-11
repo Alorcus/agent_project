@@ -413,6 +413,13 @@ and § 2.6 sums from the beginning.
 it the UI cannot show what memory contributed, which NFR-CTX-05 asks for and § 8
 designs.
 
+**Implementation note (stage 2).** `MemoryFragment.support` is the code-side name
+for the `1 -- 1` derived association already drawn above: populated by reads that
+join `fragment_support` (`candidates()` today; `select()`/`stable_core()` from
+stage 3), and ignored outright by writes — nothing in `apply()` reads or persists
+it, since the view it mirrors is recomputed from `fragment_citations` on every
+query.
+
 `reseat_group(conversation_id, group_id)` was on this protocol until v6 and should
 never have survived v4. It is a move operation, and § 2.5 abolished moves; a method
 that cannot be called without violating an invariant is worse than a missing one,
@@ -488,6 +495,17 @@ sequenceDiagram
 
 One LLM call resolves every claim against its candidates; only the `revise` branch
 pays a second call, because only it rewrites text.
+
+**Implementation note (stage 2).** `decide(new turns, candidates)` above is the
+`resolve` step; claim extraction (`propose`) is a call of its own, as the flowchart
+under "What the four outcomes are decided on" already draws separately. Extraction
+is therefore two calls, not one — the batch that finds nothing durable pays one
+call, not one call that also carries k candidates it doesn't need. Similarly,
+`Ex->>Store: messages after the watermark` is not a `MemoryStore` method: the
+extractor is handed its evidence rather than reaching for it, since the store has
+no way to hand back chat rows without a protocol `extract.py` would then share with
+a future persona pipeline. `ConversationEvidence` (`strategy.py`) slices the range
+from the live `Conversation` and hands it in.
 
 ### When extraction runs
 
@@ -660,6 +678,15 @@ The signal actually worth having from the citation graph is *how well establishe
 a claim already is*, since a claim resting on five messages across three
 conversations should bias toward reinforce rather than revise. That compresses to
 three values from a view § 1.1 already defines. Counts, not rows.
+
+**Implementation note (stage 2).** `candidates()` returns the extracted tier only
+(`consolidated = 0`) — a raw claim resolving against a consolidated insight would
+revise compressed text without re-deriving it from evidence, so extraction stays
+scoped to the layer it owns. The claim payload itself (`propose`'s output) carries
+`importance` and `confidence`: the first so § 2.6's consolidation trigger fires on
+something other than a hardcoded count, the second because GUM's order is
+trace → proposition → confidence, and `confidence` belongs with the proposition
+that earns it.
 
 ### Reasoning traces follow the thinking toggle
 
@@ -1437,6 +1464,10 @@ it.
 | `EXTRACT_EVERY` | 6 | `guess` | balance of LLM cost against recall latency | § 2.1 |
 | `REINFORCE_STEP` | 0.1 | `guess` | confidence raise per genuinely new citation | § 2.1 |
 | `CANDIDATE_POOL_K` | 10 | `guess` | how many fragments the extractor resolves against | § 2.1 |
+| `EXTRACT_MAX_TOKENS` | 2048 | `guess` | must fit a reasoning trace and the JSON array | § 2.1 |
+| `EXTRACT_TEMPERATURE` | 0.0 | `guess` | greedy — the same turns should extract the same claims twice | § 2.1 |
+| `QUOTE_MAX_CHARS` | 240 | `guess` | how much of a turn a citation quotes for the inspector | § 2.1 |
+| `EXTRACT_CLOSE_TIMEOUT` | 30.0 | `guess` | seconds the flush-on-close waits before the app stops caring | § 2.1 |
 | `RECALL_FLOOR` | 0.35 | `guess` | cosine admission gate; **embedding-model specific** | § 6.1 |
 | `RECALL_FLOOR_MODEL` | *empty (unpinned)* | `guess` | pinned encoder id the floor above is calibrated against | § 6.1 |
 | `RRF_K` | 60 | `borrowed` | standard reciprocal-rank-fusion constant | § 6 |

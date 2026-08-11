@@ -298,6 +298,17 @@ reaches every fragment including dormant.
 
 ## Changelog
 
+- **2026-08-11** — Stage 2 landed. The extraction pipeline (`observe -> audit
+  -> propose -> retrieve -> resolve -> apply`), the wire format and its three
+  pure parsers, `candidates()`'s BM25 retrieval, the chat-side adapters
+  (`MessageEvidence`, `ConversationEvidence`, `ChatMemory`), and the
+  batching/flush wiring in `ChatService`/`ChatApp` are in. `EvidenceSource` is
+  the third narrow protocol rule 2 implies but does not name — `id`,
+  `scope_id`, `items`, `read_through` — added beside `EvidenceItem` in
+  `core/memory/types.py`, alongside `PromptTurn` (the `Message` stand-in
+  `extract.py` is licensed to build prompts with). `select()`/`stable_core()`
+  still raise `NotImplementedError("stage 3")`; `rank.py` and `consolidate.py`
+  are untouched.
 - **2026-08-10** — v1.2. Added "Arming a stage": activate / extend / retire,
   with the `@expires(stage=N)` marker as the mechanical form of retirement.
   Closes the process gap found during stage-2 arming, where a green stage-1

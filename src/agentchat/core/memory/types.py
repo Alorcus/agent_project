@@ -4,6 +4,8 @@ persona pipeline (I-6)."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Flag, auto
 from typing import Protocol, runtime_checkable
@@ -17,6 +19,31 @@ class EvidenceItem(Protocol):
     id: str
     text: str
     created_at: datetime
+
+
+@runtime_checkable
+class EvidenceSource(Protocol):
+    """One batch of evidence for `MemoryExtractor.run`: the adapter has
+    already sliced it to the unread range and knows how far it reaches.
+    `ConversationEvidence` binds this to a chat; an email thread binds it
+    later."""
+
+    id: str
+    scope_id: str
+    items: Sequence[EvidenceItem]
+    #: `(created_at, id)` of the last item in `items`, watermark-comparable
+    #: (§ 2.1's lexicographic range) — `None` when there is nothing new.
+    read_through: tuple[datetime, str] | None
+
+
+@dataclass(frozen=True)
+class PromptTurn:
+    """What a provider's `generate` actually reads off a `Message`: role and
+    content, nothing else. Lets `extract.py` (and later `consolidate.py`)
+    build prompts without importing `Message` (I-6)."""
+
+    role: str
+    content: str
 
 
 class Tier(Flag):

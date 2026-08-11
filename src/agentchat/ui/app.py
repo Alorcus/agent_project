@@ -16,9 +16,11 @@ from textual.containers import Container, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Footer, Header, Input, Static
 
-from agentchat.config import Settings, build_registry, build_store
+from agentchat.config import Settings, build_memory_store, build_registry, build_store
 from agentchat.core.chat import ChatService
 from agentchat.core.errors import AgentChatError, ModelNotFoundError
+from agentchat.core.memory.strategy import ChatMemory
+from agentchat.core.memory.tuning import Tuning
 from agentchat.core.models import Conversation, Message
 from agentchat.llm.base import GenerationOptions
 from agentchat.ui.screens import ConversationPicker
@@ -44,11 +46,20 @@ class ChatApp(App[None]):
         super().__init__()
         self.settings = settings or Settings.from_env()
         self.registry = build_registry(self.settings)
-        self.chat = ChatService(self.registry, store=build_store(self.settings))
+        memory_store = build_memory_store(self.settings)
+        memory = (
+            ChatMemory(memory_store, self.registry.active_provider)
+            if memory_store is not None
+            else None
+        )
+        self.chat = ChatService(self.registry, store=build_store(self.settings), memory=memory)
         self.conversation: Conversation = Conversation()
         self.options = GenerationOptions()
         self.status_text = ""
         self._generating = False
+        # A background flush on close gets this long before the app stops
+        # waiting for it — unbounded, a 14B model's last batch hangs the quit.
+        self._extract_close_timeout = Tuning().extract_close_timeout
 
     # -- composition ------------------------------------------------------
 
@@ -69,6 +80,14 @@ class ChatApp(App[None]):
         self.conversation = await self.chat.new_conversation()
         self._chat_screen.query_one("#prompt", Input).focus()
         self._refresh_status()
+
+    async def on_unmount(self) -> None:
+        try:
+            await asyncio.wait_for(
+                self.chat.flush_extraction(self.conversation), timeout=self._extract_close_timeout
+            )
+        except asyncio.TimeoutError:
+            pass
 
     @property
     def _chat_screen(self) -> Screen:
@@ -109,6 +128,7 @@ class ChatApp(App[None]):
     async def action_new_conversation(self) -> None:
         self.action_stop()
         await self.chat.persist(self.conversation)
+        await self.chat.flush_extraction(self.conversation)
         self.conversation = await self.chat.new_conversation()
         await self._show_conversation(self.conversation)
         self._refresh_status()
@@ -167,6 +187,7 @@ class ChatApp(App[None]):
         self.action_stop()
         try:
             await self.chat.persist(self.conversation)
+            await self.chat.flush_extraction(self.conversation)
             self.conversation = await self.chat.switch_conversation(conversation_id)
         except AgentChatError as error:
             self.notify(str(error), severity="error")
