@@ -1,8 +1,7 @@
 # Memory & Groups — implementation model
 
-**Status: v5.4 — consolidation modelled on Generative Agents reflection; recall
-gated by a relevance floor; extraction driven by a durable watermark; every guessed
-constant collected in § 9.**
+**Status: v6 — review pass. Group delete is destructive, acyclicity is checked
+rather than assumed, and every piece of trigger state is durable.**
 **Stage: prototype, single user. Schema changes are free; see "Relationship to plan 001".**
 
 Scope: the **chat memory mechanism** (NFR-S-02) and the **grouping** it is scoped
@@ -44,9 +43,10 @@ Three knock-on corrections to shipped code:
 - `ConversationStore.list_conversations(group_id=None)` currently overloads null to
   mean "every conversation". That is the nullable ambiguity I-1 exists to remove;
   the unfiltered case wants its own method rather than a null argument.
-- `conversations` gains `extracted_through`, the extraction watermark (§ 2.1). New
-  column, nullable, no backfill needed — null already means the correct thing for
-  every existing row.
+- `conversations` gains `extracted_at` and `extracted_id`, the extraction watermark
+  (§ 2.1). New columns, nullable, no backfill needed — null already means the
+  correct thing for every existing row.
+- `groups` gains `last_consolidated_at` (§ 2.6), on the same terms.
 
 ---
 
@@ -68,13 +68,15 @@ erDiagram
         text id PK
         text name
         text kind "default or project"
+        text last_consolidated_at "nullable — § 2.6 trigger state"
         text created_at
     }
     CONVERSATIONS {
         text id PK
         text title
-        text group_id FK "NOT NULL, immutable, RESTRICT"
-        text extracted_through "nullable watermark — last extracted message"
+        text group_id FK "NOT NULL, immutable, CASCADE"
+        text extracted_at "nullable watermark — created_at of last extracted message"
+        text extracted_id "watermark tiebreak — id of that message"
         text created_at
         text updated_at
     }
@@ -89,15 +91,16 @@ erDiagram
     MEMORY_FRAGMENTS {
         int id PK "rowid, for FTS5"
         text uuid UK
-        text group_id FK "the scope — NOT NULL"
+        text group_id FK "the scope — NOT NULL, CASCADE"
         text origin_conversation_id FK "provenance hint only, SET NULL"
         int consolidated "0 = extracted from messages, 1 = built from fragments"
         text kind "fact decision constraint open_question artefact"
         text text "self-contained claim, rewritten on revision"
         real confidence "0-1, revised. 0 = dormant, never evicted"
         real importance "1-10 poignancy, set at creation. Drives the § 2.6 trigger"
-        real decay "alpha — per-fragment staleness rate"
+        real decay "alpha — resolved from kind, § 6.2"
         blob embedding
+        text embedding_model "which encoder produced it — § 9 drift guard"
         text reasoning "nullable — only when thinking mode was on"
         text created_at
         text revised_at
@@ -135,12 +138,37 @@ flowchart BT
     f2 --> f3
 ```
 
-**Acyclicity by monotonic id ordering (I-8).** A fragment may only cite nodes with
-a strictly smaller creation id. Since ids are assigned monotonically, creation
-satisfies this automatically and revision needs one comparison. No column, no
-maintenance, no recomputation, and it is a total order so it is strictly stronger
-than needed — which costs nothing, because nothing wants to cite *forward* in time
-anyway.
+**Acyclicity by reachability check (I-8).** Before inserting a fragment→fragment
+citation `F cites S`, check that `F` is not already reachable from `S` by following
+citation edges. If it is, the edge would close a cycle and is rejected. One
+recursive CTE over a graph that stays small.
+
+Message→fragment edges need no check at all: messages are leaves and cite nothing,
+so they cannot participate in a cycle. The check is only ever paid on the
+consolidation path.
+
+**This replaces v5's monotonic id ordering, which was wrong.** That rule — cite only
+strictly smaller ids — was justified on the grounds that "nothing wants to cite
+forward in time anyway". § 2.6 does. Its resolve loop can *reinforce* an existing
+consolidated fragment with evidence discovered later, and that citation points from
+an older fragment to a newer one. The edge is forward in id and yet perfectly
+acyclic, because the new evidence does not itself rest on the fragment it
+corroborates. A total order was strictly stronger than acyclicity requires, and the
+extra strength turned out to forbid a legitimate operation rather than costing
+nothing.
+
+**The tempting optimisation is unsound — do not add it.** Once forward edges exist,
+a backward edge no longer proves anything: `F(10) → S(5)` is safe only if `S` does
+not reach `F`, and with forward edges available it might, via `S(5) → T(20) →
+F(10)`. Id comparison cannot be used as a fast path to skip the check. Every
+fragment→fragment edge is checked.
+
+The alternative considered was routing reinforce-with-newer-evidence to a rebuild —
+mint a new consolidated fragment citing both old and new, retire the old to
+dormant. Rejected: it makes every corroboration allocate a row, so the consolidated
+layer grows with each confirmation, which is precisely the compression § 2.2 relies
+on it for running backwards. It also contradicts § 2.1's rule that reinforcement
+never rewrites.
 
 Depth is therefore **unbounded and unlabelled**: a consolidated fragment can itself
 be consolidated, exactly as reflections in *Generative Agents* can reflect on
@@ -193,7 +221,7 @@ group for life (§ 2.5), so membership is now immutable and the copy cannot drif
 
 This reverses v1, which derived `group_id` by JOIN precisely because chats could
 move. Two v4 decisions force the change together: immutable binding makes the copy
-*safe*, and the hierarchy makes it *necessary* — a fragment at h ≥ 2 consolidating
+*safe*, and the hierarchy makes it *necessary* — a consolidated fragment folding
 claims from four conversations has no meaningful origin conversation, so
 `conversation_id` cannot carry scope at every tier. `group_id` is now the only
 scope key that works for all fragments.
@@ -280,7 +308,8 @@ classDiagram
         +id: str
         +title: str
         +group_id: str
-        +extracted_through: datetime
+        +extracted_at: datetime
+        +extracted_id: str
         +messages: list~Message~
     }
 
@@ -330,7 +359,7 @@ classDiagram
         +select(group_id, query, budget) list~MemoryFragment~
         +apply(decisions) None
         +purge_conversation(conversation_id) None
-        +reseat_group(conversation_id, group_id) None
+        +purge_group(group_id) None
     }
 
     class ContextStrategy {
@@ -375,13 +404,21 @@ another `MemoryFragment` — that is the polymorphic many-to-many of § 1.1.1.
 No parent owns it.
 
 `origin_conversation_id`, `reasoning`, `embedding`, `quote`, `source_message_id`,
-`source_fragment_id`, `extracted_through` and `model_id` are nullable; Mermaid has
-no notation for it. A null `extracted_through` means "nothing extracted yet", which
-is both a fresh conversation and one predating the feature — § 2.1 treats them
-identically.
+`source_fragment_id`, the watermark pair, `last_consolidated_at` and `model_id` are
+nullable; Mermaid has no notation for it. A null watermark means "nothing extracted
+yet", which is both a fresh conversation and one predating the feature — § 2.1
+treats them identically. A null `last_consolidated_at` means "never consolidated"
+and § 2.6 sums from the beginning.
 `ContextDecision.recalled` is the one addition to the existing dataclass — without
 it the UI cannot show what memory contributed, which NFR-CTX-05 asks for and § 8
 designs.
+
+`reseat_group(conversation_id, group_id)` was on this protocol until v6 and should
+never have survived v4. It is a move operation, and § 2.5 abolished moves; a method
+that cannot be called without violating an invariant is worse than a missing one,
+because it reads as permission. Replaced by `purge_group`, which is what § 2.4.1
+actually needs. **`apply(decisions)` is the only write method**, and § 2.1 explains
+why that matters: it is the transaction boundary, and nothing else may open one.
 
 ---
 
@@ -411,7 +448,7 @@ sequenceDiagram
         Note over Ex: no extraction — ungrouped chats<br/>do not accumulate fragments
     else project group
         Store-->>Ex: group_id
-        Ex->>Store: messages after extracted_through
+        Ex->>Store: messages after the watermark
         Store-->>Ex: the unextracted range
         Ex->>Store: candidates(group_id, new_text, k)
         Store->>Store: BM25 over memory_fts, scoped to group
@@ -424,22 +461,21 @@ sequenceDiagram
 
         loop per claim
             alt unrelated — NEW
-                Ex->>Store: insert(fragment, h=1) plus citation rows
+                Ex->>Ex: stage insert plus citation rows
             else identical — REINFORCE
-                Ex->>Store: cite(...) and raise confidence
+                Ex->>Ex: stage citation; confidence raised<br/>only if that citation is new
                 Note over Ex: no rewrite — text is already right
             else similar — REVISE
                 Ex->>LLM: rewrite(old, new claim)
                 LLM-->>Ex: revised text plus confidence
-                Ex->>Store: update(text, confidence, revised_at) plus citations
+                Ex->>Ex: stage update plus citations
             else ignore
                 Note over Ex: nothing worth remembering.<br/>The common case — no row is written.
             end
         end
 
-        Ex->>Store: sync memory_fts
-        Ex->>Store: advance extracted_through
-        Note over Ex,Store: last step, same transaction.<br/>Failure leaves it unmoved — the range<br/>is simply retried next run.
+        Ex->>Store: apply(decisions)
+        Note over Ex,Store: one short transaction — fragments,<br/>citations, memory_fts and the watermark.<br/>No LLM call inside it (single writer).
     end
 ```
 
@@ -463,10 +499,20 @@ from a five-turn window cite every message that supports it.
 
 ### The watermark, and why there is no retry mechanism
 
-What defines the batch is **`conversations.extracted_through`** — a durable
-watermark holding the timestamp of the last message successfully extracted. Every
-run processes "messages after the watermark" and advances it as its final step,
-inside the same transaction as the writes.
+What defines the batch is a durable watermark on the conversation, holding the
+position of the last message successfully extracted. Every run processes "messages
+after the watermark" and advances it inside the same transaction as the writes.
+
+**The watermark is `(extracted_at, extracted_id)`, not a bare timestamp.** Two
+messages can share a `created_at` — the resolution is finite and a fast exchange or
+a bulk insert will collide — and a timestamp alone cannot say which side of the
+boundary a tied message falls on. Comparison is the lexicographic
+`(created_at, id) > (extracted_at, extracted_id)`, which is total and stable. Clock
+skew is the second reason: `created_at` is wall-clock, so a clock adjustment can
+make a later message compare earlier, and the id component at least keeps the
+ordering deterministic when that happens. A monotonic per-conversation sequence
+number would be strictly better than both and is worth considering if message ids
+ever stop being sortable.
 
 This is deliberately not an in-memory counter of turns since the last run, and the
 difference is what removes an entire mechanism from the design:
@@ -484,10 +530,48 @@ difference is what removes an entire mechanism from the design:
   fact and one volatile one that can disagree.
 
 Extraction must therefore be **idempotent over a range**, since a range can be
-retried after a partial failure. It already is: I-7's partial unique indexes dedupe
-re-citation, and a claim re-extracted verbatim resolves as `identical` → reinforce,
-which touches only confidence. Worth stating because the watermark is what makes it
-load-bearing rather than incidental.
+retried after a partial failure. It is not idempotent for free, and v5.3's claim
+that it was — "re-citation is a no-op and an identical claim resolves as reinforce,
+which touches only confidence" — had the argument backwards. Raising confidence *is*
+the non-idempotent part. Run the same range twice and the claim ends up more
+confident than its evidence warrants.
+
+Two changes, addressing two different failure modes. Both are needed; neither
+subsumes the other.
+
+**One short write transaction, with the LLM outside it.** `apply(decisions)` — the
+method § 1.3 already declares — is the entire write: fragment inserts and updates,
+citation rows, `memory_fts` sync, and the watermark advance, committed together or
+not at all. Every LLM call happens before it, against data read in an earlier,
+separate transaction.
+
+The alternative — one transaction spanning the whole run — would make retry trivially
+safe and is still wrong, because SQLite in WAL mode has a **single writer**.
+Holding the write lock across several LLM calls stalls every other write in the
+application for as long as generation takes, which on a local model is seconds to
+minutes. Correctness is not worth buying with a lock held across an unbounded wait.
+
+With this boundary, a run that fails anywhere commits nothing and leaves the
+watermark unmoved, so the retry starts from a clean state.
+
+**Confidence rises only when a citation is genuinely new.** Insert the citation with
+`ON CONFLICT DO NOTHING RETURNING id`; raise confidence only if a row came back.
+I-7's unique indexes already make the duplicate insert a no-op — this makes the
+*confidence* follow it.
+
+This is the more important of the two, because it fixes a case the transaction
+boundary cannot touch: a **backfill overlapping a normal range** produces two runs
+that both succeed, over evidence counted twice. No transaction discipline helps
+there; only tying the increment to new evidence does.
+
+It is also the better definition on its own terms. Confidence should measure how
+much evidence a claim has accumulated, not how many times the extractor happened to
+look at it. Under the old rule, re-running extraction over an untouched
+conversation would have inflated every claim in it.
+
+One knock-on for § 8.2: the `↑ reinforced` count reports confidence changes that
+actually happened, not `reinforce` decisions the LLM returned. The two now differ,
+and the first is the honest number.
 
 ### Backfilling historical conversations
 
@@ -520,7 +604,7 @@ flowchart TD
     claims --> q0{"worth remembering<br/>beyond this turn?"}
     q0 -->|no| ignore["IGNORE<br/>no row written"]
     q0 -->|yes| match{"nearest fragment by embedding —<br/>how related?"}
-    match -->|unrelated| new["NEW<br/>insert at h=1, cite messages"]
+    match -->|unrelated| new["NEW<br/>insert as extracted, cite messages"]
     match -->|identical| reinforce["REINFORCE<br/>add citation, raise confidence,<br/>text unchanged"]
     match -->|similar| revise["REVISE<br/>rewrite text, recompute confidence,<br/>add citation"]
     match -->|unclear| new
@@ -704,13 +788,47 @@ folding others together (§ 2.6). The query-selected block wants specific ones �
 those extracted directly from messages, closest to what was actually said. The two
 blocks draw from different tiers rather than competing for the same rows.
 
+### When the consolidated layer outgrows `core_budget`
+
+`stable_core` has no query, so § 6's fusion does not apply — it needs a query-free
+ordering, and the natural one reuses machinery already present:
+
+```
+core_rank(f) = importance(f) · exp(−α(f) · k · age(f))
+```
+
+Importance is the constant the § 2.6 trigger already assigns; the decay term is
+§ 6.2's, with age from `last_seen_at`. A durable, frequently-corroborated decision
+outranks a consolidated observation nobody has touched in a month.
+
+**This is top-N truncation, and § 5's objection to it does not apply here.** That
+objection was against truncating *extracted* fragments and calling the result
+compression. The compression in this design is performed by consolidation — many
+fragments folded into one, with the originals still cited and reachable — not by
+the budget. Ranking an already-compressed layer when it overflows is a different
+operation from using a budget as a substitute for compressing.
+
+It is also a signal worth reading. **A consolidated layer that chronically overflows
+`core_budget` means consolidation is not folding hard enough** — the threshold is
+too high or the fan-in too low, both of which are § 7 #16's constants. The right
+first response to persistent overflow is to tune § 9, not to raise the budget.
+
+**Cold start: before the first consolidation, the stable core is empty.** A new
+project group has no consolidated tier until accumulated importance first crosses
+the threshold, so NFR-CTX-01 rests on the recency window alone until then. This is
+acceptable rather than merely tolerated: a group holding less than one threshold's
+worth of fragments has very little to compress, and the recency window covers a
+short history without help. It does mean the compression guarantee arrives late
+rather than at turn one, which is worth knowing when testing a fresh group and
+finding the core empty.
+
 ## 2.3 Fragment lifecycle
 
 ```mermaid
 stateDiagram-v2
     [*] --> Live : extraction emits new
 
-    Live --> Live : reinforce<br/>(citation added, confidence up)
+    Live --> Live : reinforce<br/>(citation added; confidence up<br/>only if the citation was new)
     Live --> Live : revise<br/>(text rewritten, confidence recomputed)
     Live --> Live : consolidated into a higher fragment<br/>(still cited from above)
     Live --> Dormant : revision drives confidence to 0
@@ -718,8 +836,9 @@ stateDiagram-v2
     Dormant --> Live : a later claim revives it
 
     Live --> [*] : last citation removed
-    Live --> [*] : group deleted
+    Live --> [*] : group deleted (§ 2.4.1)
     Dormant --> [*] : last citation removed
+    Dormant --> [*] : group deleted (§ 2.4.1)
 
     note right of Live
         enters the digest and
@@ -737,10 +856,20 @@ Dormancy replaces the v3 `Superseded` state. The difference that matters: it is
 **reversible and continuous** rather than a one-way flag, so a wrong call costs
 confidence rather than destroying a claim.
 
+**Revival depends on an asymmetry that has to be stated, because one `WHERE` clause
+makes Dormant a dead state.** `candidates()` — extraction's retrieval — **includes**
+confidence-0 fragments. `select()` — recall's retrieval — **excludes** them (§ 6).
+The Dormant → Live edge exists only because of that difference: a later claim can
+only revive a dormant fragment if extraction can still see it to resolve against.
+Filter dormant fragments out of `candidates()` too, and the edge silently stops
+firing — a contradiction that was later retracted stays buried, and the design's
+claim that nothing is ever destroyed becomes false in practice while remaining true
+in the schema. This is I-13.
+
 Deleting one message can weaken many fragments at once and kill any resting on it
-alone. With the hierarchy that fan-out now propagates *upward* too — a swept h=1
-fragment can orphan the h=2 fragment built on it — which is why the sweep in § 2.4
-iterates to a fixpoint rather than running once.
+alone. With the hierarchy that fan-out now propagates *upward* too — a swept
+extracted fragment can orphan the consolidated fragment built on it — which is why
+the sweep in § 2.4 iterates to a fixpoint rather than running once.
 
 ## 2.4 Deleting a conversation
 
@@ -767,6 +896,52 @@ fragment with it. Splitting scope (`group_id`) from provenance
 through citations only, and a fragment survives exactly when evidence for it
 survives.
 
+## 2.4.1 Deleting a group
+
+**Deleting a group deletes its conversations.** They are not moved to the default
+group. This is the decision that keeps § 2.5 true: a conversation is bound to its
+group for life, and life ends with the group. Had delete re-homed them, § 2.5's
+immutability claim would have been false in exactly one path, and with it the
+§ 1.1 argument that `group_id` is safe to copy onto the fragment because it can
+never drift.
+
+```mermaid
+flowchart TD
+    start["delete group G"] --> guard{"is G the<br/>default group?"}
+    guard -->|yes| refuse["refuse — the default group<br/>is not deletable"]
+    guard -->|no| confirm["confirm, naming the blast radius:<br/>n conversations, m fragments"]
+    confirm --> tx["BEGIN"]
+    tx --> del["DELETE group G"]
+    del --> c1["cascade: conversations in G<br/>→ their messages<br/>→ citations of those messages"]
+    del --> c2["cascade: fragments scoped to G<br/>→ citations naming them"]
+    c1 --> fts["drop memory_fts rows<br/>for the deleted fragments"]
+    c2 --> fts
+    fts --> commit["COMMIT"]
+```
+
+**No sweep loop, unlike § 2.4.** Deleting a conversation removes evidence and
+leaves the question of which fragments still stand, which is why it iterates to a
+fixpoint. Deleting a group removes the *scope*, and `memory_fragments.group_id`
+CASCADEs, so every fragment in G goes directly regardless of its citations. There
+is nothing left to survey.
+
+**I-3 is what makes that safe.** Because a fragment's citations all lie inside its
+own group, no fragment outside G can cite anything inside G, so the deletion cannot
+orphan a fragment elsewhere. The invariant that looked like bookkeeping in § 3 is
+doing real work here — without it this transaction would need § 2.4's fixpoint
+loop, extended across group boundaries.
+
+For the same reason `origin_conversation_id` needs no `SET NULL` pass: a fragment's
+origin conversation is always in its own group, since conversations never move, so
+every dangling reference is already being deleted.
+
+**The confirmation has to state the blast radius.** Under the old move-to-default
+behaviour a group delete lost the grouping and kept the content, which is
+recoverable-ish. Now it destroys conversations, messages and memory together, and
+it is the most destructive action in the application. NFR-U-06 asks for
+confirmation; the count of conversations and fragments about to go is what makes
+that confirmation mean anything.
+
 That also settles ⚠ § 7 #2. The lenient reading is no longer a judgement call
 someone has to defend — it falls out of the model. "Every reference to the deleted
 conversation is removed, and claims still supported by surviving messages remain
@@ -776,6 +951,32 @@ The loop is the one new cost: the hierarchy means a sweep can orphan the layer
 above, so it iterates to a fixpoint. One recursive CTE does it in a single
 statement.
 
+## 2.5 Conversations do not move between groups
+
+A conversation is assigned to its group at creation and **bound to it for life**.
+There is no move operation, so v3's § 2.5 flowchart is deleted rather than revised.
+
+What this buys:
+
+- I-3 (citations stay inside the group) holds **by construction**. No pruning step,
+  no cross-group citation to detect.
+- `group_id` on the fragment becomes immutable and therefore safe to copy (§ 1.1).
+- § 7 #1 resolves: a default-group chat can never be promoted into a project, so
+  extracting fragments from one could never pay off.
+
+What it costs, stated plainly: **you cannot retroactively file a chat into a
+project.** Starting a conversation, realising three turns in that it belongs to an
+existing project, and moving it there is a thing both ChatGPT and Claude support
+and this design does not. The mitigation is at creation time — the new-conversation
+flow has to make the group choice obvious and cheap, because it is the only chance
+to get it right.
+
+**"For life" is meant literally, including at group delete.** The obvious escape
+hatch — re-home a group's conversations to the default group instead of deleting
+them — is the one thing this section cannot permit, because it is a move. § 2.4.1
+therefore destroys them, which is the more expensive answer and the only consistent
+one. If that ever feels too harsh, the thing to reopen is this section, not
+§ 2.4.1.
 ## 2.6 Consolidation — reflection over fragments
 
 Modelled directly on *Generative Agents* § 4.2 (Park et al., UIST '23,
@@ -791,7 +992,7 @@ sequenceDiagram
     participant Con as Consolidator
     participant LLM as LLMProvider
 
-    Note over Store: accumulated importance since the<br/>last consolidation crosses the threshold
+    Note over Store: SUM(importance) of extracted fragments<br/>created after groups.last_consolidated_at<br/>crosses the threshold
     Store-)Con: trigger(group_id)
     Con->>Store: recent(group_id, n)
     Store-->>Con: n most recent fragments
@@ -807,8 +1008,8 @@ sequenceDiagram
     end
 
     Con->>Con: resolve each insight as new / reinforce / revise
-    Con->>Store: write consolidated fragments,<br/>citing the fragments named as evidence
-    Con->>Store: sync memory_fts
+    Con->>Store: apply(decisions)
+    Note over Con,Store: one transaction — consolidated fragments,<br/>their citations, memory_fts, and<br/>last_consolidated_at. Same shape as § 2.1.
 ```
 
 **The trigger is accumulated importance, not a fragment count.** Generative Agents
@@ -817,6 +1018,30 @@ theirs, reflecting two or three times a day). That self-regulates in a way a cou
 cannot: fifteen turns of throat-clearing do not trigger, three decisions do. Chat
 turns vary in significance at least as much as their agents' observations do, so
 the same argument applies here.
+
+**"Accumulated since the last consolidation" needs somewhere to live.**
+`groups.last_consolidated_at`, advanced inside the same transaction as the
+consolidated writes. The accumulator is then derived, not stored:
+
+```sql
+SELECT SUM(importance) FROM memory_fragments
+WHERE group_id = ? AND consolidated = 0
+  AND created_at > (SELECT last_consolidated_at FROM groups WHERE id = ?)
+```
+
+This is § 2.1's watermark argument applied a second time, and it was an oversight
+not to apply it here in v5: a running counter in memory is lost on restart, drifts
+from the rows it claims to summarise, and has no way to be checked. A timestamp
+plus a `SUM` cannot disagree with the data, because it *is* the data. A null
+`last_consolidated_at` means "never consolidated" and sums from the beginning.
+
+**`consolidated = 0` in that predicate is load-bearing.** Without it, consolidation
+counts its own output toward the next threshold and becomes self-exciting — a run
+producing six fragments at importance 7 contributes 42 toward a threshold of 40 and
+fires again immediately, on input it just wrote. Excluding the consolidated tier
+from the *trigger* costs nothing, since § 2.6's retrieval still admits consolidated
+fragments as *input*; reflection-on-reflection is preserved, runaway reflection is
+not possible.
 
 **The evidence citation is the mechanism, not a nicety.** Their insight prompt asks
 for output in the form `insight (because of 1, 5, 3)`, indices into the statement
@@ -841,26 +1066,6 @@ NFR-CTX-01 vs NFR-CTX-03. Worth revisiting if the split proves fussy.
 it was created — so frequently-recalled memories stay hot. That is a nicer model
 than § 6's age-based decay, at the cost of a write on every retrieval. § 7 #15.
 
-## 2.5 Conversations do not move between groups
-
-A conversation is assigned to its group at creation and **bound to it for life**.
-There is no move operation, so v3's § 2.5 flowchart is deleted rather than revised.
-
-What this buys:
-
-- I-3 (citations stay inside the group) holds **by construction**. No pruning step,
-  no cross-group citation to detect.
-- `group_id` on the fragment becomes immutable and therefore safe to copy (§ 1.1).
-- § 7 #1 resolves: a default-group chat can never be promoted into a project, so
-  extracting fragments from one could never pay off.
-
-What it costs, stated plainly: **you cannot retroactively file a chat into a
-project.** Starting a conversation, realising three turns in that it belongs to an
-existing project, and moving it there is a thing both ChatGPT and Claude support
-and this design does not. The mitigation is at creation time — the new-conversation
-flow has to make the group choice obvious and cheap, because it is the only chance
-to get it right.
-
 ---
 
 # 3 — Invariants
@@ -874,11 +1079,12 @@ to get it right.
 | I-5 | Fragment text is self-contained — no unresolved pronouns or references. | Extraction prompt; unenforceable in schema |
 | I-6 | Memory code never reads persona data, and persona code never reads fragments. | Package boundary; if they ever meet it is at prompt assembly, explicitly |
 | I-7 | A (fragment, source) pair is cited at most once. | Two partial unique indexes (§ 1.1.1) |
-| I-8 | The citation graph is acyclic. | A fragment cites only strictly smaller ids (§ 1.1.1) |
+| I-8 | The citation graph is acyclic. | Reachability check before each fragment→fragment citation insert (§ 1.1.1). Message→fragment edges are exempt — messages cite nothing |
 | I-9 | A fragment cites either a message or a fragment, never both and never neither. | `CHECK` on the citation row |
 | I-10 | Confidence-0 fragments are retained, not deleted. | Sweep keys on citations only, never on confidence |
 | I-11 | No fragment below the relevance floor reaches the prompt. | Admission gate inside `select()`, applied *before* fusion (§ 6.1) — not a post-filter on ranked output |
-| I-12 | Every message in a project group is either extracted or sits past its conversation's watermark. | `extracted_through` advances only on success, in the same transaction as the writes (§ 2.1) |
+| I-12 | Every message in a project group is either extracted or sits past its conversation's watermark. | Watermark advances only on success, in the same transaction as the writes (§ 2.1) |
+| I-13 | Dormant fragments are reachable by extraction and not by recall. | `candidates()` carries no confidence predicate; `select()` gates at `confidence > 0` (§ 2.3, § 6). Without the asymmetry, dormancy is irreversible |
 
 I-2 is the one that earns its keep. Making the default group a real memory scope
 would pool every unrelated one-off chat into one invisible digest — a leak that is
@@ -911,7 +1117,7 @@ worthless once detached from its turn, and nothing in the schema can catch it.
 | Extraction off the reply path, cancellable worker | NFR-U-04 | MUST |
 | Durable extraction watermark — no turn is lost to a crash or a failed run | NFR-S-04 | SHOULD |
 | Group picker as a modal, no drag-and-drop | NFR-P-03 | MUST |
-| Move-to-default on group delete, with confirmation | NFR-U-06 | SHOULD |
+| Group delete destroys its conversations, with confirmation naming the blast radius (§ 2.4.1) | NFR-U-06 | SHOULD |
 
 ---
 
@@ -1160,7 +1366,7 @@ user is reading something else.
 | Symbol | Action | Confidence shown as |
 |---|---|---|
 | `+` | new | the initial value |
-| `↑` | reinforce | the delta, e.g. `0.6 → 0.8` |
+| `↑` | reinforce | the delta, e.g. `0.6 → 0.8`. Counts confidence changes that happened, not `reinforce` decisions returned — see § 2.1 |
 | `~` | revise | the delta, and `→ 0` reads as dormant |
 
 **Symbols, not colour alone.** NFR-P-04 requires graceful degradation across
@@ -1175,6 +1381,17 @@ inspector should let a revision be read as a diff against the previous text.
 This is also where the thinking-mode coupling from § 2.1 should surface: if
 extraction ran without reasoning traces, the indicator should say so, or the user
 has no way to know their memory is being built in a degraded mode.
+
+```
+  memory · +2 new  ↑1 reinforced  ~1 revised  · no traces   [M to inspect]
+```
+
+**`· no traces` is literal text, for the same reason the actions get symbols.**
+NFR-P-04 rules out carrying meaning in colour alone, and a degraded-mode marker is
+the easiest place to forget that — dimming the line or greying the counts is the
+obvious implementation and it disappears entirely on a monochrome terminal. It is
+also the marker whose absence is least likely to be noticed, since a user who never
+turns thinking on never sees the line change. Spell it out.
 
 ---
 
@@ -1211,6 +1428,7 @@ it.
 | Constant | Default | Status | Origin | § |
 |---|---|---|---|---|
 | `EXTRACT_EVERY` | 6 | `guess` | balance of LLM cost against recall latency | § 2.1 |
+| `REINFORCE_STEP` | 0.1 | `guess` | confidence raise per genuinely new citation | § 2.1 |
 | `CANDIDATE_POOL_K` | 10 | `guess` | how many fragments the extractor resolves against | § 2.1 |
 | `RECALL_FLOOR` | 0.35 | `guess` | cosine admission gate; **embedding-model specific** | § 6.1 |
 | `RRF_K` | 60 | `borrowed` | standard reciprocal-rank-fusion constant | § 6 |
@@ -1232,13 +1450,18 @@ and would silently crowd out conversation history on a small window.
 
 Two things this section requires beyond a config file:
 
-- **The recall floor is pinned to its embedding model.** It is the one constant with
-  a silent failure mode — swap the encoder and the same number means something
-  different, with no error and no visible symptom beyond recall quietly getting
-  worse. Store `RECALL_FLOOR_MODEL` alongside it and **warn at startup when the
-  configured embedding model differs from the one the floor was set against**. This
-  is the only value that gets a guard, because it is the only one whose meaning
-  depends on a component that can change underneath it.
+- **The embedding model is pinned, and the guard covers stored vectors as well as
+  the floor.** Swapping the encoder silently invalidates two things, not one. The
+  floor is the obvious casualty — the same number means something different against
+  a different similarity distribution. The larger one is the corpus: every
+  `memory_fragments.embedding` written by the old encoder is meaningless against
+  query vectors from the new one, so recall degrades to noise with no error
+  anywhere. Store `RECALL_FLOOR_MODEL` next to the floor and `embedding_model` on
+  each fragment, and **warn at startup when the configured encoder differs from
+  either**, reporting how many fragments are affected. The remedy is to re-embed;
+  the per-fragment column is what makes that incremental rather than all-or-nothing,
+  and what lets the warning be specific instead of a shrug. Nothing else here gets a
+  guard, because nothing else has a meaning that can change underneath it.
 - **The effective values are visible in the memory inspector**, read-only, with
   their status shown. § 8 exists so the user can see what memory did; seeing the
   constants that produced it is the same argument one level down, and it is what
@@ -1258,7 +1481,7 @@ from now, the first question is which of these was in force.
 | ⏸ 15 | Recency by age, or by time since last *retrieval*? Generative Agents decays from last access, so frequently-recalled fragments stay hot. Better model; costs a write on every retrieval. | § 6, § 2.6 |
 | ⏸ 16 | Consolidation threshold and fan-out. Theirs: 150 accumulated importance, 3 questions, 5 insights, over the 100 most recent records. A chat group accumulates far more slowly, so these want scaling down — and the numbers are guesses until there is a real group to watch. Provisional values are in § 9, marked `scaled`. | § 2.6, § 9 |
 | ✔ 14 | *Resolved.* Consolidation follows *Generative Agents* reflection: importance-threshold trigger, generate salient questions, retrieve per question, generate insights citing their evidence, feed back through new/reinforce/revise. | § 2.6 |
-| ✔ 5 | *Resolved, and half of it dissolved.* The question bundled two problems. Failed extractions need no trigger at all: a durable `extracted_through` watermark means a failed run leaves it unmoved and the range is retried next run. Historical chats are an explicit per-group action from the memory inspector — never on-open, which would make recall quality depend on browsing history. | § 2.1 |
+| ✔ 5 | *Resolved, and half of it dissolved.* The question bundled two problems. Failed extractions need no trigger at all: a durable `(extracted_at, extracted_id)` watermark means a failed run leaves it unmoved and the range is retried next run. Historical chats are an explicit per-group action from the memory inspector — never on-open, which would make recall quality depend on browsing history. | § 2.1 |
 | ✔ 7 | *Resolved.* No. Candidates carry `fragment_support` counts, not citation rows — the re-citation the question worried about is already a no-op under I-7, while the signal actually worth having (how well established the claim is) compresses to three integers. | § 2.1 |
 | ✔ 11 | *Resolved.* Per-`kind` constant. Model-generated `α` is set once and never revisited, so a wrong value silently buries a fragment with no correction path — the shape of mistake v4 removed elsewhere. Changing `kind` on revise moves `α` for free. | § 6.2 |
 | ✔ 1 | *Resolved.* Ungrouped chats do not accumulate fragments. Since conversations never move (§ 2.5), a default-group chat can never be promoted, so its fragments could never become reachable. | § 2.1 |
@@ -1273,6 +1496,31 @@ from now, the first question is which of these was in force.
 
 ## Changelog
 
+- **2026-08-10** — v6. External review. Three logical errors and six gaps.
+  **Group delete contradicted § 2.5** — shipping "move-to-default" while claiming
+  conversations never move made the immutability premise false in exactly one path,
+  and that premise is what licenses copying `group_id` onto fragments. Resolved by
+  deleting the conversations instead (§ 2.4.1): the destructive answer, and the only
+  one consistent with § 2.5. Both FKs become CASCADE; I-3 is what spares the
+  transaction § 2.4's fixpoint loop. **I-8 forbade a legitimate operation** —
+  monotonic id ordering blocks § 2.6 reinforcing a consolidated fragment with newer
+  evidence, an edge that is forward in id and still acyclic. Replaced by a
+  reachability check on fragment→fragment edges, with an explicit warning that id
+  comparison is no longer sound even as a fast path. **Idempotence was asserted, not
+  achieved** — the confidence raise is the non-idempotent step. Fixed twice over:
+  `apply(decisions)` is the single short write transaction with no LLM call inside
+  it (WAL has one writer), and confidence rises only when the citation insert
+  actually inserted, which also covers backfill overlap that no transaction
+  boundary could. Gaps closed: `groups.last_consolidated_at` makes the consolidation
+  trigger durable, with `consolidated = 0` in the accumulator so reflection cannot
+  excite itself; the encoder-drift guard extends to stored `embedding` blobs via a
+  per-fragment `embedding_model`; I-13 states the `candidates()`/`select()`
+  asymmetry that dormancy depends on; § 2.2 specifies `stable_core` overflow
+  ordering and the cold-start window. Minor: watermark becomes
+  `(extracted_at, extracted_id)`, § 2.5 and § 2.6 reordered, `· no traces` spelled
+  out as text per NFR-P-04. Found while checking cross-references:
+  `MemoryStore.reseat_group` was still on the protocol, a move operation § 2.5
+  abolished in v4 — removed, replaced by `purge_group`.
 - **2026-08-10** — v5.4. Added § 9, collecting every tuning constant that had been
   scattered through the prose as an inline literal. Each carries a status —
   `borrowed` / `scaled` / `guess` / `tuned` — so the table records *how much we
@@ -1284,7 +1532,7 @@ from now, the first question is which of these was in force.
   logged once at startup.
 - **2026-08-10** — v5.3. Resolved the three items that were decidable without a
   running system. **#5** — the question bundled two problems; the failure half
-  dissolves under a durable `conversations.extracted_through` watermark, which
+  dissolves under a durable per-conversation extraction watermark, which
   replaces the volatile turn counter, survives crashes, and needs no retry
   mechanism because a failed run simply does not advance it. Historical backfill is
   an explicit per-group action, not on-open, since on-open would make recall
