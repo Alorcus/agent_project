@@ -21,9 +21,17 @@ MEMORY_PACKAGE = (
     Path(__file__).resolve().parent.parent / "src" / "agentchat" / "core" / "memory"
 )
 
-#: The reply the scripted provider hands back where a test needs exactly one
-#: claim. Its wire format is stage 2's contract, not stage 0's.
-ONE_CLAIM = '[{"kind": "fact", "text": "We chose SQLite for storage."}]'
+#: The two replies the scripted provider hands back where a test needs exactly
+#: one claim to survive the pipeline: the `propose` reply, then the `resolve`
+#: reply. The wire format is stage 2's contract — see
+#: `docs/plans/2026-08-11-005-memory-stage-2-extraction-write-path.md` § 3.
+#: The evidence list covers every turn the I-12 test writes, because that test
+#: reads "extracted" as "cited".
+ONE_CLAIM = (
+    '[{"text": "The project stores conversations in SQLite.",'
+    ' "kind": "decision", "importance": 7, "evidence": [1, 2, 3]}]'
+)
+ONE_DECISION = '[{"claim": 1, "relation": "unrelated", "confidence": 0.8}]'
 
 
 def stage(n: int):
@@ -70,9 +78,9 @@ async def test_i1_conversation_requires_a_group(tmp_path: Path):
         await store.save(make_conversation(group_id=None))
 
 
-@stage(2)
 async def test_i2_default_group_extracts_nothing(tmp_path: Path, monkeypatch):
     from agentchat.core.memory.extract import MemoryExtractor
+    from agentchat.core.memory.strategy import ConversationEvidence
     from agentchat.storage.memory import SqliteMemoryStore
 
     from factories import GraphBuilder, make_group, write
@@ -86,9 +94,10 @@ async def test_i2_default_group_extracts_nothing(tmp_path: Path, monkeypatch):
     write(store, builder.build())
 
     applied: list[object] = []
-    monkeypatch.setattr(store, "apply", lambda decisions: applied.append(decisions))
+    monkeypatch.setattr(store, "apply", lambda writes, **kwargs: applied.append(writes))
 
-    await MemoryExtractor(store, ScriptedProvider(ONE_CLAIM)).run(conversation)
+    extractor = MemoryExtractor(store, ScriptedProvider(ONE_CLAIM, ONE_DECISION))
+    await extractor.run(ConversationEvidence(conversation))
 
     assert applied == []
     with sqlite3.connect(path) as conn:
@@ -234,7 +243,6 @@ async def test_i4_uncited_insights_are_dropped_not_written(tmp_path: Path):
     assert citationless == 0
 
 
-@stage(2)
 def test_i5_extraction_prompt_demands_self_contained_text():
     """Best effort by construction: § 3 concedes I-5 is unenforceable in the
     schema, so all a test can check is that the instruction is still in the
@@ -445,10 +453,10 @@ def test_i11_floor_is_applied_before_fusion(tmp_path: Path, monkeypatch):
     assert store.select(builder.group.id, query, 512) == []
 
 
-@stage(2)
 async def test_i12_watermark_advances_only_with_its_writes(tmp_path: Path):
     from agentchat.core.errors import ProviderError
     from agentchat.core.memory.extract import MemoryExtractor
+    from agentchat.core.memory.strategy import ConversationEvidence
     from agentchat.storage.memory import SqliteMemoryStore
 
     from factories import GraphBuilder, write
@@ -466,12 +474,13 @@ async def test_i12_watermark_advances_only_with_its_writes(tmp_path: Path):
     failing = ScriptedProvider(error=ProviderError("simulated"))
 
     with pytest.raises(ProviderError):
-        await MemoryExtractor(store, failing).run(chat)
+        await MemoryExtractor(store, failing).run(ConversationEvidence(chat))
 
     with sqlite3.connect(path) as conn:
         assert conn.execute(watermark, (chat.id,)).fetchone() == (None, None)
 
-    await MemoryExtractor(store, ScriptedProvider(ONE_CLAIM)).run(chat)
+    extractor = MemoryExtractor(store, ScriptedProvider(ONE_CLAIM, ONE_DECISION))
+    await extractor.run(ConversationEvidence(chat))
 
     with sqlite3.connect(path) as conn:
         extracted_at, extracted_id = conn.execute(watermark, (chat.id,)).fetchone()
