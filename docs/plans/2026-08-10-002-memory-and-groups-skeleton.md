@@ -121,11 +121,37 @@ here rather than left implicit in test files:
 
 ---
 
+## Arming a stage
+
+Arming — the planner-side test work before the implementer starts — has three
+jobs, not one. The stage-2 arming defect (a green stage-1 placeholder test,
+`pytest.raises(NotImplementedError, match="stage 2")`, left pinning behavior
+the stage retires) showed that job three was missing:
+
+1. **Activate** — delete the stage's `@stage(N)` skip markers; verify every
+   red test is red for a substantive reason.
+2. **Extend** — second-copy tables (e.g. `test_tuning.DEFAULTS`) gain the
+   stage's new entries, turning green tests red on purpose.
+3. **Retire** — remove assertions that pin *placeholder* behavior this stage
+   replaces. To make this mechanical rather than a sweep: any test asserting
+   placeholder behavior carries `@expires(stage=N)` (the symmetric counterpart
+   of `@stage(N)` — born-at versus dies-at), and arming stage N retires
+   everything the marker names. Retrofit the marker onto existing placeholder
+   assertions (`select`/`stable_core`/`purge_*` stubs and their like) at the
+   stage-3 arming.
+
+The arming commit records the expected baseline tally (failed/passed/skipped)
+in the detail plan; any later planner-side test edit during the stage updates
+that tally in the same commit. Green-test retirement is planner-owned, always —
+an implementer who hits an unretired placeholder stops and reports, which is
+the flow working, not a failure.
+
 ## Stages
 
 Each stage ends at a **gate**: its acceptance tests pass, and every invariant
 test from prior stages still passes. The invariant suite is cumulative and
-never shrinks.
+never shrinks — retirement under arming job three removes placeholder pins,
+never invariant coverage.
 
 ### Stage 0 — Invariant suite and scaffolding
 
@@ -271,6 +297,12 @@ reaches every fragment including dormant.
 | I-13 dormant reachable by extraction only | 3 | `candidates()` vs `select()` |
 
 ## Changelog
+
+- **2026-08-10** — v1.2. Added "Arming a stage": activate / extend / retire,
+  with the `@expires(stage=N)` marker as the mechanical form of retirement.
+  Closes the process gap found during stage-2 arming, where a green stage-1
+  placeholder test pinned behavior the stage retires. Baseline-tally recording
+  and planner-only green-test retirement made explicit.
 
 - **2026-08-11** — v1.1. Added "The per-stage flow": five explicit steps with
   test ownership pinned. Resolves an ambiguity the stage-1 planning session
