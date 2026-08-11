@@ -32,10 +32,11 @@ and idempotently.** What ships:
 Still nothing the user can see: § 8's status line is stage 6, and this stage
 deliberately leaves `ApplyResult` unrendered.
 
-**Gate:** the 40 tests of the red baseline below green — the three activated
-invariants (I-2 write side, I-5, I-12), `tests/test_extraction.py`, and the two
-flush tests appended to `tests/test_app.py` — with every stage-0/1 test still
-green and no file under `tests/` modified. Plus one cluster run of
+**Gate:** the 42 tests of the red baseline below green — the three activated
+invariants (I-2 write side, I-5, I-12), `tests/test_extraction.py`, the two
+flush tests appended to `tests/test_app.py`, and the two tuning tests that now
+transcribe this stage's constants — with every other stage-0/1 test still green
+and no file under `tests/` modified. Plus one cluster run of
 `tests/test_extraction_real_model.py`, which is the only check that the format
 below survives contact with the two models this project actually runs.
 
@@ -49,7 +50,7 @@ below survives contact with the two models this project actually runs.
 | skeleton rule 2 | `extract.py` imports neither `Message` nor `Conversation` nor anything under `agentchat.storage` — enforced by the I-6 lint, which is active and green |
 | skeleton rule 5 | `store.apply(writes, watermark=…)` is the only write; no LLM call inside a transaction |
 | skeleton rule 6 | every new number lands in `tuning.py` **and** § 9 in the same commit |
-| stage 1 | `MemoryStore` is synchronous; `candidates()` raises `NotImplementedError("stage 2")` until this stage fills it in |
+| stage 1 | `MemoryStore` is synchronous; `candidates()` raised `NotImplementedError("stage 2")` and this stage is what retires that marker |
 
 ## Decisions taken before writing this plan
 
@@ -86,12 +87,14 @@ needs has landed; `tests/` is closed for the rest of this stage.
 | `tests/test_extraction.py` | **written** — 35 stage-2 acceptance tests |
 | `tests/test_extraction_real_model.py` | **written** — 3 cluster smoke tests, skipped without `AGENTCHAT_TEST_REAL_MODEL=1` |
 | `tests/test_app.py` | **written** — 2 flush-wiring tests appended |
+| `tests/test_memory_store.py` | **armed** — the `candidates` clause of `test_unimplemented_methods_name_the_stage_that_owns_them` deleted; stage 2 is the stage that owns it |
+| `tests/test_tuning.py` | **armed** — § 9's transcribed `DEFAULTS` gains this stage's four constants |
 | everything under `src/agentchat/` | untouched — the whole of the work below |
 
 **Implementation touches no file under `tests/`.** A test that looks wrong is
 escalated to the planner, never adjusted.
 
-Four notes on the test edits, since three of them go beyond deleting markers and
+Six notes on the test edits, since five of them go beyond deleting markers and
 the flow says that is the planner's call to make and to record:
 
 - **`ONE_CLAIM` is stage 2's to define.** Stage 0 wrote it as a placeholder and
@@ -110,16 +113,39 @@ the flow says that is the planner's call to make and to record:
   now `lambda writes, **kwargs: …`. The test never reaches it (that is the
   point of the test), but a stub that would `TypeError` if it did is a trap
   laid for the next reader.
+- **`test_memory_store.py` pinned `candidates()` as unimplemented.** Stage 1 made
+  every method of a later stage raise `NotImplementedError` naming its stage,
+  and asserted it; stage 2 is that stage for `candidates()`, so the clause is
+  deleted and the rest of the assertion stands. Deleting it is the same edit as
+  deleting a `@stage(2)` marker — a stage-1 placeholder whose stage has arrived
+  — and it has to happen at arming, because the moment `candidates()` runs real
+  SQL an unknown group id returns `[]` instead of raising and that test goes red
+  through no fault of the implementation.
+- **`test_tuning.py`'s `DEFAULTS` is § 9 transcribed**, and its whole value is
+  being a second copy. Stage 2 adds four constants, so they are transcribed now
+  — which pins the four numbers in section 8 as the implementer's target rather
+  than leaving them uncovered by the drift detector that exists for exactly
+  this.
+
+**How the last two were found, since the process missed them once.** The arming
+run checks that every *red* test is red for a substantive reason. It says
+nothing about *green* tests that the stage's own implementation will break, and
+this stage breaks two: one pinning a stub it replaces, one transcribing a table
+it extends. The implementer caught the first while reading the plan against the
+tree and stopped, which is the flow working. The question "which currently-green
+test does this stage retire?" now belongs beside "is every failure
+substantive?" in step 2, and the skeleton should say so.
 
 ---
 
 ## The red baseline
 
-`uv run pytest -q` on the armed tree: **40 failed, 124 passed, 11 skipped**
+`uv run pytest -q` on the armed tree: **42 failed, 122 passed, 11 skipped**
 (from 124 / 11 / 0 at the stage-1 gate). Every failure is substantive — a
-missing module, name, or an unimplemented store method. This list is the
-target: stage 2 is done when all 40 are green, the 124 are still green, and the
-11 skips still read `stage 3`, `stage 4`, `stage 5` or the real-model flag.
+missing module, a missing name, an unimplemented store method, or a missing
+tuning constant. This list is the target: stage 2 is done when all 42 are
+green, the 122 are still green, and the 11 skips still read `stage 3`, `stage
+4`, `stage 5` or the real-model flag.
 
 **`tests/test_invariants.py` — 3, the newly activated invariants**
 
@@ -149,6 +175,13 @@ test fails loudly instead of passing against nothing.
 Both `AttributeError: 'ChatService' object has no attribute 'flush_extraction'`,
 raised in the spy helper before the pilot does anything — the wiring does not
 exist yet, which is the point.
+
+**`tests/test_tuning.py` — 2**
+
+`test_defaults_match_the_section_9_table` and
+`test_env_override_applies_to_one_constant_only`, both `AttributeError: 'Tuning'
+object has no attribute 'extract_max_tokens'`. They go green when the four
+constants of section 8 land in `tuning.py` with the defaults printed there.
 
 Two notes on reading the list. The 17 `ModuleNotFoundError`s are shallow by
 construction: `strategy.py` is the first file to write and nothing behind it
@@ -590,6 +623,15 @@ means the app itself extracts nothing until stage 6.
 
 ## Changelog
 
+- **2026-08-11** — v1.1. Two currently-green tests turned out to pin behaviour
+  this stage retires, both found by the implementer reading the plan against
+  the tree before writing anything, and both fixed at arming:
+  `test_memory_store.py`'s `candidates` clause (a stage-1 stub marker whose
+  stage has arrived) and `test_tuning.py`'s transcribed § 9 table (which now
+  carries stage 2's four constants). Baseline 40 → 42 failed, 124 → 122 passed.
+  The gap in step 2 they came from is recorded under "State of the tree": the
+  arming run only proves red tests are red for good reasons, and says nothing
+  about green tests the implementation will break.
 - **2026-08-11** — v1. Detail plan for skeleton stage 2, with steps 1–3 of the
   per-stage flow done in one session: planned, armed, baseline recorded. Four
   test edits beyond deleting the three `@stage(2)` markers, each listed under
@@ -630,20 +672,22 @@ Nothing under `tests/` and nothing under `src/agentchat/llm/`. `rank.py` and
 
 | | Before (stage-1 gate) | Armed (now) | After stage 2 |
 |---|---|---|---|
-| failed | 0 | **40** | 0 |
-| passed | 124 | 124 | 164 |
+| failed | 0 | **42** | 0 |
+| passed | 124 | 122 | 164 |
 | skipped | 11 | 11 | 11 |
 
-The 40: 3 invariants (I-2 write, I-5, I-12), 35 in `test_extraction.py`, 2 in
-`test_app.py`. The 11 skips are 7 invariants reading `stage 3`/`stage 4`/`stage
-5`, `test_local`'s weights check, and the 3 real-model smoke tests — none reads
-`stage 2`, which is the gate's own condition.
+The 42: 3 invariants (I-2 write, I-5, I-12), 35 in `test_extraction.py`, 2 in
+`test_app.py`, 2 in `test_tuning.py`. The two that moved out of the passing
+column are the tuning pair — the same tests, now transcribing four constants
+that do not exist yet. The 11 skips are 7 invariants reading `stage 3`/`stage
+4`/`stage 5`, `test_local`'s weights check, and the 3 real-model smoke tests —
+none reads `stage 2`, which is the gate's own condition.
 
 ### Verification
 
 ```bash
 uv run pytest -q                    # the mock gate: 164 passed, 11 skipped, 0 failed
-                                    # (from 124 / 11 / 40 at arming)
+                                    # (from 122 / 11 / 42 at arming)
 uv run pytest tests/test_extraction.py -v
 uv run pytest tests/test_invariants.py -v   # I-2 (write), I-5, I-12 now active;
                                             # 7 skips, all "stage 3".."stage 5"

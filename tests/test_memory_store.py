@@ -473,11 +473,11 @@ def test_opening_a_pre_memory_database_raises_naming_the_file(tmp_path: Path):
 
 def test_unimplemented_methods_name_the_stage_that_owns_them(tmp_path: Path):
     # An empty-list stub would let the skipped I-11 and I-13 tests pass for the
-    # wrong reason the day someone activates them early.
+    # wrong reason the day someone activates them early. `candidates` was here
+    # too until stage 2 implemented it; `tests/test_extraction.py` holds its
+    # tests now.
     _, store = fresh(tmp_path)
 
-    with pytest.raises(NotImplementedError, match="stage 2"):
-        store.candidates("g", "which database did we choose", 10)
     with pytest.raises(NotImplementedError, match="stage 3"):
         store.select("g", "which database did we choose", 512)
     with pytest.raises(NotImplementedError, match="stage 3"):
