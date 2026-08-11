@@ -143,11 +143,16 @@ async def test_conversations_do_not_leak_into_each_other():
 
 
 async def test_store_scopes_listing_by_group():
+    from factories import make_group
+
     chat = ChatService(fast_registry())
-    await chat.store.save(Conversation(group_id="g1"))
-    await chat.store.save(Conversation(group_id="g2"))
-    assert len(await chat.store.list_conversations("g1")) == 1
-    assert len(await chat.store.list_conversations()) == 2
+    scoped, other = make_group(name="scoped"), make_group(name="other")
+    await chat.store.save_group(scoped)
+    await chat.store.save_group(other)
+    await chat.store.save(Conversation(group_id=scoped.id))
+    await chat.store.save(Conversation(group_id=other.id))
+    assert len(await chat.store.list_conversations(scoped.id)) == 1
+    assert len(await chat.store.list_all_conversations()) == 2
 
 
 def test_build_store_memory_returns_in_memory_store():

@@ -1,11 +1,16 @@
-"""Builders for memory test data — object graphs only, no store involved.
+"""Builders for memory test data: object graphs, plus `write` to persist one.
 
-Stage 1 adds ``write(store, graph)`` here once ``apply()`` exists.
+`write` is the only part that touches a store, and it goes through
+`MemoryStore.apply` rather than around it — so a test that builds a hierarchy
+by hand still exercises the I-7 and I-8 paths a real extraction run would.
 """
 
 from __future__ import annotations
 
+import json
+from contextlib import closing
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from agentchat.core.models import Conversation, Message
@@ -15,9 +20,13 @@ if TYPE_CHECKING:
 
 
 def make_conversation(**overrides) -> Conversation:
+    # Spelled out rather than imported from `core.models`: this module is
+    # imported for its object builders by tests that must stay collectable
+    # before `DEFAULT_GROUP_ID` exists. It is the one group the schema seeds,
+    # so a conversation that means nothing by its group satisfies the FK.
     defaults = dict(
         title="Trip planning",
-        group_id="g1",
+        group_id="default",
         messages=[
             Message(role="user", content="Where should I go?"),
             Message(role="assistant", content="Try Kyoto.", model_id="qwen"),
@@ -140,3 +149,67 @@ class GraphBuilder:
         fragment = make_fragment(**overrides)
         self.fragments.append(fragment)
         return fragment
+
+
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def write(store, graph: MemoryGraph) -> None:
+    """Persist `graph`: group, conversation and message rows directly,
+    fragments and citations through `store.apply` — the only write path memory
+    state has. Idempotent, so the same graph can be written twice."""
+    from agentchat.core.memory.store import FragmentWrite
+    from agentchat.storage.schema import connect
+
+    with closing(connect(store.path)) as conn, conn:
+        conn.execute(
+            "INSERT INTO groups (id, name, kind, last_consolidated_at, created_at)"
+            " VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+            (
+                graph.group.id,
+                graph.group.name,
+                graph.group.kind,
+                _iso(graph.group.last_consolidated_at),
+                graph.group.created_at.isoformat(),
+            ),
+        )
+        for conversation in graph.conversations:
+            conn.execute(
+                "INSERT INTO conversations (id, title, group_id, extracted_at,"
+                " extracted_id, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET"
+                " title = excluded.title, updated_at = excluded.updated_at",
+                (
+                    conversation.id,
+                    conversation.title,
+                    conversation.group_id,
+                    _iso(conversation.extracted_at),
+                    conversation.extracted_id,
+                    conversation.created_at.isoformat(),
+                    conversation.updated_at.isoformat(),
+                ),
+            )
+            for ordinal, message in enumerate(conversation.messages):
+                conn.execute(
+                    "INSERT INTO messages (id, conversation_id, ordinal, role,"
+                    " content, created_at, model_id, metadata)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+                    (
+                        message.id,
+                        conversation.id,
+                        ordinal,
+                        message.role,
+                        message.content,
+                        message.created_at.isoformat(),
+                        message.model_id,
+                        json.dumps(message.metadata),
+                    ),
+                )
+
+    by_fragment: dict[int | None, list[FragmentCitation]] = {}
+    for citation in graph.citations:
+        by_fragment.setdefault(citation.fragment_id, []).append(citation)
+    store.apply(
+        [FragmentWrite(fragment, by_fragment.get(fragment.id, [])) for fragment in graph.fragments]
+    )

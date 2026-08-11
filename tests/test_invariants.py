@@ -53,7 +53,6 @@ class ScriptedProvider:
         yield self._replies[min(self.calls - 1, len(self._replies) - 1)]
 
 
-@stage(1)
 async def test_i1_conversation_requires_a_group(tmp_path: Path):
     from dataclasses import fields
 
@@ -284,7 +283,6 @@ def _is_forbidden_module(name: str, forbidden: tuple[str, ...]) -> bool:
     return any(name == f or name.startswith(f + ".") for f in forbidden)
 
 
-@stage(1)
 def test_i7_repeat_citation_is_a_noop(tmp_path: Path):
     from agentchat.storage.memory import SqliteMemoryStore
 
@@ -317,7 +315,6 @@ def test_i7_repeat_citation_is_a_noop(tmp_path: Path):
     assert fragment_edges == 1
 
 
-@stage(1)
 def test_i8_cycle_closing_edge_is_rejected(tmp_path: Path):
     from agentchat.core.errors import StorageError
     from agentchat.storage.memory import SqliteMemoryStore
@@ -340,7 +337,6 @@ def test_i8_cycle_closing_edge_is_rejected(tmp_path: Path):
         write(store, graph)
 
 
-@stage(1)
 def test_i8_forward_edge_in_id_order_is_allowed(tmp_path: Path):
     from agentchat.storage.memory import SqliteMemoryStore
 
@@ -369,7 +365,6 @@ def test_i8_forward_edge_in_id_order_is_allowed(tmp_path: Path):
     assert edges == 1
 
 
-@stage(1)
 def test_i9_citation_cites_exactly_one_source(tmp_path: Path):
     from agentchat.storage.memory import SqliteMemoryStore
 
