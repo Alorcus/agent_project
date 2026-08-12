@@ -15,6 +15,7 @@ from pathlib import Path
 from dotenv import find_dotenv, load_dotenv
 
 from agentchat.core.errors import AgentChatError
+from agentchat.core.extraction import ExtractionService
 from agentchat.llm.base import ModelInfo
 from agentchat.llm.local import DEFAULT_MODEL_ROOT, TransformersProvider
 from agentchat.llm.local import default_models as local_models
@@ -119,6 +120,18 @@ class Settings:
     mock_load_delay: float | None = field(
         default_factory=lambda: _env_float("MOCK_LOAD_DELAY")
     )
+    #: On by default — a feature that has to be switched on is not
+    #: demonstrable. Off switches extraction entirely, with no flag threaded
+    #: through call sites (`ChatService.summarise` just checks for `None`).
+    extract_summaries: bool = field(
+        default_factory=lambda: _env_flag("EXTRACT_SUMMARIES", True)
+    )
+    #: Seconds `action_quit` waits for extraction before exiting anyway.
+    extraction_timeout: float = field(
+        default_factory=lambda: (
+            30.0 if (v := _env_float("EXTRACTION_TIMEOUT")) is None else v
+        )
+    )
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -152,6 +165,16 @@ def build_store(settings: Settings) -> ConversationStore:
     """Assemble the conversation store. The only place stores are named."""
     _require_choice("STORE", settings.store, STORES)
     return SqliteStore(settings.data_dir / "agentchat.db")
+
+
+def build_extractor(
+    settings: Settings, registry: ModelRegistry
+) -> ExtractionService | None:
+    """Assemble the extraction service. The only place extraction is switched
+    on; `None` when `extract_summaries` is off."""
+    if not settings.extract_summaries:
+        return None
+    return ExtractionService(registry)
 
 
 def _register_local(registry: ModelRegistry, settings: Settings) -> None:

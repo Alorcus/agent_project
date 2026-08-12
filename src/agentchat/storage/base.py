@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from agentchat.core.errors import StorageError
-from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, Group
+from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, ConversationSummary, Group
 
 
 def by_recency(conversations: list[Conversation]) -> list[Conversation]:
@@ -60,4 +60,19 @@ class ConversationStore(Protocol):
 
     async def delete(self, conversation_id: str) -> None:
         """Must also remove any derived state (memory index, caches)."""
+        ...
+
+    # -- derived state: conversation summaries ----------------------------
+    #
+    # No consumer yet: this is the read half of NFR-S-02 (summaries scoped to
+    # a group), shipped so a later group overview can be additive.
+
+    async def save_summary(self, summary: ConversationSummary) -> None:
+        """Upsert on `conversation_id`, preserving the original `created_at`."""
+        ...
+
+    async def summary(self, conversation_id: str) -> ConversationSummary | None: ...
+
+    async def list_summaries(self, group_id: str) -> list[ConversationSummary]:
+        """Most-recently-updated first."""
         ...

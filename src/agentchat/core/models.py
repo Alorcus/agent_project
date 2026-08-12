@@ -56,6 +56,42 @@ class Message:
         return not self.content.strip()
 
 
+#: The `;`-joined encoding `ConversationSummary` stores keywords in. Kept
+#: local rather than imported from `core.prompts` — that module cleans up
+#: after a model's reply, this one reads back what the store itself wrote,
+#: and models.py must not depend on prompts.py (prompts.py already depends on
+#: models.py for `Message`).
+_KEYWORD_SEPARATOR = "; "
+
+
+@dataclass
+class ConversationSummary:
+    """Derived state for one conversation: a dense summary and up to five
+    keywords, produced by `ExtractionService` and scoped to `group_id` so a
+    group's summaries are readable without reading any conversation's
+    messages."""
+
+    conversation_id: str
+    group_id: str
+    summary: str
+    keywords: tuple[str, ...] = ()
+    #: How many of the conversation's messages this summary was built from —
+    #: the watermark that makes re-extraction a no-op when nothing changed.
+    covered_messages: int = 0
+    #: Which model produced this summary; `None` only if provenance was lost.
+    model_id: str | None = None
+    created_at: datetime = field(default_factory=_now)
+    updated_at: datetime = field(default_factory=_now)
+
+    @property
+    def keywords_text(self) -> str:
+        return _KEYWORD_SEPARATOR.join(self.keywords)
+
+    @staticmethod
+    def split_keywords(text: str) -> tuple[str, ...]:
+        return tuple(piece.strip() for piece in text.split(";") if piece.strip())
+
+
 @dataclass
 class Conversation:
     """An ordered list of messages."""

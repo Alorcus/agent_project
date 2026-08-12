@@ -69,6 +69,11 @@ checkpoint fails loudly instead.
 | `Ctrl+O` | Cycle model |
 | `Ctrl+T` | Toggle thinking mode |
 | `Ctrl+D` | Exit |
+| `Delete` | Delete forward in the prompt |
+
+`Ctrl+D` is a priority binding, so it exits even while the prompt has focus —
+which is where it usually is. The cost is `Input`'s own `Ctrl+D` binding
+(delete-forward); use `Delete` for that instead.
 
 `Ctrl+N` inherits rather than asking: working inside a project means starting
 several chats inside it, so the group you are in is a better guess than "no
@@ -91,6 +96,8 @@ Environment variables, all prefixed `AGENTCHAT_`:
 | `AGENTCHAT_DATA_DIR` | `./data` | Where `agentchat.db` lives (the `sqlite` store) |
 | `AGENTCHAT_CORPUS_DIR` | `./corpus` | RAG ingestion source (not yet used) |
 | `AGENTCHAT_SIMULATE_FAILURE` | `0` | Make the second model fail on load, to exercise error handling |
+| `AGENTCHAT_EXTRACT_SUMMARIES` | `1` | Derive a summary and keywords for a conversation when it is left |
+| `AGENTCHAT_EXTRACTION_TIMEOUT` | `30.0` | Seconds `Ctrl+D`/`Ctrl+Q` wait for extraction before exiting anyway |
 
 Variables can also go in a `.env` file at the project root (copy
 `.env.example`) instead of being exported in the shell. Real environment
@@ -103,15 +110,32 @@ not silently rewritten — the app raises naming the file. Delete it and restart
 to get a fresh one: `rm data/agentchat.db` (or whatever `AGENTCHAT_DATA_DIR`
 points at).
 
+## Conversation summaries
+
+Every conversation gets a dense summary and up to five keywords, produced by
+two LLM calls on the active model (summary first, keywords from the summary)
+and stored in `conversation_summaries`, keyed by conversation and carrying the
+group id. Extraction fires when a conversation is left — switching away
+(`Ctrl+N`/`Ctrl+G`/`Ctrl+L`) runs it in the background and the status bar
+shows `summarising…` for as long as it's in flight, without blocking the next
+turn; quitting (`Ctrl+D`/`Ctrl+Q`) shows the same status line but waits for
+it, bounded by `AGENTCHAT_EXTRACTION_TIMEOUT`. A conversation with no new
+messages since its last summary is not re-summarised.
+`AGENTCHAT_EXTRACT_SUMMARIES=0` switches the feature off. Nothing in the UI
+reads the table yet — it exists so a later group overview and prompt-recall
+feature can be additive.
+
 ## Layout
 
 ```
 src/agentchat/
   config.py        settings + the single wiring point for backends
   core/
-    models.py      Message, Conversation
+    models.py      Message, Conversation, ConversationSummary
     chat.py        turn orchestration — the only thing that knows how a reply is made
     context.py     ContextStrategy seam (context-management elective)
+    prompts.py     the two extraction prompts, transcript rendering, keyword parsing
+    extraction.py  ExtractionService — two LLM calls, summary then keywords
     errors.py      every failure the UI is expected to render
   llm/
     base.py        LLMProvider protocol — the app/backend boundary
@@ -158,6 +182,9 @@ imports a concrete backend.
   conversation in it** — they are not re-homed, because a conversation's group
   cannot change — so the confirmation names how many chats are about to go.
   The default group is not deletable.
+- Conversation summaries — a dense summary and up to five keywords, derived
+  on leaving a conversation and stored per group. See "Conversation
+  summaries" above.
 
 ## Not yet built
 

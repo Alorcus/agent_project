@@ -4,15 +4,16 @@ import asyncio
 
 import pytest
 
-from agentchat.config import ConfigurationError, Settings, build_store
+from agentchat.config import ConfigurationError, Settings, build_extractor, build_store
 from agentchat.core.chat import ChatService
 from agentchat.core.context import RecencyWindowStrategy
 from agentchat.core.errors import ModelNotFoundError, ProviderError
+from agentchat.core.extraction import ExtractionService
 from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, Message
 from agentchat.llm.base import GenerationOptions, ModelInfo
 from agentchat.llm.mock import MockProvider
 from agentchat.storage.sqlite import SqliteStore
-from conftest import fast_registry
+from conftest import fast_registry, mock_settings
 from factories import make_group
 
 
@@ -179,3 +180,21 @@ def test_build_store_sqlite_returns_sqlite_store_and_creates_parent(tmp_path):
 def test_build_store_unknown_raises_configuration_error():
     with pytest.raises(ConfigurationError):
         build_store(Settings(backend="mock", store="nope"))
+
+
+def test_build_extractor_is_switched_by_extract_summaries():
+    registry = fast_registry()
+    assert build_extractor(mock_settings(extract_summaries=False), registry) is None
+    extractor = build_extractor(mock_settings(extract_summaries=True), registry)
+    assert isinstance(extractor, ExtractionService)
+
+
+def test_agentchat_extract_summaries_env_flag_is_honoured(monkeypatch):
+    monkeypatch.setenv("AGENTCHAT_EXTRACT_SUMMARIES", "0")
+    assert Settings().extract_summaries is False
+
+
+def test_agentchat_extraction_timeout_bad_value_raises_configuration_error(monkeypatch):
+    monkeypatch.setenv("AGENTCHAT_EXTRACTION_TIMEOUT", "abc")
+    with pytest.raises(ConfigurationError):
+        Settings()

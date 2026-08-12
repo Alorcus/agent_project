@@ -22,3 +22,7 @@ class ContextOverflowError(AgentChatError):
 
 class StorageError(AgentChatError):
     """Persisting or loading conversation state failed."""
+
+
+class ExtractionError(AgentChatError):
+    """Summarising a conversation produced nothing worth storing."""

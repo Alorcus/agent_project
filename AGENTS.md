@@ -30,6 +30,9 @@ would need, delete it.
 src/agentchat/
   config.py        settings + the single wiring point for backends and stores
   core/            domain model, chat orchestration, context strategy, errors
+    prompts.py     the extraction prompts and nothing else — edit this file to
+                    tune summary/keyword quality, not extraction.py
+    extraction.py  ExtractionService: two LLM calls, summary then keywords
   llm/             LLMProvider protocol, mock + local (transformers) backends, registry
   storage/         ConversationStore protocol and its SQLite implementation
   ui/              Textual application, widgets, and modal screens

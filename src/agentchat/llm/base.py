@@ -71,3 +71,14 @@ class LLMProvider(Protocol):
     ) -> AsyncIterator[str]:
         """Yield response chunks as they are produced."""
         ...
+
+
+async def complete(
+    provider: LLMProvider,
+    messages: Sequence[Message],
+    options: GenerationOptions | None = None,
+) -> str:
+    """Drain ``generate`` into one string, for callers that want a whole
+    answer rather than a stream."""
+    parts = [chunk async for chunk in provider.generate(messages, options)]
+    return "".join(parts)

@@ -32,6 +32,16 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at TEXT NOT NULL, model_id TEXT, metadata TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation
   ON messages(conversation_id, ordinal);
+
+CREATE TABLE IF NOT EXISTS conversation_summaries (
+  conversation_id TEXT PRIMARY KEY
+    REFERENCES conversations(id) ON DELETE CASCADE,
+  group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+  summary TEXT NOT NULL, keywords TEXT NOT NULL,
+  covered_messages INTEGER NOT NULL, model_id TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_summaries_group
+  ON conversation_summaries(group_id);
 """
 
 

@@ -17,7 +17,7 @@ from textual.containers import Container, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Footer, Input, Static
 
-from agentchat.config import Settings, build_registry, build_store
+from agentchat.config import Settings, build_extractor, build_registry, build_store
 from agentchat.core.chat import ChatService
 from agentchat.core.errors import AgentChatError, ModelNotFoundError
 from agentchat.core.models import Conversation, Group, Message
@@ -26,6 +26,8 @@ from agentchat.ui.screens import ConversationPicker, GroupChooser
 from agentchat.ui.widgets import ConversationHeader, MessageBubble
 
 _GENERATION_GROUP = "generation"
+_EXTRACTION_GROUP = "extraction"
+_SUMMARISING_STATUS = "summarising…"
 
 
 class ChatApp(App[None]):
@@ -33,7 +35,11 @@ class ChatApp(App[None]):
     TITLE = "agentchat"
 
     BINDINGS = [
-        Binding("ctrl+d", "quit", "Exit"),
+        # priority=True: `Input.BINDINGS` binds `ctrl+d` to `delete_right`,
+        # which would otherwise shadow this while the prompt has focus (the
+        # common case). The cost is `delete_right` itself — `Delete` still
+        # does it.
+        Binding("ctrl+d", "quit", "Exit", priority=True),
         Binding("escape", "stop", "Stop"),
         Binding("ctrl+n", "new_conversation", "New chat"),
         Binding("ctrl+g", "choose_group", "New chat in…"),
@@ -46,11 +52,20 @@ class ChatApp(App[None]):
         super().__init__()
         self.settings = settings or Settings.from_env()
         self.registry = build_registry(self.settings)
-        self.chat = ChatService(self.registry, store=build_store(self.settings))
+        self.chat = ChatService(
+            self.registry,
+            store=build_store(self.settings),
+            extractor=build_extractor(self.settings, self.registry),
+        )
         self.conversation: Conversation = Conversation()
         self.options = GenerationOptions()
         self.status_text = ""
         self._generating = False
+        # A count, not a bool: two fast switches can leave one background
+        # extraction winding down (cancelled) while its replacement is still
+        # running, and a bool would let the first one's `finally` clear the
+        # indicator out from under the second.
+        self._summarising_count = 0
         # The header renders synchronously and holds only a group id, so it
         # cannot await the store per repaint.
         self._groups: dict[str, Group] = {}
@@ -115,6 +130,39 @@ class ChatApp(App[None]):
             return
         self.workers.cancel_group(self, _GENERATION_GROUP)
 
+    async def action_quit(self) -> None:
+        """The only awaitable pre-exit hook (KTD11): `App.exit()` is
+        synchronous, so overriding this coroutine is the one place that can
+        await the closing summary — and it covers every route out of the
+        app, the app's own Ctrl+D binding and textual's default Ctrl+Q."""
+        self.workers.cancel_group(self, _GENERATION_GROUP)
+        await self._summarise_before_exit()
+        await super().action_quit()
+
+    async def _summarise_before_exit(self) -> None:
+        if self.chat.extractor is None or not self.conversation.messages:
+            return
+        # A background run from an earlier switch may still hold the
+        # provider lock this call needs.
+        self.workers.cancel_group(self, _EXTRACTION_GROUP)
+        self._refresh_status(busy=_SUMMARISING_STATUS)
+        # Actions run as tasks off the message pump; without yielding here,
+        # the status line's repaint can lose the race against `wait_for`
+        # below and never actually be seen.
+        await asyncio.sleep(0)
+        try:
+            await asyncio.wait_for(
+                self.chat.summarise(self.conversation),
+                timeout=self.settings.extraction_timeout,
+            )
+        except TimeoutError:
+            # The app is a line of code from gone; a toast nobody can read is
+            # worse than silence. The watermark makes the next exit from this
+            # conversation (if there is one) retry it.
+            pass
+        except AgentChatError:
+            pass
+
     async def action_new_conversation(self) -> None:
         """Instant, and inherits the current conversation's group — the group
         you are in is the one you were last thinking about. The header states
@@ -149,6 +197,7 @@ class ChatApp(App[None]):
     async def _start_conversation(self, group_id: str) -> None:
         self.action_stop()
         await self.chat.persist(self.conversation)
+        self._maybe_summarise(self.conversation)
         self.conversation = await self.chat.new_conversation(group_id)
         await self._show_conversation(self.conversation)
         self._refresh_status()
@@ -251,6 +300,7 @@ class ChatApp(App[None]):
         self.action_stop()
         try:
             await self.chat.persist(self.conversation)
+            self._maybe_summarise(self.conversation)
             self.conversation = await self.chat.switch_conversation(conversation_id)
         except AgentChatError as error:
             self.notify(str(error), severity="error")
@@ -295,10 +345,61 @@ class ChatApp(App[None]):
         )
         self._refresh_status()
 
+    # -- extraction ---------------------------------------------------------
+
+    def _maybe_summarise(self, conversation: Conversation) -> None:
+        """Start the background extraction worker, unless extraction is off
+        — checked here, not inside the worker, so a disabled feature starts
+        no worker at all rather than one that immediately no-ops.
+
+        Incrementing the counter here, before the worker has even started,
+        means the caller's own trailing `_refresh_status()` (after the switch
+        completes) already shows the indicator — no race with the worker's
+        first tick.
+        """
+        if self.chat.extractor is None:
+            return
+        self._summarising_count += 1
+        self._summarise(conversation)
+
+    @work(group=_EXTRACTION_GROUP, exclusive=True)
+    async def _summarise(self, conversation: Conversation) -> None:
+        """Summarise `conversation` in the background, once it is left. Not
+        in `_GENERATION_GROUP`: sharing it would make switching cancel a
+        running generation, the exact regression plan 001's U5 guarded
+        against (R9). `exclusive=True` within its own group so two fast
+        switches leave one extraction in flight, not two."""
+        try:
+            await self.chat.summarise(conversation)
+        except asyncio.CancelledError:
+            # Cancellation is the designed path (a new turn pre-empts a
+            # stale extraction, or the app is shutting down, KTD7) — not a
+            # failure, and not reported. The counter still needs correcting,
+            # but nothing here may touch the screen: cancellation reaches
+            # here during app shutdown too, once the screen stack is already
+            # torn down.
+            self._summarising_count -= 1
+            raise
+        except AgentChatError as error:
+            # Warning, not error: a missing summary costs the user nothing
+            # they asked for, and a red toast every time a model misbehaves
+            # would be worse than the missing row (R11).
+            self._summarising_count -= 1
+            self._refresh_status()
+            self.notify(str(error), severity="warning")
+        else:
+            self._summarising_count -= 1
+            self._refresh_status()
+
     # -- generation -------------------------------------------------------
 
     @work(exclusive=True, group=_GENERATION_GROUP)
     async def _turn(self, text: str) -> None:
+        # A user who types immediately after switching never waits on a
+        # summary; the abandoned conversation is picked up next time it is
+        # left, since the watermark makes that free (KTD7).
+        self.workers.cancel_group(self, _EXTRACTION_GROUP)
+
         log = self._chat_screen.query_one("#chat-log", VerticalScroll)
         await log.query(".placeholder").remove()
 
@@ -346,6 +447,12 @@ class ChatApp(App[None]):
         turn = self.chat.last_turn
         if turn is not None and turn.context.was_trimmed:
             bits.append(f"context: dropped {len(turn.context.dropped)}")
+
+        if busy is None and self._summarising_count > 0:
+            # Worth a status line on its own, but a caller's explicit `busy`
+            # (loading, generating, the quit-time wait) is foreground work
+            # and takes priority when both are happening at once.
+            busy = _SUMMARISING_STATUS
 
         self.status_text = ("  ·  ".join(bits)) + (f"  ·  {busy}" if busy else "")
         bar = self._chat_screen.query_one("#statusbar", Static)

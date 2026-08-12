@@ -12,7 +12,7 @@ from agentchat.core.models import DEFAULT_GROUP_ID, Message
 from agentchat.storage.schema import connect
 from agentchat.storage.sqlite import SqliteStore
 
-from factories import make_conversation, make_group
+from factories import make_conversation, make_group, make_summary
 
 
 async def test_round_trip_title_group_messages_and_model_id(tmp_path: Path):
@@ -273,3 +273,153 @@ async def test_a_pre_groups_database_is_refused_not_rewritten(tmp_path: Path):
 
     with closing(sqlite3.connect(path)) as conn:
         assert conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 1
+
+
+# -- conversation summaries -------------------------------------------------
+
+
+async def test_summary_round_trips_across_a_fresh_store_instance(tmp_path: Path):
+    path = tmp_path / "chat.db"
+    conversation = make_conversation()
+    await SqliteStore(path).save(conversation)
+    summary = make_summary(conversation_id=conversation.id, keywords=("a", "b"))
+    await SqliteStore(path).save_summary(summary)
+
+    loaded = await SqliteStore(path).summary(conversation.id)
+
+    assert loaded is not None
+    assert loaded.summary == summary.summary
+    assert loaded.keywords == summary.keywords
+    assert loaded.covered_messages == summary.covered_messages
+    assert loaded.model_id == summary.model_id
+    assert loaded.created_at.tzinfo is not None
+    assert loaded.updated_at.tzinfo is not None
+    assert loaded.created_at == summary.created_at
+    assert loaded.updated_at == summary.updated_at
+
+
+async def test_summary_keywords_with_comma_and_non_ascii_survive(tmp_path: Path):
+    path = tmp_path / "chat.db"
+    conversation = make_conversation()
+    store = SqliteStore(path)
+    await store.save(conversation)
+    summary = make_summary(
+        conversation_id=conversation.id, keywords=("café, München", "日本語")
+    )
+    await store.save_summary(summary)
+
+    loaded = await store.summary(conversation.id)
+
+    assert loaded is not None
+    assert loaded.keywords == ("café, München", "日本語")
+
+
+async def test_summary_with_no_keywords_round_trips_as_empty_tuple(tmp_path: Path):
+    path = tmp_path / "chat.db"
+    conversation = make_conversation()
+    store = SqliteStore(path)
+    await store.save(conversation)
+    await store.save_summary(make_summary(conversation_id=conversation.id, keywords=()))
+
+    loaded = await store.summary(conversation.id)
+
+    assert loaded is not None
+    assert loaded.keywords == ()
+
+
+async def test_saving_a_summary_twice_leaves_one_row_and_keeps_the_first_created_at(
+    tmp_path: Path,
+):
+    path = tmp_path / "chat.db"
+    conversation = make_conversation()
+    store = SqliteStore(path)
+    await store.save(conversation)
+    first = make_summary(conversation_id=conversation.id, summary="first pass")
+    await store.save_summary(first)
+    second = make_summary(conversation_id=conversation.id, summary="second pass")
+    await store.save_summary(second)
+
+    loaded = await store.summary(conversation.id)
+    assert loaded is not None
+    assert loaded.summary == "second pass"
+    assert loaded.created_at == first.created_at
+
+    with sqlite3.connect(path) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM conversation_summaries WHERE conversation_id = ?",
+            (conversation.id,),
+        ).fetchone()[0]
+    assert count == 1
+
+
+async def test_summary_of_unknown_conversation_returns_none(tmp_path: Path):
+    store = SqliteStore(tmp_path / "chat.db")
+    assert await store.summary("does-not-exist") is None
+
+
+async def test_deleting_the_conversation_removes_its_summary_row(tmp_path: Path):
+    path = tmp_path / "chat.db"
+    store = SqliteStore(path)
+    conversation = make_conversation()
+    await store.save(conversation)
+    await store.save_summary(make_summary(conversation_id=conversation.id))
+
+    await store.delete(conversation.id)
+
+    with sqlite3.connect(path) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM conversation_summaries WHERE conversation_id = ?",
+            (conversation.id,),
+        ).fetchone()[0]
+    assert count == 0
+
+
+async def test_deleting_the_group_takes_summaries_with_it_two_hop(tmp_path: Path):
+    path = tmp_path / "chat.db"
+    store = SqliteStore(path)
+    project = make_group()
+    await store.save_group(project)
+    conversation = make_conversation(group_id=project.id)
+    await store.save(conversation)
+    await store.save_summary(
+        make_summary(conversation_id=conversation.id, group_id=project.id)
+    )
+
+    await store.delete_group(project.id)
+
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM conversation_summaries").fetchone()[0] == 0
+
+
+async def test_list_summaries_scopes_to_group_most_recently_updated_first(tmp_path: Path):
+    path = tmp_path / "chat.db"
+    store = SqliteStore(path)
+    other_group = make_group(name="other")
+    await store.save_group(other_group)
+    c1 = make_conversation()
+    c2 = make_conversation()
+    c_other = make_conversation(group_id=other_group.id)
+    await store.save(c1)
+    await store.save(c2)
+    await store.save(c_other)
+
+    now = datetime.now(timezone.utc)
+    await store.save_summary(
+        make_summary(conversation_id=c1.id, summary="older", updated_at=now - timedelta(hours=1))
+    )
+    await store.save_summary(
+        make_summary(conversation_id=c2.id, summary="newer", updated_at=now)
+    )
+    await store.save_summary(
+        make_summary(conversation_id=c_other.id, group_id=other_group.id)
+    )
+
+    summaries = await store.list_summaries(DEFAULT_GROUP_ID)
+
+    assert [s.summary for s in summaries] == ["newer", "older"]
+
+
+async def test_saving_a_summary_for_a_missing_conversation_raises(tmp_path: Path):
+    store = SqliteStore(tmp_path / "chat.db")
+    with pytest.raises(StorageError):
+        await store.save_summary(make_summary(conversation_id="no-such-conversation"))

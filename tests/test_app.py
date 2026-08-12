@@ -11,9 +11,9 @@ import asyncio
 
 from textual.widgets import Input, ListView, Static
 
-from agentchat.core.errors import StorageError
+from agentchat.core.errors import ProviderError, StorageError
 from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, Group, Message
-from agentchat.ui.app import ChatApp
+from agentchat.ui.app import _EXTRACTION_GROUP, ChatApp
 from agentchat.ui.screens import ConversationPicker, GroupChooser
 from agentchat.ui.widgets import ConversationHeader, MessageBubble
 from conftest import mock_settings
@@ -49,6 +49,19 @@ async def _wait_for_rows(pilot, app, count: int) -> None:
             return
         await asyncio.sleep(0.05)
     raise AssertionError(f"picker never settled on {count} rows")
+
+
+async def _wait_for_summary(pilot, app, conversation_id: str, attempts: int = 120):
+    # Two real LLM calls (mock or not) can run well past a couple of seconds
+    # under realistic timing; callers using `_REALISTIC_TIMING` pass a higher
+    # `attempts` budget.
+    for _ in range(attempts):
+        await pilot.pause()
+        summary = await app.chat.store.summary(conversation_id)
+        if summary is not None:
+            return summary
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"no summary ever appeared for conversation {conversation_id!r}")
 
 
 async def _wait_for_screen(pilot, app, screen_type) -> None:
@@ -1181,3 +1194,273 @@ async def test_delete_group_storage_error_notifies_and_keeps_running():
 
         await pilot.press("escape")
         await pilot.pause()
+
+
+# -- conversation summaries (extraction on switch) -------------------------
+
+
+async def test_switching_away_summarises_the_outgoing_conversation():
+    app = ChatApp(mock_settings(extract_summaries=True))
+    async with app.run_test() as pilot:
+        await _submit(pilot, "hello")
+        await _wait_until_done(pilot, app)
+        outgoing_id = app.conversation.id
+
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+
+        summary = await _wait_for_summary(pilot, app, outgoing_id)
+        assert summary.summary
+
+
+async def test_switching_away_shows_a_summarising_status_while_extraction_runs():
+    app = ChatApp(mock_settings(extract_summaries=True, **_REALISTIC_TIMING))
+    async with app.run_test() as pilot:
+        await _submit(pilot, "hello")
+        await _wait_until_done(pilot, app)
+        outgoing_id = app.conversation.id
+        statusbar = app.query_one("#statusbar", Static)
+
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+
+        for _ in range(100):
+            await pilot.pause()
+            if "summarising…" in app.status_text:
+                break
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError("status bar never showed the summarising indicator")
+        assert statusbar.has_class("-busy")
+
+        await _wait_for_summary(pilot, app, outgoing_id, attempts=600)
+        await pilot.pause()
+
+        assert "summarising…" not in app.status_text
+        assert not statusbar.has_class("-busy")
+
+
+async def test_switching_away_from_an_empty_conversation_writes_nothing():
+    app = ChatApp(mock_settings(extract_summaries=True))
+    async with app.run_test() as pilot:
+        empty_id = app.conversation.id
+
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        await asyncio.sleep(0.1)
+        await pilot.pause()
+
+        assert await app.chat.store.summary(empty_id) is None
+
+
+async def test_switching_while_generating_lets_the_generation_finish():
+    app = ChatApp(mock_settings(extract_summaries=True, **_REALISTIC_TIMING))
+    async with app.run_test() as pilot:
+        await _submit(pilot, "a long enough prompt to stream")
+        await asyncio.sleep(0.3)
+        assert app._generating, "should still be mid-generation"
+
+        outgoing = app.conversation
+        target = Conversation()
+        await app.chat.store.save(target)
+        await app._switch_to(target.id)
+        await _wait_until_done(pilot, app)
+
+        assert not app._generating
+        assert app.conversation.id == target.id
+        assert outgoing.messages[-1].content.strip() != ""
+
+
+async def test_typing_while_extraction_in_flight_leaves_the_abandoned_chat_unsummarised():
+    app = ChatApp(mock_settings(extract_summaries=True, **_REALISTIC_TIMING))
+    async with app.run_test() as pilot:
+        await _submit(pilot, "first")
+        await _wait_until_done(pilot, app)
+        abandoned_id = app.conversation.id
+
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        await asyncio.sleep(0.1)  # let the extraction worker get into flight
+
+        await _submit(pilot, "second")
+        await _wait_until_done(pilot, app)
+
+        reply = list(app.query(MessageBubble))[-1]
+        assert reply.message.role == "assistant"
+        assert reply.message.content.strip()
+        assert await app.chat.store.summary(abandoned_id) is None
+
+
+async def test_deleting_the_active_conversation_writes_no_summary_row():
+    app = ChatApp(mock_settings(extract_summaries=True))
+    async with app.run_test() as pilot:
+        await _submit(pilot, "first")
+        await _wait_until_done(pilot, app)
+        doomed_id = app.conversation.id
+
+        await pilot.press("ctrl+l")
+        await _wait_for_screen(pilot, app, ConversationPicker)
+        await pilot.press("ctrl+x")
+        await pilot.pause()
+        await pilot.press("y")
+        await pilot.pause()
+        await asyncio.sleep(0.2)
+        await pilot.pause()
+
+        assert await app.chat.store.summary(doomed_id) is None
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+
+async def test_extractor_provider_error_surfaces_as_a_warning_and_app_keeps_running():
+    app = ChatApp(mock_settings(extract_summaries=True))
+    async with app.run_test() as pilot:
+        await _submit(pilot, "hello")
+        await _wait_until_done(pilot, app)
+
+        async def boom(conversation: Conversation) -> None:
+            raise ProviderError("boom")
+
+        app.chat.summarise = boom
+
+        notified_severities: list[str | None] = []
+        app.notify = lambda message, **kwargs: notified_severities.append(
+            kwargs.get("severity")
+        )
+
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        for _ in range(60):
+            await pilot.pause()
+            if notified_severities:
+                break
+            await asyncio.sleep(0.05)
+
+        assert notified_severities == ["warning"]
+        assert app.is_running
+
+
+async def test_extraction_disabled_switching_writes_nothing_and_starts_no_worker():
+    app = ChatApp(mock_settings())  # extract_summaries defaults to False
+    async with app.run_test() as pilot:
+        await _submit(pilot, "first")
+        await _wait_until_done(pilot, app)
+        outgoing_id = app.conversation.id
+
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        await asyncio.sleep(0.1)
+        await pilot.pause()
+
+        assert await app.chat.store.summary(outgoing_id) is None
+        assert not any(worker.group == _EXTRACTION_GROUP for worker in app.workers)
+
+
+# -- extraction on quit, and Ctrl+D --------------------------------------
+
+
+async def test_ctrl_d_triggers_quit_not_delete_right_while_the_prompt_has_focus():
+    """The regression test for the bug U7 fixes: `Input.BINDINGS` shadows
+    `ctrl+d` with `delete_right` unless the app's binding is `priority=True`."""
+    app = ChatApp(mock_settings())
+    quit_calls = []
+
+    async def fake_quit() -> None:
+        quit_calls.append(True)
+
+    async with app.run_test() as pilot:
+        app.action_quit = fake_quit
+        prompt = pilot.app.query_one("#prompt", Input)
+        prompt.value = "hello"
+        prompt.cursor_position = 0  # delete_right here would remove the "h"
+
+        await pilot.press("ctrl+d")
+        await pilot.pause()
+
+        assert quit_calls == [True]
+        assert prompt.value == "hello"
+
+
+async def test_action_quit_stores_a_summary_for_the_active_conversation():
+    app = ChatApp(mock_settings(extract_summaries=True))
+    async with app.run_test() as pilot:
+        await _submit(pilot, "hello")
+        await _wait_until_done(pilot, app)
+        conversation_id = app.conversation.id
+
+        await app.action_quit()
+
+        summary = await app.chat.store.summary(conversation_id)
+        assert summary is not None
+
+
+async def test_action_quit_on_an_empty_launch_never_calls_the_extractor():
+    app = ChatApp(mock_settings(extract_summaries=True))
+    async with app.run_test():
+        called = False
+
+        async def spy(conversation: Conversation):
+            nonlocal called
+            called = True
+
+        app.chat.summarise = spy
+
+        await app.action_quit()
+
+        assert called is False
+
+
+async def test_action_quit_times_out_and_exits_anyway_leaving_no_row():
+    app = ChatApp(mock_settings(extract_summaries=True, extraction_timeout=0.05))
+    async with app.run_test() as pilot:
+        await _submit(pilot, "hello")
+        await _wait_until_done(pilot, app)
+        conversation_id = app.conversation.id
+
+        async def hang(conversation: Conversation):
+            await asyncio.sleep(10)
+
+        app.chat.summarise = hang
+
+        await asyncio.wait_for(app.action_quit(), timeout=2.0)
+
+        assert await app.chat.store.summary(conversation_id) is None
+
+
+async def test_action_quit_with_a_provider_error_still_exits():
+    app = ChatApp(mock_settings(extract_summaries=True))
+    async with app.run_test() as pilot:
+        await _submit(pilot, "hello")
+        await _wait_until_done(pilot, app)
+
+        async def boom(conversation: Conversation):
+            raise ProviderError("boom")
+
+        app.chat.summarise = boom
+
+        await asyncio.wait_for(app.action_quit(), timeout=2.0)  # must not hang or raise
+
+
+async def test_a_running_generation_is_cancelled_by_quit():
+    app = ChatApp(mock_settings(**_REALISTIC_TIMING))
+    async with app.run_test() as pilot:
+        await _submit(pilot, "a long enough prompt to stream")
+        await asyncio.sleep(0.3)
+        assert app._generating, "should still be mid-generation"
+
+        await asyncio.wait_for(app.action_quit(), timeout=2.0)
+
+
+async def test_ctrl_q_also_goes_through_action_quit_and_summarises():
+    app = ChatApp(mock_settings(extract_summaries=True))
+    async with app.run_test() as pilot:
+        await _submit(pilot, "hello")
+        await _wait_until_done(pilot, app)
+        conversation_id = app.conversation.id
+
+        await pilot.press("ctrl+q")
+        await pilot.pause()
+
+        summary = await _wait_for_summary(pilot, app, conversation_id)
+        assert summary is not None

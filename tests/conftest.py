@@ -63,11 +63,16 @@ def mock_settings(**overrides) -> Settings:
     on *mid-generation* behaviour (still streaming, cancel, stop) need a real
     gap to land in — pass ``mock_chunk_delay=None, mock_load_delay=None``
     to opt back into ``mock.default_models()``'s realistic timing.
+
+    Extraction defaults to off, so the existing suite doesn't grow two silent
+    LLM calls per switch; tests that are about extraction pass
+    ``extract_summaries=True`` explicitly.
     """
     overrides.setdefault("backend", "mock")
     overrides.setdefault("store", "sqlite")
     overrides.setdefault("mock_chunk_delay", 0.0)
     overrides.setdefault("mock_load_delay", 0.0)
+    overrides.setdefault("extract_summaries", False)
     return Settings(**overrides)
 
 
