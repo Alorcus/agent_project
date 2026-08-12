@@ -1,7 +1,8 @@
 """SQLite-backed `ConversationStore`: conversations survive process restarts.
 
 Each method offloads its synchronous sqlite3 body to a worker thread via
-`asyncio.to_thread`, so storage I/O never blocks the event loop.
+`asyncio.to_thread`, so storage I/O never blocks the event loop. The schema
+itself lives in `storage.schema`.
 """
 
 from __future__ import annotations
@@ -14,21 +15,9 @@ from datetime import datetime
 from pathlib import Path
 
 from agentchat.core.errors import StorageError
-from agentchat.core.models import Conversation, Message
-from agentchat.storage.base import by_recency
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS conversations (
-  id TEXT PRIMARY KEY, title TEXT NOT NULL, group_id TEXT,
-  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS messages (
-  id TEXT PRIMARY KEY,
-  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-  ordinal INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
-  created_at TEXT NOT NULL, model_id TEXT, metadata TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS idx_messages_conversation
-  ON messages(conversation_id, ordinal);
-"""
+from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, Group, Message
+from agentchat.storage import schema
+from agentchat.storage.base import by_default_first, by_recency
 
 
 class SqliteStore:
@@ -36,24 +25,26 @@ class SqliteStore:
 
     def __init__(self, path: Path) -> None:
         self._path = path
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            with closing(self._connect()) as conn, conn:
-                conn.executescript(_SCHEMA)
-        except sqlite3.Error as exc:
-            raise StorageError(f"could not open database at {path}") from exc
+        schema.ensure_schema(path)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._path)
-        # Per-connection setting: without it ON DELETE CASCADE is silently
-        # ignored and delete() would orphan message rows.
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
+        return schema.connect(self._path)
 
-    async def list_conversations(
-        self, group_id: str | None = None
-    ) -> list[Conversation]:
+    async def list_conversations(self, group_id: str = DEFAULT_GROUP_ID) -> list[Conversation]:
         return await asyncio.to_thread(self._list_conversations, group_id)
+
+    async def list_all_conversations(self) -> list[Conversation]:
+        return await asyncio.to_thread(self._list_conversations, None)
+
+    async def list_groups(self) -> list[Group]:
+        return await asyncio.to_thread(self._list_groups)
+
+    async def save_group(self, group: Group) -> None:
+        await asyncio.to_thread(self._save_group, group)
+
+    async def default_group(self) -> Group:
+        groups = await self.list_groups()
+        return groups[0]
 
     async def load(self, conversation_id: str) -> Conversation | None:
         return await asyncio.to_thread(self._load, conversation_id)
@@ -81,6 +72,33 @@ class SqliteStore:
             raise StorageError("failed to list conversations") from exc
         items = [c for c in items if c is not None]
         return by_recency(items)
+
+    def _list_groups(self) -> list[Group]:
+        try:
+            with closing(self._connect()) as conn, conn:
+                rows = conn.execute(
+                    "SELECT id, name, kind, created_at FROM groups"
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError("failed to list groups") from exc
+        groups = [
+            Group(id=id_, name=name, kind=kind, created_at=datetime.fromisoformat(created_at))
+            for id_, name, kind, created_at in rows
+        ]
+        return by_default_first(groups)
+
+    def _save_group(self, group: Group) -> None:
+        try:
+            with closing(self._connect()) as conn, conn:
+                conn.execute(
+                    "INSERT INTO groups (id, name, kind, created_at) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET "
+                    "name = excluded.name, kind = excluded.kind",
+                    (group.id, group.name, group.kind, group.created_at.isoformat()),
+                )
+        except sqlite3.Error as exc:
+            raise StorageError(f"failed to save group {group.id}") from exc
 
     def _load(self, conversation_id: str) -> Conversation | None:
         try:

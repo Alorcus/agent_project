@@ -9,6 +9,10 @@ from typing import Any, Literal
 
 Role = Literal["system", "user", "assistant"]
 
+#: The group the schema seeds and every conversation lands in unless another
+#: is chosen at creation. It always exists, so no code path handles its absence.
+DEFAULT_GROUP_ID = "default"
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -16,6 +20,22 @@ def _now() -> datetime:
 
 def _new_id() -> str:
     return uuid.uuid4().hex
+
+
+@dataclass
+class Group:
+    """The container a conversation belongs to, and the unit downstream
+    features scope by."""
+
+    id: str = field(default_factory=_new_id)
+    name: str = "New group"
+    kind: Literal["default", "project"] = "project"
+    created_at: datetime = field(default_factory=_now)
+
+    def is_project(self) -> bool:
+        """The single place `kind` is branched on, so callers never spell out
+        a `kind == "default"` comparison of their own."""
+        return self.kind != "default"
 
 
 @dataclass
@@ -42,8 +62,9 @@ class Conversation:
 
     id: str = field(default_factory=_new_id)
     title: str = "New conversation"
-    #: Project-folder handle; unused today, reserved for scoping memory recall.
-    group_id: str | None = None
+    #: NOT NULL at the schema level (I-1) and chosen once at creation — every
+    #: conversation belongs to a group, even if only the seeded default one.
+    group_id: str = DEFAULT_GROUP_ID
     created_at: datetime = field(default_factory=_now)
     updated_at: datetime = field(default_factory=_now)
     messages: list[Message] = field(default_factory=list)

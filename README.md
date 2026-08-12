@@ -88,6 +88,13 @@ Variables can also go in a `.env` file at the project root (copy
 `.env.example`) instead of being exported in the shell. Real environment
 variables take precedence over `.env`.
 
+**No migrations.** `agentchat.db`'s schema only ever grows by hand-written
+`CREATE TABLE IF NOT EXISTS` statements; there is no upgrade path from an
+older schema. A database written before conversation groups landed is refused,
+not silently rewritten — the app raises naming the file. Delete it and restart
+to get a fresh one: `rm data/agentchat.db` (or whatever `AGENTCHAT_DATA_DIR`
+points at).
+
 ## Layout
 
 ```
@@ -105,7 +112,8 @@ src/agentchat/
     mock.py        the stub backend
   storage/
     base.py        ConversationStore protocol + in-memory implementation
-    sqlite.py      durable implementation — two tables, one save per turn
+    schema.py      the DDL, the default-group seed, and the old-database guard
+    sqlite.py      durable implementation — three tables, one save per turn
   ui/
     app.py         Textual application
     widgets.py     message bubbles

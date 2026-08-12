@@ -5,7 +5,10 @@
 plans (`…-003-memory-stage-0-scaffolding.md`,
 `…-004-memory-stage-1-schema-and-stores.md`,
 `…-005-memory-stage-2-extraction-write-path.md`,
-`…-006-memory-stage-3-read-path.md`).
+`…-006-memory-stage-3-read-path.md`). **Those files live on
+`feat/memory-pipeline`, not on this branch** — every bare `§` below cites
+`memory-and-groups.md`, and this document is the standalone statement of the
+part of it that is about groups.
 
 **Scope of this file:** groups as a feature of their own — what a group is, how
 a conversation acquires one, how they are listed, and what deleting one means.
@@ -50,8 +53,8 @@ neither reads nor maintains them.
 - **It is not deletable** (§ 2.4.1's first guard).
 - The kind is the branch point downstream features read. The group model's
   contribution is only that the distinction exists, is durable, and has exactly
-  **one predicate** expressing it (`Group.is_memory_scope()` in the current
-  code) rather than a `kind == "default"` comparison scattered across callers.
+  **one predicate** expressing it (`Group.is_project()` in the current code)
+  rather than a `kind == "default"` comparison scattered across callers.
 
 ## 1.3 Membership: exactly one group, chosen once (§ 2.5)
 
@@ -151,64 +154,76 @@ losing — this is the first thing that has to change.
 
 # Part 2 — What is implemented, and where
 
-Stages 0–3 have landed. **Effectively all group functionality is stage 1's**;
-the later stages consume `group_id` as a scope key and add nothing to the group
-model itself.
+This branch carries the group model and nothing that scopes by it. The two
+columns § 1.1 lists as belonging to a downstream feature —
+`groups.last_consolidated_at` and `conversations.extracted_at` /
+`extracted_id` — are **not** in this schema; the feature that owns them brings
+them when it lands. `Group.kind` is here in full, because the distinction is
+the group model's own.
 
 ## 2.1 The group model
 
 | Piece | Location |
 |---|---|
-| `Group` dataclass — `id`, `name`, `kind`, `created_at`, plus the downstream column of § 1.1 | `src/agentchat/core/memory/models.py:16-26` |
-| The single kind predicate | `src/agentchat/core/memory/models.py:24-26` |
+| `Group` dataclass — `id`, `name`, `kind`, `created_at` | `src/agentchat/core/models.py:25-38` |
+| The single kind predicate, `Group.is_project()` | `src/agentchat/core/models.py:35-38` |
 | `DEFAULT_GROUP_ID = "default"` | `src/agentchat/core/models.py:12-14` |
-| `Conversation.group_id: str = DEFAULT_GROUP_ID` — I-1 in the type | `src/agentchat/core/models.py:50-51` |
+| `Conversation.group_id: str = DEFAULT_GROUP_ID` — I-1 in the type | `src/agentchat/core/models.py:65-67` |
 
-Note the `Group` dataclass lives under `core/memory/` rather than
-`core/models.py`, a placement inherited from the plan that introduced it. Stage
-1 recorded the resulting `storage → core/memory` import as intentional.
+`Group` sits in `core/models.py` beside `Conversation`, the table it is the
+parent of. § 1.2's "exactly one predicate" is `is_project()`; a feature that
+scopes by group reads it rather than comparing `kind` itself.
 
 ## 2.2 Schema
 
 | Piece | Location |
 |---|---|
-| `groups` table | `src/agentchat/storage/schema.py:18-20` |
-| `conversations.group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE` | `src/agentchat/storage/schema.py:22-26` |
-| Default group seeded on creation (`id="default"`, `name="Chats"`, `kind="default"`) | `src/agentchat/storage/schema.py:15`, `:99-125` |
-| Old-database guard — a pre-`groups` database is **refused** with a `StorageError` naming the file, never rewritten, so first launch cannot destroy real conversations | `src/agentchat/storage/schema.py:112-119` |
-| `connect()` sets `PRAGMA foreign_keys = ON` — without it the FK above is decorative | `src/agentchat/storage/schema.py:89-97` |
+| `groups` table | `src/agentchat/storage/schema.py:19-21` |
+| `conversations.group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE` | `src/agentchat/storage/schema.py:23-26` |
+| Default group seeded on creation (`id="default"`, `name="Chats"`, `kind="default"`) | `src/agentchat/storage/schema.py:16`, `:75-80` |
+| Old-database guard — a pre-`groups` database is **refused** with a `StorageError` naming the file, never rewritten, so first launch cannot destroy real conversations | `src/agentchat/storage/schema.py:60-72` |
+| `connect()` sets `PRAGMA foreign_keys = ON` — without it the FK above is decorative | `src/agentchat/storage/schema.py:38-44` |
+
+The guard matters more than it looks: plan 001's `conversations` table already
+exists in real databases with a nullable, FK-less `group_id`, and
+`CREATE TABLE IF NOT EXISTS` would leave it exactly as it is and report
+success. § 1.8 chose "drop the database" over a migration — refusing is how
+that choice gets made deliberately instead of silently.
 
 ## 2.3 Stores
 
 | Piece | Location |
 |---|---|
-| `ConversationStore` group surface: `list_conversations(group_id)`, `list_all_conversations()`, `list_groups()`, `save_group()`, `default_group()` — null overload gone | `src/agentchat/storage/base.py:27-41` |
-| `by_default_first()` — the ordering every implementation's `list_groups` shares | `src/agentchat/storage/base.py:19-23` |
-| `InMemoryStore`: same surface, seeds the default group, and **rejects a conversation whose group does not exist** — it has no FK to do it for it, and a stub that permits what the real store forbids lets I-1 break in every test using it | `src/agentchat/storage/base.py:59-86` |
-| `SqliteStore` group methods and their sync bodies | `src/agentchat/storage/sqlite.py:34-48`, `:59-115` |
+| `ConversationStore` group surface: `list_conversations(group_id)`, `list_all_conversations()`, `list_groups()`, `save_group()`, `default_group()` — null overload gone | `src/agentchat/storage/base.py:25-39` |
+| `by_default_first()` — the ordering every implementation's `list_groups` shares | `src/agentchat/storage/base.py:18-21` |
+| `InMemoryStore`: same surface, seeds the default group, and **rejects a conversation whose group does not exist** — it has no FK to do it for it, and a stub that permits what the real store forbids lets I-1 break in every test using it | `src/agentchat/storage/base.py:52-88` |
+| `SqliteStore` group methods and their sync bodies | `src/agentchat/storage/sqlite.py:33-47`, `:76-101` |
 
 ## 2.4 Service and UI
 
 | Piece | Location |
 |---|---|
-| `new_conversation(group_id=DEFAULT_GROUP_ID)` | `src/agentchat/core/chat.py:49-50` |
-| `list_all_conversations()` passthrough | `src/agentchat/core/chat.py:59-60` |
-| UI listing call sites use `list_all_conversations()`; the picker is group-blind until stage 6 | `src/agentchat/ui/app.py:163`, `:194`, `:202` |
-| New chats always land in the default group — no picker | `src/agentchat/ui/app.py:102`, `:154` |
+| `new_conversation(group_id=DEFAULT_GROUP_ID)` | `src/agentchat/core/chat.py:40-42` |
+| `list_all_conversations()` passthrough | `src/agentchat/core/chat.py:51-52` |
+| UI listing call sites use `list_all_conversations()`; the picker is group-blind until the group tree lands | `src/agentchat/ui/app.py:121`, `:152`, `:160` |
+| New chats always land in the default group — no picker | `src/agentchat/ui/app.py:69`, `:112` |
 
 ## 2.5 Tests
 
 | Test | File |
 |---|---|
-| `test_i1_conversation_requires_a_group` — the annotation is `str`, and a null group fails through the store as `StorageError` | `tests/test_invariants.py:64-78` |
-| `test_default_group_is_seeded_and_is_not_a_memory_scope` — a fresh database has exactly one group, `kind="default"` | `tests/test_storage.py` |
+| `test_i1_conversation_requires_a_group` — the annotation is `str`, and a null group fails through the store as `StorageError` | `tests/test_invariants.py` |
+| `test_the_default_group_always_exists` | `tests/test_invariants.py` |
+| `test_default_group_is_seeded_and_is_not_a_project` — a fresh database has exactly one group, `kind="default"` | `tests/test_storage.py` |
 | `test_groups_round_trip_with_the_default_group_first` | `tests/test_storage.py` |
 | `test_saving_a_conversation_into_an_unknown_group_raises` — the FK from the conversation side | `tests/test_storage.py` |
 | `test_list_all_conversations_spans_groups_and_scoped_listing_does_not` — both readings have a name | `tests/test_storage.py` |
 | `test_list_conversations_filters_by_group_id` | `tests/test_storage.py` |
+| `test_deleting_a_group_cascades_to_its_conversations` — the cascade § 1.4 relies on, exercised by hand because nothing calls for it yet | `tests/test_storage.py` |
+| `test_a_pre_groups_database_is_refused_not_rewritten` — the guard leaves the old rows intact | `tests/test_storage.py` |
 | `test_in_memory_store_holds_i1_too` | `tests/test_storage.py` |
-| `test_store_scopes_listing_by_group` | `tests/test_core.py` |
-| `make_group()` factory; `GraphBuilder(group)` builds group → conversations → messages; `write(store, graph)` persists it | `tests/factories.py:51`, `:129-150` |
+| `test_store_scopes_listing_by_group`, `test_new_conversation_lands_in_the_group_it_was_given` | `tests/test_core.py` |
+| `make_group()` and `make_conversation()` factories | `tests/factories.py` |
 
 ---
 
@@ -216,7 +231,7 @@ Note the `Group` dataclass lives under `core/memory/` rather than
 
 | Item | State |
 |---|---|
-| **Group deletion** (§ 1.4) — the refuse-default guard, the cascade transaction, and the blast-radius counts the confirmation needs | Not implemented anywhere. The conversation store has no `delete_group`; the FK cascade would fire if a row were deleted by hand, but nothing calls for it. Planned for stage 4 |
+| **Group deletion** (§ 1.4) — the refuse-default guard, the cascade transaction, and the blast-radius counts the confirmation needs | Not implemented. The conversation store has no `delete_group`; the FK cascade fires if a row is deleted by hand, which is all `test_deleting_a_group_cascades_to_its_conversations` can pin |
 | **Group picker modal at creation** (§ 1.9, and § 2.5's only chance to get membership right) | Not started — `new_conversation()` always takes the default group |
 | **Group tree sidebar** | Not started; `ui/widgets.py` contains no group surface |
 | **Delete-with-blast-radius confirmation** | Not started |
@@ -227,11 +242,17 @@ Note the `Group` dataclass lives under `core/memory/` rather than
 - **No group can be created through the application.** `save_group` exists on
   both stores and is exercised by tests, but nothing under `src/` calls it, so
   a `project` group is currently something only a test or a `sqlite3` prompt can
-  create. Everything real runs in the seeded default group.
+  create. Everything real runs in the seeded default group. This is the gap
+  § 1.3 is least forgiving about: membership is chosen at creation or never,
+  and right now there is no way to choose.
 - **The null-`group_id` overload survives one level up.** It is gone from
-  `ConversationStore` (`src/agentchat/storage/base.py:27`), but
+  `ConversationStore` (`src/agentchat/storage/base.py:25`), but
   `ChatService.list_conversations` still accepts `group_id: str | None = None`
   and delegates to `list_all_conversations()` when it is `None`
-  (`src/agentchat/core/chat.py:52-57`). Harmless today, since the two readings
+  (`src/agentchat/core/chat.py:44-49`). Harmless today, since the two readings
   do have separate names underneath, but it is the same ambiguity § 1.8 asked to
   be removed — worth collapsing when the UI becomes group-aware.
+- **`Group.is_project()` is spelled for the group model alone.** On the branch
+  this was extracted from it reads `is_memory_scope()`, naming the feature that
+  consumes it. Same predicate, same branch point (§ 1.2); a consumer that wants
+  the other name should alias it rather than add a second `kind` comparison.

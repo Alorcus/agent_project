@@ -8,12 +8,13 @@ from agentchat.config import ConfigurationError, Settings, build_store
 from agentchat.core.chat import ChatService
 from agentchat.core.context import RecencyWindowStrategy
 from agentchat.core.errors import ModelNotFoundError, ProviderError
-from agentchat.core.models import Conversation, Message
+from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, Message
 from agentchat.llm.base import GenerationOptions, ModelInfo
 from agentchat.llm.mock import MockProvider
 from agentchat.storage.base import InMemoryStore
 from agentchat.storage.sqlite import SqliteStore
 from conftest import fast_registry
+from factories import make_group
 
 
 async def test_mock_provider_streams_multiple_chunks():
@@ -144,10 +145,23 @@ async def test_conversations_do_not_leak_into_each_other():
 
 async def test_store_scopes_listing_by_group():
     chat = ChatService(fast_registry())
-    await chat.store.save(Conversation(group_id="g1"))
-    await chat.store.save(Conversation(group_id="g2"))
-    assert len(await chat.store.list_conversations("g1")) == 1
-    assert len(await chat.store.list_conversations()) == 2
+    scoped, other = make_group(name="scoped"), make_group(name="other")
+    await chat.store.save_group(scoped)
+    await chat.store.save_group(other)
+    await chat.store.save(Conversation(group_id=scoped.id))
+    await chat.store.save(Conversation(group_id=other.id))
+    assert len(await chat.store.list_conversations(scoped.id)) == 1
+    assert len(await chat.store.list_all_conversations()) == 2
+
+
+async def test_new_conversation_lands_in_the_group_it_was_given():
+    """Membership is set here or not at all — § 2.5 allows no move later."""
+    chat = ChatService(fast_registry())
+    project = make_group()
+    await chat.store.save_group(project)
+
+    assert (await chat.new_conversation()).group_id == DEFAULT_GROUP_ID
+    assert (await chat.new_conversation(project.id)).group_id == project.id
 
 
 def test_build_store_memory_returns_in_memory_store():
