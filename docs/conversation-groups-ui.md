@@ -13,7 +13,8 @@ sidebar costs permanent horizontal space for information that is relevant at
 exactly two moments (when you create a chat, and when you go looking for one),
 and the overview modal already owns the second moment.
 
-Group *deletion* (§ 1.4) is deliberately not designed here — see Part 5.7.
+Group *deletion* (§ 1.4) was deliberately left out of the first draft; it is
+designed in Part 5.7, and lives in the chooser.
 
 ---
 
@@ -86,7 +87,7 @@ would be.
 │                                              │
 │  + New group…                                │
 │                                              │
-│  enter start here · esc cancel               │
+│ enter start here · ctrl+x delete group · esc…│
 └──────────────────────────────────────────────┘
 ```
 
@@ -233,6 +234,7 @@ in the default group.
 | `Enter` | chooser | start a conversation in the highlighted group — or, on `+ New group…`, name one first |
 | `Ctrl+L` | chat screen | the overview, now grouped |
 | `Ctrl+X` | overview | delete the highlighted conversation (unchanged; never a group) |
+| `Ctrl+X` | chooser | delete the highlighted group **and its conversations** — see Part 5.7 |
 
 `README.md`'s key table gains the `Ctrl+G` row and a note on `Ctrl+N`.
 
@@ -342,6 +344,10 @@ Through the headless pilot, in the style of `tests/test_app.py`:
 | an overview row renders the title and nothing else | the meta line is gone and does not creep back |
 | arrowing from the last row of one block to the next skips the header | the disabled-row contract |
 | deleting the last conversation of a project group leaves the header, and the restored index is not on it | Part 3.3 and 3.4 |
+| `Ctrl+X` in the chooser, then `y` → the group and its chats are gone, other groups' chats are not, and the chooser stays open | Part 5.7's delete |
+| the confirmation names the group and how many chats go with it | the blast radius, which is the whole point of asking |
+| `Ctrl+X` on the default group refuses without a prompt, and `y` afterwards deletes nothing | § 1.4's first guard, at the surface a user meets it |
+| `Ctrl+X` on the group you are currently in → a fresh unfiled conversation, and the deleted one is not written back | Part 5.7's last bullet |
 
 ---
 
@@ -387,12 +393,47 @@ trip when `Ctrl+G` is pressed cold. *Recommendation: show them* — a count is
 what tells you whether the group you are about to pick is the one you were
 thinking of. Drop it if the round trip is visible in practice.
 
-**5.7 Group deletion is out of scope here.** § 1.4 is the most destructive
-action in the application and needs its own design: the refuse-the-default
-guard, the blast-radius counts, and a confirmation that names them. The
-overview's group header rows are its natural home (`Ctrl+X` on a header), which
-is a reason to keep the headers as real rows rather than decorations — but the
-binding is not proposed yet.
+**5.7 (settled) Group deletion lives in the chooser, not the overview.**
+§ 1.4 is the most destructive action in the application. This section
+previously proposed `Ctrl+X` on an overview group header; what shipped is
+`Ctrl+X` in the **chooser** instead, because the chooser is the one surface
+that lists every group — including the empty ones, which are exactly the ones
+worth removing — and a row there is a group rather than a header above
+conversations. The overview's headers stay non-selectable, so `Ctrl+X` there
+still means "the highlighted conversation" and never silently escalates to
+its group.
+
+```
+┌─ New conversation in… ───────────────────────┐
+│  Thesis                    current  3 chats  │
+│  Cluster ops                        0 chats  │
+│  Chats                              7 chats  │
+│                                              │
+│  + New group…                                │
+│                                              │
+│ Delete "Thesis" and its 3 chats? y confirms  │
+│ — any other key cancels                      │
+└──────────────────────────────────────────────┘
+```
+
+- **The confirmation names the count**, which is what makes it mean anything
+  (§ 1.4): the chooser already holds per-group counts for its rows, so the
+  blast radius costs no extra store call.
+- **It reuses the overview's inline confirmation**, hint line and all — one
+  `_HintLine` mixin, so "only *y* confirms, any other key backs out" is
+  written once and cannot drift between the two modals.
+- **The default group refuses without asking.** `Ctrl+X` on it replaces the
+  hint with `"Chats" cannot be deleted` rather than a prompt, so there is no
+  keypress that could delete it by reflex. The store refuses it too
+  (`refuse_default_group`); the UI-side message is there to explain, not to
+  enforce.
+- **The delete does not dismiss the chooser**, exactly as in the overview: it
+  posts `DeleteRequested`, the app does the store work and hands the remaining
+  groups back through `refresh_groups`.
+- **If the group held the conversation you were in**, that conversation is
+  gone with it — § 2.5 forbids re-homing — and the chat screen behind the
+  modal falls back to a fresh, unsaved conversation in the default group. The
+  fresh one is never persisted while it is empty, so nothing is resurrected.
 
 **5.8 Should the group be visible in the status bar too?** *Recommendation:
 no.* The header states it, and the status bar is per-turn state (model,

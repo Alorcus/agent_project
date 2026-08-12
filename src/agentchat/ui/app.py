@@ -126,9 +126,8 @@ class ChatApp(App[None]):
         # Bare @work, like the picker: choosing a group must never cancel a
         # running generation.
         groups = await self._refresh_groups()
-        counts = Counter(c.group_id for c in await self.chat.list_all_conversations())
         choice = await self.push_screen_wait(
-            GroupChooser(groups, counts, self.conversation.group_id)
+            GroupChooser(groups, await self._group_counts(), self.conversation.group_id)
         )
         if choice is None:
             return
@@ -159,6 +158,40 @@ class ChatApp(App[None]):
         groups = await self.chat.list_groups()
         self._groups = {group.id: group for group in groups}
         return groups
+
+    async def _group_counts(self) -> Counter[str]:
+        """Conversations per group — the chooser's blast-radius figure, and
+        the only count it shows."""
+        return Counter(c.group_id for c in await self.chat.list_all_conversations())
+
+    async def on_group_chooser_delete_requested(
+        self, event: GroupChooser.DeleteRequested
+    ) -> None:
+        """The chooser already confirmed inline, naming what goes with the
+        group; it stays open and gets the remaining groups back."""
+        chooser = self.screen
+        if not isinstance(chooser, GroupChooser):
+            return
+        try:
+            await self.chat.delete_group(event.group_id)
+        except AgentChatError as error:
+            self.notify(str(error), severity="error")
+            return
+        groups = await self._refresh_groups()
+        if self.conversation.group_id == event.group_id:
+            # The conversation we were in went with its group, and there is
+            # nowhere to re-home it to — membership is for life. A fresh,
+            # unsaved one in the default group is what is left; persist skips
+            # it while it has no messages, so nothing is resurrected.
+            self.action_stop()
+            self.conversation = Conversation()
+            await self._show_conversation(self.conversation)
+            self._refresh_status()
+        # Escape during the store work leaves nothing to refresh.
+        if self.screen is chooser:
+            await chooser.refresh_groups(
+                groups, await self._group_counts(), self.conversation.group_id
+            )
 
     @work
     async def action_open_conversations(self) -> None:

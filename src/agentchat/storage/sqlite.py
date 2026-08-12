@@ -17,7 +17,7 @@ from pathlib import Path
 from agentchat.core.errors import StorageError
 from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, Group, Message
 from agentchat.storage import schema
-from agentchat.storage.base import by_default_first, by_recency
+from agentchat.storage.base import by_default_first, by_recency, refuse_default_group
 
 
 class SqliteStore:
@@ -41,6 +41,9 @@ class SqliteStore:
 
     async def save_group(self, group: Group) -> None:
         await asyncio.to_thread(self._save_group, group)
+
+    async def delete_group(self, group_id: str) -> None:
+        await asyncio.to_thread(self._delete_group, group_id)
 
     async def default_group(self) -> Group:
         groups = await self.list_groups()
@@ -99,6 +102,16 @@ class SqliteStore:
                 )
         except sqlite3.Error as exc:
             raise StorageError(f"failed to save group {group.id}") from exc
+
+    def _delete_group(self, group_id: str) -> None:
+        refuse_default_group(group_id)
+        try:
+            # One statement, one transaction: the FKs carry it from here to the
+            # group's conversations and on to their messages.
+            with closing(self._connect()) as conn, conn:
+                conn.execute("DELETE FROM groups WHERE id = ?", (group_id,))
+        except sqlite3.Error as exc:
+            raise StorageError(f"failed to delete group {group_id}") from exc
 
     def _load(self, conversation_id: str) -> Conversation | None:
         try:

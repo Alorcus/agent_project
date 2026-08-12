@@ -987,3 +987,197 @@ async def test_emptying_a_project_group_keeps_its_header_and_moves_the_cursor_of
 
         await pilot.press("escape")
         await pilot.pause()
+
+
+# -- deleting a group -----------------------------------------------------
+
+
+async def _wait_for_chooser_names(pilot, chooser, names: list[str]) -> None:
+    """The chooser is refreshed by the app after it has awaited the store, so
+    the new row set lands a tick or two after the confirming keypress."""
+    for _ in range(60):
+        await pilot.pause()
+        # Mid-rebuild the body is briefly gone; only a settled list counts.
+        if len(chooser.query(ListView)) == 1 and _chooser_names(chooser) == names:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"chooser never settled on {names}")
+
+
+def _chooser_current_name(chooser) -> str | None:
+    """The name of the row marked `current`, which is where the next Ctrl+N
+    would land."""
+    for row in chooser.query_one(ListView).children:
+        marks = row.query(".chooser__current")
+        if marks and str(marks.first().content) == "current":
+            return str(row.query(Static).first().content)
+    return None
+
+
+async def test_ctrl_x_in_the_chooser_deletes_the_group_and_its_conversations():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        thesis = await _project_group(app, "Thesis")
+        doomed = make_conversation(title="Chapter 3", group_id=thesis.id)
+        kept = make_conversation(title="Why is the sky blue", group_id=DEFAULT_GROUP_ID)
+        await app.chat.store.save(doomed)
+        await app.chat.store.save(kept)
+
+        chooser = await _open_chooser(pilot, app)
+        # The list opens on the current (default) group; Thesis is above it.
+        await pilot.press("up")
+        await pilot.press("ctrl+x")
+        await pilot.pause()
+
+        hint = chooser.query_one("#chooser-hint", Static)
+        # The confirmation names the blast radius, not merely the group.
+        assert "Thesis" in hint.content and "1 chat" in hint.content
+        assert "y confirms" in hint.content
+        assert hint.has_class("-confirming")
+
+        await pilot.press("y")
+        await _wait_for_chooser_names(pilot, chooser, ["Chats", "+ New group…"])
+
+        assert [g.name for g in await app.chat.list_groups()] == ["Chats"]
+        titles = {c.title for c in await app.chat.list_all_conversations()}
+        assert titles == {"Why is the sky blue"}
+        # The same screen the whole time: a delete must not close and reopen
+        # the chooser.
+        assert app.screen is chooser
+        assert not hint.has_class("-confirming")
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+
+async def test_ctrl_x_any_other_key_leaves_the_group_and_its_chats_alone():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        thesis = await _project_group(app, "Thesis")
+        await app.chat.store.save(make_conversation(title="Chapter 3", group_id=thesis.id))
+
+        chooser = await _open_chooser(pilot, app)
+        await pilot.press("up")
+        await pilot.press("ctrl+x")
+        await pilot.pause()
+
+        # A stray Enter (or anything but "y") must be the safe choice — and it
+        # must not select the highlighted group either.
+        await pilot.press("enter")
+        await pilot.pause()
+
+        hint = chooser.query_one("#chooser-hint", Static)
+        assert "y confirms" not in hint.content
+        assert not hint.has_class("-confirming")
+        assert app.screen is chooser
+        assert [g.name for g in await app.chat.list_groups()] == ["Chats", "Thesis"]
+        assert [c.title for c in await app.chat.list_all_conversations()] == ["Chapter 3"]
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+
+async def test_the_default_group_cannot_be_deleted_from_the_chooser():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await _project_group(app, "Thesis")
+        await app.chat.store.save(
+            make_conversation(title="Why is the sky blue", group_id=DEFAULT_GROUP_ID)
+        )
+
+        chooser = await _open_chooser(pilot, app)
+        # The list opens on the current group, which is the default one.
+        await pilot.press("ctrl+x")
+        await pilot.pause()
+
+        hint = chooser.query_one("#chooser-hint", Static)
+        assert "cannot be deleted" in hint.content
+        # Refused outright, not asked about: "y" must not be an answer to it.
+        assert "y confirms" not in hint.content
+        await pilot.press("y")
+        await pilot.pause()
+
+        assert [g.name for g in await app.chat.list_groups()] == ["Chats", "Thesis"]
+        assert [c.title for c in await app.chat.list_all_conversations()] == [
+            "Why is the sky blue"
+        ]
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+
+async def test_ctrl_x_on_the_new_group_row_does_nothing():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await _project_group(app, "Thesis")
+
+        chooser = await _open_chooser(pilot, app)
+        chooser.query_one(ListView).index = len(chooser.query_one(ListView).children) - 1
+        await pilot.press("ctrl+x")
+        await pilot.pause()
+
+        hint = chooser.query_one("#chooser-hint", Static)
+        assert "y confirms" not in hint.content
+        assert app.screen is chooser
+        assert len(await app.chat.list_groups()) == 2
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+
+async def test_deleting_the_group_you_are_in_leaves_a_fresh_unfiled_chat():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        thesis = await _project_group(app, "Thesis")
+        app.conversation = await app.chat.new_conversation(thesis.id)
+        await _submit(pilot, "chapter three")
+        await _wait_until_done(pilot, app)
+        doomed_id = app.conversation.id
+
+        chooser = await _open_chooser(pilot, app)
+        # The chooser opens on the group the current conversation is in.
+        await pilot.press("ctrl+x")
+        await pilot.pause()
+        await pilot.press("y")
+        await _wait_for_chooser_names(pilot, chooser, ["Chats", "+ New group…"])
+
+        # There is nowhere to re-home the conversation to, so it goes with the
+        # group and a fresh unfiled one takes its place.
+        assert app.conversation.id != doomed_id
+        assert app.conversation.group_id == DEFAULT_GROUP_ID
+        assert app.conversation.messages == []
+        assert await app.chat.list_all_conversations() == []
+        assert _chooser_current_name(chooser) == "Chats"
+
+        await pilot.press("escape")
+        await pilot.pause()
+        # Nothing was resurrected on the way out, and the chat screen shows
+        # the empty conversation rather than the deleted one.
+        assert await app.chat.store.load(doomed_id) is None
+        assert not list(app.query(MessageBubble))
+        assert "Thesis" not in _header_text(app)
+
+
+async def test_delete_group_storage_error_notifies_and_keeps_running():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await _project_group(app, "Thesis")
+
+        async def boom(group_id: str) -> None:
+            raise StorageError("boom")
+
+        app.chat.delete_group = boom
+
+        chooser = await _open_chooser(pilot, app)
+        await pilot.press("up")
+        await pilot.press("ctrl+x")
+        await pilot.pause()
+        await pilot.press("y")
+        await pilot.pause()
+
+        assert app.screen is chooser
+        assert app.is_running
+        assert len(await app.chat.list_groups()) == 2
+
+        await pilot.press("escape")
+        await pilot.pause()

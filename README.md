@@ -65,7 +65,7 @@ checkpoint fails loudly instead.
 | `Ctrl+N` | New conversation, in the group the current one belongs to |
 | `Ctrl+G` | New conversation, choosing the group — or making one |
 | `Ctrl+L` | Open the conversation overview |
-| `Ctrl+X` | Delete the highlighted conversation (in the overview) |
+| `Ctrl+X` | Delete the highlighted conversation (overview) or group (chooser) |
 | `Ctrl+O` | Cycle model |
 | `Ctrl+T` | Toggle thinking mode |
 | `Ctrl+D` | Exit |
@@ -153,7 +153,10 @@ imports a concrete backend.
   cleared in a row.
 - Conversation groups — chats can be filed into projects, chosen at creation
   with `Ctrl+G` and inherited by `Ctrl+N`. The overview shows one block per
-  group; deleting a group is not built yet.
+  group. `Ctrl+X` in the group chooser deletes a group **and every
+  conversation in it** — they are not re-homed, because a conversation's group
+  cannot change — so the confirmation names how many chats are about to go.
+  The default group is not deletable.
 
 ## Not yet built
 

@@ -213,19 +213,49 @@ async def test_list_all_conversations_spans_groups_and_scoped_listing_does_not(t
 
 
 async def test_deleting_a_group_cascades_to_its_conversations(tmp_path: Path):
-    """The FK the design leans on. Nothing calls for the delete yet (§ Part 3),
-    so this pins the cascade rather than a `delete_group` that does not exist."""
+    """Deleting a group deletes its conversations — they are not re-homed to
+    the default group, because that would be a move and there are none."""
     path = tmp_path / "chat.db"
     store = SqliteStore(path)
     project = make_group()
     await store.save_group(project)
     doomed = make_conversation(group_id=project.id)
+    kept = make_conversation(group_id=DEFAULT_GROUP_ID)
     await store.save(doomed)
+    await store.save(kept)
 
-    with closing(connect(path)) as conn, conn:
-        conn.execute("DELETE FROM groups WHERE id = ?", (project.id,))
+    await store.delete_group(project.id)
 
     assert await store.load(doomed.id) is None
+    assert await store.load(kept.id) is not None
+    assert [group.id for group in await store.list_groups()] == [DEFAULT_GROUP_ID]
+
+
+async def test_deleting_a_group_takes_its_messages_with_it(tmp_path: Path):
+    """The second half of the cascade, which nothing else can observe once the
+    conversation rows it hangs off are gone."""
+    path = tmp_path / "chat.db"
+    store = SqliteStore(path)
+    project = make_group()
+    await store.save_group(project)
+    await store.save(make_conversation(group_id=project.id))
+
+    await store.delete_group(project.id)
+
+    with closing(connect(path)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
+
+
+async def test_the_default_group_cannot_be_deleted(tmp_path: Path):
+    store = SqliteStore(tmp_path / "chat.db")
+    kept = make_conversation(group_id=DEFAULT_GROUP_ID)
+    await store.save(kept)
+
+    with pytest.raises(StorageError):
+        await store.delete_group(DEFAULT_GROUP_ID)
+
+    assert await store.default_group() is not None
+    assert await store.load(kept.id) is not None
 
 
 async def test_a_pre_groups_database_is_refused_not_rewritten(tmp_path: Path):
@@ -252,3 +282,25 @@ async def test_in_memory_store_holds_i1_too():
     with pytest.raises(StorageError):
         await store.save(make_conversation(group_id="no-such-group"))
     await store.save(make_conversation(group_id=DEFAULT_GROUP_ID))
+
+
+async def test_in_memory_group_delete_cascades_and_refuses_the_default_too():
+    """No FK to do either for it, and a stub that keeps conversations the real
+    store destroys would hide the cascade from every test using it."""
+    store = InMemoryStore()
+    project = make_group()
+    await store.save_group(project)
+    doomed = make_conversation(group_id=project.id)
+    kept = make_conversation(group_id=DEFAULT_GROUP_ID)
+    await store.save(doomed)
+    await store.save(kept)
+
+    await store.delete_group(project.id)
+
+    assert await store.load(doomed.id) is None
+    assert await store.load(kept.id) is not None
+    assert [group.id for group in await store.list_groups()] == [DEFAULT_GROUP_ID]
+
+    with pytest.raises(StorageError):
+        await store.delete_group(DEFAULT_GROUP_ID)
+    assert await store.default_group() is not None

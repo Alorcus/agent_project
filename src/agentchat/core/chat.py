@@ -56,6 +56,11 @@ class ChatService:
         await self.store.save_group(group)
         return group
 
+    async def delete_group(self, group_id: str) -> None:
+        """Takes the group's conversations with it — there is no re-homing,
+        because there is no move."""
+        await self.store.delete_group(group_id)
+
     async def switch_conversation(self, conversation_id: str) -> Conversation:
         """Resolve an id to the authoritative `Conversation` from the store.
 

@@ -194,20 +194,23 @@ that choice gets made deliberately instead of silently.
 
 | Piece | Location |
 |---|---|
-| `ConversationStore` group surface: `list_conversations(group_id)`, `list_all_conversations()`, `list_groups()`, `save_group()`, `default_group()` — null overload gone | `src/agentchat/storage/base.py:25-39` |
+| `ConversationStore` group surface: `list_conversations(group_id)`, `list_all_conversations()`, `list_groups()`, `save_group()`, `delete_group()`, `default_group()` — null overload gone | `src/agentchat/storage/base.py:31-54` |
 | `by_default_first()` — the ordering every implementation's `list_groups` shares | `src/agentchat/storage/base.py:18-21` |
-| `InMemoryStore`: same surface, seeds the default group, and **rejects a conversation whose group does not exist** — it has no FK to do it for it, and a stub that permits what the real store forbids lets I-1 break in every test using it | `src/agentchat/storage/base.py:52-88` |
-| `SqliteStore` group methods and their sync bodies | `src/agentchat/storage/sqlite.py:33-47`, `:76-101` |
+| `refuse_default_group()` — § 1.4's first guard, shared by both implementations because neither the schema nor an FK can express it | `src/agentchat/storage/base.py:24-28` |
+| `InMemoryStore`: same surface, seeds the default group, **rejects a conversation whose group does not exist**, and cascades a group delete by hand — it has no FK to do either for it, and a stub that permits what the real store forbids lets I-1 break in every test using it | `src/agentchat/storage/base.py:67-112` |
+| `SqliteStore` group methods and their sync bodies; `delete_group` is one `DELETE FROM groups` and lets the FKs carry it to conversations and messages | `src/agentchat/storage/sqlite.py:39-50`, `:93-114` |
 
 ## 2.4 Service and UI
 
 | Piece | Location |
 |---|---|
 | `new_conversation(group_id=DEFAULT_GROUP_ID)` | `src/agentchat/core/chat.py` |
-| `list_all_conversations()`, `list_groups()`, `create_group(name)` | `src/agentchat/core/chat.py` |
+| `list_all_conversations()`, `list_groups()`, `create_group(name)`, `delete_group(group_id)` | `src/agentchat/core/chat.py` |
 | The `group › title` header, and the group-name cache it renders from | `src/agentchat/ui/widgets.py`, `src/agentchat/ui/app.py` |
 | `Ctrl+G` group chooser; `Ctrl+N` inherits the current conversation's group | `src/agentchat/ui/screens.py`, `src/agentchat/ui/app.py` |
 | Grouped conversation overview, default group's block last | `src/agentchat/ui/screens.py` |
+| `Ctrl+X` in the chooser: the blast-radius confirmation and the delete it guards | `src/agentchat/ui/screens.py`, `src/agentchat/ui/app.py` |
+| `_HintLine` — the hint row and its inline confirmation, shared by both modals so "only *y* deletes" is written once | `src/agentchat/ui/screens.py` |
 
 The UI these describe is designed in `docs/conversation-groups-ui.md`, which
 supersedes § 1.9's first two bullets: there is no group tree sidebar.
@@ -223,7 +226,11 @@ supersedes § 1.9's first two bullets: there is no group tree sidebar.
 | `test_saving_a_conversation_into_an_unknown_group_raises` — the FK from the conversation side | `tests/test_storage.py` |
 | `test_list_all_conversations_spans_groups_and_scoped_listing_does_not` — both readings have a name | `tests/test_storage.py` |
 | `test_list_conversations_filters_by_group_id` | `tests/test_storage.py` |
-| `test_deleting_a_group_cascades_to_its_conversations` — the cascade § 1.4 relies on, exercised by hand because nothing calls for it yet | `tests/test_storage.py` |
+| `test_deleting_a_group_cascades_to_its_conversations`, `test_deleting_a_group_takes_its_messages_with_it` — § 1.4's cascade, both halves | `tests/test_storage.py` |
+| `test_the_default_group_cannot_be_deleted`, and `…_from_the_chooser` for the same guard as a user meets it | `tests/test_storage.py`, `tests/test_app.py` |
+| `test_in_memory_group_delete_cascades_and_refuses_the_default_too` | `tests/test_storage.py` |
+| `test_ctrl_x_in_the_chooser_deletes_the_group_and_its_conversations` — including the count in the confirmation | `tests/test_app.py` |
+| `test_deleting_the_group_you_are_in_leaves_a_fresh_unfiled_chat` — no re-homing, and nothing resurrected | `tests/test_app.py` |
 | `test_a_pre_groups_database_is_refused_not_rewritten` — the guard leaves the old rows intact | `tests/test_storage.py` |
 | `test_in_memory_store_holds_i1_too` | `tests/test_storage.py` |
 | `test_store_scopes_listing_by_group`, `test_new_conversation_lands_in_the_group_it_was_given` | `tests/test_core.py` |
@@ -235,9 +242,14 @@ supersedes § 1.9's first two bullets: there is no group tree sidebar.
 
 | Item | State |
 |---|---|
-| **Group deletion** (§ 1.4) — the refuse-default guard, the cascade transaction, and the blast-radius counts the confirmation needs | Not implemented. The conversation store has no `delete_group`; the FK cascade fires if a row is deleted by hand, which is all `test_deleting_a_group_cascades_to_its_conversations` can pin |
-| **Delete-with-blast-radius confirmation** | Not started. The overview's group header rows are its natural home, which is why they are real `ListItem`s rather than decorations |
+| **Group deletion** (§ 1.4) — the refuse-default guard, the cascade transaction, and the blast-radius count | Implemented; see § 2.3 and § 2.4. The count the confirmation states is conversations, which is what the chooser already holds — messages are not counted separately |
+| **Delete-with-blast-radius confirmation** | Implemented in the **chooser** (`Ctrl+X`), not on the overview's group headers as § 5.7 of the UI design guessed. The chooser is where a group is already the thing being pointed at, and it is the one surface listing every group, including empty ones |
 | **Group tree sidebar** | Dropped, not deferred — the UI design replaces it with a header breadcrumb and group blocks in the overview |
+
+The one behaviour § 1.4 does not settle is what the screen shows afterwards
+when the deleted group held the conversation you were in. There is nothing to
+re-home it to, so the chat screen falls back to a fresh, unsaved conversation
+in the default group, and the chooser stays open with `current` moved to it.
 
 ## Deviations worth knowing
 

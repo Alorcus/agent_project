@@ -21,6 +21,13 @@ def by_default_first(groups: list[Group]) -> list[Group]:
     return sorted(groups, key=lambda g: (g.is_project(), g.created_at))
 
 
+def refuse_default_group(group_id: str) -> None:
+    """The guard every `delete_group` opens with: the default group is what a
+    conversation lands in when no other is chosen, so it always exists."""
+    if group_id == DEFAULT_GROUP_ID:
+        raise StorageError("the default group cannot be deleted")
+
+
 class ConversationStore(Protocol):
     async def list_conversations(self, group_id: str = DEFAULT_GROUP_ID) -> list[Conversation]:
         """Most-recently-updated first, scoped to one group."""
@@ -35,6 +42,14 @@ class ConversationStore(Protocol):
         ...
 
     async def save_group(self, group: Group) -> None: ...
+
+    async def delete_group(self, group_id: str) -> None:
+        """Delete the group **and its conversations** — membership is bound
+        for life, so they are not re-homed to the default group.
+
+        Raises `StorageError` for the default group, which is not deletable.
+        """
+        ...
 
     async def default_group(self) -> Group: ...
 
@@ -70,6 +85,15 @@ class InMemoryStore:
 
     async def save_group(self, group: Group) -> None:
         self._groups[group.id] = group
+
+    async def delete_group(self, group_id: str) -> None:
+        refuse_default_group(group_id)
+        self._groups.pop(group_id, None)
+        # The cascade SQLite's FK does, by hand.
+        for conversation_id in [
+            c.id for c in self._items.values() if c.group_id == group_id
+        ]:
+            del self._items[conversation_id]
 
     async def default_group(self) -> Group:
         return self._groups[DEFAULT_GROUP_ID]
