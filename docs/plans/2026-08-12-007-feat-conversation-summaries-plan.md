@@ -13,9 +13,10 @@ depth: standard
 
 **Origin requirements:** `docs/requirements.md` (NFR-S-02, NFR-S-04, NFR-CTX-01,
 NFR-U-04, NFR-U-07, NFR-Q-02/03)
-**Target repo:** this repo (`agentchat`), branch `feat/groups`
-**Numbering:** 002–006 are taken by the memory-pipeline stage plans on
-`feat/memory-pipeline`; this plan is 007 so the two branches can coexist.
+**Target repo:** this repo (`agentchat`), branch `feat/conversation-extraction`
+**Numbering:** 002–006 are taken by the memory-pipeline stage plans, now on
+`experimental/memory-pipeline` and on hold; this plan is 007 so the numbering
+does not collide if that work resumes.
 
 ---
 
@@ -41,9 +42,12 @@ against a table that will already be stable.
 ## Problem Frame
 
 `Group` exists, membership is immutable, and `conversations.group_id` is NOT
-NULL with a cascade (`docs/conversation-groups.md` Part 2). What does not exist
-is anything that *scopes data by group* — the design extract says so outright:
-*"This branch carries the group model and nothing that scopes by it."*
+NULL with a cascade (`storage/schema.py`; verified directly, since
+`docs/conversation-groups.md` — the design doc this was drafted against — was
+removed once the group model landed). What does not exist is anything that
+*scopes data by group*: `list_conversations(group_id)` filters which
+conversations show up, and that is the whole of it — nothing derived is
+scoped, indexed, or even stored per group.
 
 So NFR-S-02 ("memory MUST be scoped to groups of chats") has a container and no
 contents. Concretely:
@@ -72,8 +76,9 @@ Out of scope, and not touched by any unit here: rendering summaries or keywords
 anywhere in the UI; injecting them into a prompt or into `ContextStrategy`
 (that is the recall half of NFR-S-02, and its own plan); group-level
 consolidation and the `groups.last_consolidated_at` column reserved for it;
-keyword search; the GUM-style fragment pipeline on `feat/memory-pipeline`;
-adaptive RAG; sub-agents; fine-tuned adapters.
+keyword search; the GUM-style fragment pipeline on
+`experimental/memory-pipeline` (on hold); adaptive RAG; sub-agents; fine-tuned
+adapters.
 
 ---
 
@@ -108,12 +113,14 @@ conversation makes R7's "overwritten, never duplicated" a property of the schema
 rather than of the code. `ON DELETE CASCADE` gives R8 for free.
 
 **KTD2 — The reserved column names stay reserved.**
-`docs/conversation-groups.md` § 1.1 names three columns owned by a downstream
-feature: `groups.last_consolidated_at` and
-`conversations.extracted_at` / `extracted_id`. Those belong to the fragment
-pipeline on `feat/memory-pipeline`, whose watermark semantics are not these.
-This plan touches none of them and adds no column to `conversations` or
-`groups`, so the two features can land in either order.
+`groups.last_consolidated_at` and `conversations.extracted_at` /
+`extracted_id` are columns reserved for the fragment pipeline on
+`experimental/memory-pipeline` (design doc `docs/conversation-groups.md` §1.1;
+removed from the repo once the group model landed, but the reservation still
+holds). That branch is on hold and not a concern for this plan's sequencing,
+but the columns cost nothing to keep clear: this plan touches none of them and
+adds no column to `conversations` or `groups`, so the two features can still
+land in either order whenever that work resumes.
 
 **KTD3 — `group_id` is copied into the summary row, not JOINed.**
 § 1.1's rule: *derive what is mutable, copy what is immutable.* Membership is
@@ -247,8 +254,8 @@ sequenceDiagram
     EX->>P: complete(SUMMARY prompt)  temp=0, thinking=off
     P-->>EX: summary text
     EX->>P: complete(KEYWORDS prompt over the summary)
-    P-->>EX: "a; b; c"
-    EX->>EX: parse_keywords(...) → up to 5
+    P-->>EX: "a, b, c"
+    EX->>EX: parse_keywords(...) > up to 5
     EX-->>CS: ConversationSummary
     CS->>S: save_summary(...)  upsert on conversation_id
 ```
@@ -653,7 +660,8 @@ stores.
    `overrides.setdefault("extract_summaries", False)`. Extraction is off for the
    existing suite so no current test grows two silent LLM calls per switch;
    the tests that are *about* extraction pass `extract_summaries=True`
-   explicitly. Same reasoning as the existing `store="memory"` default.
+   explicitly. Same reasoning as `mock_settings`'s existing `mock_chunk_delay` /
+   `mock_load_delay` defaults: safe and fast unless a test opts in.
 
 **Patterns to follow:** the `backend` / `store` fields and
 `_require_choice`; `mock_settings`'s existing `setdefault` block and the
@@ -917,8 +925,8 @@ eight verification steps performed, 7 and 8 on a GPU node; `README.md` and
 ### Not in scope
 
 Adaptive RAG, sub-agent deployment, the context-management elective, fine-tuned
-adapters, and the fragment pipeline on `feat/memory-pipeline`. None are touched
-by any unit here.
+adapters, and the fragment pipeline on `experimental/memory-pipeline` (on
+hold). None are touched by any unit here.
 
 ---
 
@@ -962,7 +970,7 @@ length; adjust after U8.
 | `Ctrl+D` is shadowed by `Input.delete_right`, so the quit trigger silently does nothing. | Confirmed by probe, not assumed. U7 step 1 fixes it and its first test is the regression guard. |
 | A small model answers the keyword prompt in prose, and keywords are empty everywhere. | Defensive parser (U1) with a documented fallback, KTD9 keeping the summary regardless, and U8 as the check that says whether it is actually happening. |
 | Extraction doubles the LLM calls per session and slows the demo. | `AGENTCHAT_EXTRACT_SUMMARIES=0` switches it off; the watermark stops repeat work; the quit path is bounded by `AGENTCHAT_EXTRACTION_TIMEOUT`. |
-| `conversation_summaries` collides with the schema on `feat/memory-pipeline` at merge time. | KTD2: no shared column and no shared table name; the reserved column names are left untouched. |
+| `conversation_summaries` collides with the schema on `experimental/memory-pipeline` (on hold) if that work resumes. | KTD2: no shared column and no shared table name; the reserved column names are left untouched. |
 | A summary row outlives its conversation, breaking NFR-S-04. | Two FKs with `ON DELETE CASCADE`, `PRAGMA foreign_keys = ON` already set per connection, and U2's two-hop cascade test. |
 
 ---
@@ -972,23 +980,27 @@ length; adjust after U8.
 - `docs/requirements.md` — NFR-S-02/03/04, NFR-CTX-01, NFR-U-04/07,
   NFR-Q-01/02/03, and Open Decision #6 (a summarisation adapter as one of the
   two fine-tunes).
-- `docs/conversation-groups.md` — § 1.1 (the reserved columns, and "copy what is
-  immutable"), § 1.3 (membership is immutable, which is what makes KTD3 safe),
-  § 1.4 (the group cascade this table joins), Part 2 ("nothing that scopes by
-  it" — the gap this plan fills).
-- `docs/plans/2026-08-10-001-feat-conversation-switching-plan.md` — KTD5 (sqlite
-  on a worker thread), KTD7 (the priority-binding trade, taken the other way in
-  KTD10), KTD8 (the UI performs the work), Q2 (full hydration in
-  `list_conversations`).
+- `docs/conversation-groups.md` — the design doc this plan's group-model facts
+  (§ 1.1 the reserved columns and "copy what is immutable", § 1.3 immutable
+  membership behind KTD3, § 1.4 the group cascade this table joins, Part 2
+  "nothing that scopes by it" — the gap this plan fills) were drafted against.
+  Removed from the repo once the group model landed; the same facts are now
+  verifiable directly in `core/models.py` and `storage/schema.py`.
+- `docs/plans/2026-08-10-001-feat-conversation-switching-plan.md` — the source
+  for KTD5 (sqlite on a worker thread), KTD7 (the priority-binding trade, taken
+  the other way in KTD10), KTD8 (the UI performs the work), and Q2 (full
+  hydration in `list_conversations`). Also removed once landed; verify those
+  directly against `storage/sqlite.py` and `ui/app.py`.
 - `src/agentchat/llm/local.py` — the single `_thread` / `_stop` pair and
   `_settle()`, which is why KTD7 exists; the `temperature > 0` greedy branch
   behind KTD6.
 - `src/agentchat/core/context.py` — `estimate_tokens`, reused for budgeting;
   `RecencyWindowStrategy`'s bias, which is why KTD8 does not reuse it.
-- `feat/memory-pipeline`'s stage-2 plan — read for overlap. It agrees on two
-  points reached independently here: extraction takes the resident provider
-  rather than loading its own, and an unparseable reply is "nothing worth
-  saying" rather than a failure. Its fragment model is deliberately not adopted.
+- `experimental/memory-pipeline`'s stage-2 plan (branch on hold) — read for
+  overlap. It agrees on two points reached independently here: extraction
+  takes the resident provider rather than loading its own, and an unparseable
+  reply is "nothing worth saying" rather than a failure. Its fragment model is
+  deliberately not adopted.
 - Verified against installed textual 8.2.8: `Input.BINDINGS` binds
   `delete,ctrl+d` → `delete_right`; `App.BINDINGS` is `ctrl+q` → `quit` and
   `ctrl+c` → `help_quit`; `App.action_quit` is a coroutine that calls
