@@ -9,7 +9,6 @@ import pytest
 
 from agentchat.core.errors import StorageError
 from agentchat.core.models import DEFAULT_GROUP_ID, Message
-from agentchat.storage.base import InMemoryStore
 from agentchat.storage.schema import connect
 from agentchat.storage.sqlite import SqliteStore
 
@@ -274,33 +273,3 @@ async def test_a_pre_groups_database_is_refused_not_rewritten(tmp_path: Path):
 
     with closing(sqlite3.connect(path)) as conn:
         assert conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 1
-
-
-async def test_in_memory_store_holds_i1_too():
-    store = InMemoryStore()
-
-    with pytest.raises(StorageError):
-        await store.save(make_conversation(group_id="no-such-group"))
-    await store.save(make_conversation(group_id=DEFAULT_GROUP_ID))
-
-
-async def test_in_memory_group_delete_cascades_and_refuses_the_default_too():
-    """No FK to do either for it, and a stub that keeps conversations the real
-    store destroys would hide the cascade from every test using it."""
-    store = InMemoryStore()
-    project = make_group()
-    await store.save_group(project)
-    doomed = make_conversation(group_id=project.id)
-    kept = make_conversation(group_id=DEFAULT_GROUP_ID)
-    await store.save(doomed)
-    await store.save(kept)
-
-    await store.delete_group(project.id)
-
-    assert await store.load(doomed.id) is None
-    assert await store.load(kept.id) is not None
-    assert [group.id for group in await store.list_groups()] == [DEFAULT_GROUP_ID]
-
-    with pytest.raises(StorageError):
-        await store.delete_group(DEFAULT_GROUP_ID)
-    assert await store.default_group() is not None

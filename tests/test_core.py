@@ -11,7 +11,6 @@ from agentchat.core.errors import ModelNotFoundError, ProviderError
 from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, Message
 from agentchat.llm.base import GenerationOptions, ModelInfo
 from agentchat.llm.mock import MockProvider
-from agentchat.storage.base import InMemoryStore
 from agentchat.storage.sqlite import SqliteStore
 from conftest import fast_registry
 from factories import make_group
@@ -73,9 +72,9 @@ def test_context_strategy_keeps_everything_when_it_fits():
     assert decision.messages == messages
 
 
-async def test_chat_service_records_both_turns_and_provenance():
+async def test_chat_service_records_both_turns_and_provenance(store):
     registry = fast_registry()
-    chat = ChatService(registry)
+    chat = ChatService(registry, store=store)
     conversation = await chat.new_conversation()
 
     chunks = [c async for c in chat.stream_reply(conversation, "hello there")]
@@ -86,11 +85,11 @@ async def test_chat_service_records_both_turns_and_provenance():
     assert conversation.title.startswith("hello there")
 
 
-async def test_stopping_mid_stream_keeps_the_partial_reply():
+async def test_stopping_mid_stream_keeps_the_partial_reply(store):
     # Needs a real mid-generation gap to cancel into — fast_registry()'s
     # default near-zero delay would finish before the sleep below.
     registry = fast_registry(mock_chunk_delay=None, mock_load_delay=None)
-    chat = ChatService(registry)
+    chat = ChatService(registry, store=store)
     conversation = await chat.new_conversation()
 
     async def consume():
@@ -108,12 +107,13 @@ async def test_stopping_mid_stream_keeps_the_partial_reply():
     assert reply.role == "assistant"
     assert reply.content, "a stopped reply keeps what it produced"
     stored = await chat.store.load(conversation.id)
-    assert stored is conversation
+    assert stored is not None
+    assert stored.messages[1].content == reply.content
 
 
-async def test_thinking_option_changes_the_output():
+async def test_thinking_option_changes_the_output(store):
     registry = fast_registry()
-    chat = ChatService(registry)
+    chat = ChatService(registry, store=store)
     plain_conv = await chat.new_conversation()
     plain = "".join([c async for c in chat.stream_reply(plain_conv, "q")])
 
@@ -129,9 +129,9 @@ async def test_thinking_option_changes_the_output():
     assert len(thought) > len(plain)
 
 
-async def test_conversations_do_not_leak_into_each_other():
+async def test_conversations_do_not_leak_into_each_other(store):
     registry = fast_registry()
-    chat = ChatService(registry)
+    chat = ChatService(registry, store=store)
     a = await chat.new_conversation()
     b = await chat.new_conversation()
 
@@ -143,8 +143,8 @@ async def test_conversations_do_not_leak_into_each_other():
     assert all("alpha" not in m.content for m in b.messages)
 
 
-async def test_store_scopes_listing_by_group():
-    chat = ChatService(fast_registry())
+async def test_store_scopes_listing_by_group(store):
+    chat = ChatService(fast_registry(), store=store)
     scoped, other = make_group(name="scoped"), make_group(name="other")
     await chat.store.save_group(scoped)
     await chat.store.save_group(other)
@@ -154,9 +154,9 @@ async def test_store_scopes_listing_by_group():
     assert len(await chat.store.list_all_conversations()) == 2
 
 
-async def test_new_conversation_lands_in_the_group_it_was_given():
+async def test_new_conversation_lands_in_the_group_it_was_given(store):
     """Membership is set here or not at all — § 2.5 allows no move later."""
-    chat = ChatService(fast_registry())
+    chat = ChatService(fast_registry(), store=store)
     project = make_group()
     await chat.store.save_group(project)
 
@@ -164,9 +164,9 @@ async def test_new_conversation_lands_in_the_group_it_was_given():
     assert (await chat.new_conversation(project.id)).group_id == project.id
 
 
-def test_build_store_memory_returns_in_memory_store():
-    store = build_store(Settings(backend="mock", store="memory"))
-    assert isinstance(store, InMemoryStore)
+def test_build_store_memory_raises_configuration_error():
+    with pytest.raises(ConfigurationError):
+        build_store(Settings(backend="mock", store="memory"))
 
 
 def test_build_store_sqlite_returns_sqlite_store_and_creates_parent(tmp_path):

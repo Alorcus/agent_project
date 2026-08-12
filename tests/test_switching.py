@@ -5,18 +5,17 @@ import pytest
 from agentchat.core.chat import ChatService
 from agentchat.core.errors import StorageError
 from agentchat.core.models import Conversation
-from agentchat.storage.base import InMemoryStore
 from agentchat.storage.sqlite import SqliteStore
 from conftest import fast_registry
 
 
-async def test_list_all_conversations_on_fresh_service_is_empty():
-    chat = ChatService(fast_registry())
+async def test_list_all_conversations_on_fresh_service_is_empty(store):
+    chat = ChatService(fast_registry(), store=store)
     assert await chat.list_all_conversations() == []
 
 
-async def test_list_all_conversations_returns_most_recently_updated_first():
-    chat = ChatService(fast_registry())
+async def test_list_all_conversations_returns_most_recently_updated_first(store):
+    chat = ChatService(fast_registry(), store=store)
     a = await chat.new_conversation()
     b = await chat.new_conversation()
 
@@ -29,8 +28,8 @@ async def test_list_all_conversations_returns_most_recently_updated_first():
     assert [c.id for c in listed] == [b.id, a.id]
 
 
-async def test_new_conversation_alone_does_not_appear_in_listing():
-    chat = ChatService(fast_registry())
+async def test_new_conversation_alone_does_not_appear_in_listing(store):
+    chat = ChatService(fast_registry(), store=store)
     conversation = await chat.new_conversation()
 
     assert await chat.list_all_conversations() == []
@@ -42,8 +41,8 @@ async def test_new_conversation_alone_does_not_appear_in_listing():
     assert [c.id for c in listed] == [conversation.id]
 
 
-async def test_persist_skips_empty_conversation():
-    chat = ChatService(fast_registry())
+async def test_persist_skips_empty_conversation(store):
+    chat = ChatService(fast_registry(), store=store)
     conversation = Conversation()
 
     await chat.persist(conversation)
@@ -51,8 +50,8 @@ async def test_persist_skips_empty_conversation():
     assert await chat.store.load(conversation.id) is None
 
 
-async def test_persist_stores_conversation_with_messages():
-    chat = ChatService(fast_registry())
+async def test_persist_stores_conversation_with_messages(store):
+    chat = ChatService(fast_registry(), store=store)
     conversation = Conversation()
     conversation.add_user("hi")
 
@@ -63,8 +62,8 @@ async def test_persist_stores_conversation_with_messages():
     assert stored.id == conversation.id
 
 
-async def test_switch_conversation_returns_stored_messages():
-    chat = ChatService(fast_registry())
+async def test_switch_conversation_returns_stored_messages(store):
+    chat = ChatService(fast_registry(), store=store)
     conversation = await chat.new_conversation()
     async for _ in chat.stream_reply(conversation, "hello"):
         pass
@@ -76,14 +75,14 @@ async def test_switch_conversation_returns_stored_messages():
     ]
 
 
-async def test_switch_conversation_unknown_id_raises_storage_error():
-    chat = ChatService(fast_registry())
+async def test_switch_conversation_unknown_id_raises_storage_error(store):
+    chat = ChatService(fast_registry(), store=store)
     with pytest.raises(StorageError):
         await chat.switch_conversation("does-not-exist")
 
 
-async def test_switch_conversation_resets_last_turn():
-    chat = ChatService(fast_registry())
+async def test_switch_conversation_resets_last_turn(store):
+    chat = ChatService(fast_registry(), store=store)
     a = await chat.new_conversation()
     b = await chat.new_conversation()
     async for _ in chat.stream_reply(a, "hello"):
@@ -99,8 +98,8 @@ async def test_switch_conversation_resets_last_turn():
     assert chat.last_turn is None
 
 
-async def test_delete_conversation_removes_it_from_listing():
-    chat = ChatService(fast_registry())
+async def test_delete_conversation_removes_it_from_listing(store):
+    chat = ChatService(fast_registry(), store=store)
     conversation = await chat.new_conversation()
     async for _ in chat.stream_reply(conversation, "hello"):
         pass
@@ -109,10 +108,6 @@ async def test_delete_conversation_removes_it_from_listing():
     await chat.delete_conversation(conversation.id)
 
     assert await chat.list_all_conversations() == []
-
-
-async def test_switch_round_trip_does_not_corrupt_conversations_in_memory():
-    await _assert_round_trip_no_corruption(InMemoryStore())
 
 
 async def test_switch_round_trip_does_not_corrupt_conversations_sqlite(tmp_path):

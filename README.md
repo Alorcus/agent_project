@@ -87,7 +87,7 @@ Environment variables, all prefixed `AGENTCHAT_`:
 | `AGENTCHAT_MODEL_ROOT` | `/sc/projects/sci-lippert/intelligent-agents/model_checkpoints` | Where the checkpoints live |
 | `AGENTCHAT_MODEL` | first registered | Model selected at startup (`phi-4-mini`, `qwen3-14b`) |
 | `AGENTCHAT_MAX_CONTEXT` | unset | Cap every model's context window, for a smaller GPU |
-| `AGENTCHAT_STORE` | `sqlite` | `sqlite` for durable storage, `memory` for the non-durable stub |
+| `AGENTCHAT_STORE` | `sqlite` | `sqlite` is the only store |
 | `AGENTCHAT_DATA_DIR` | `./data` | Where `agentchat.db` lives (the `sqlite` store) |
 | `AGENTCHAT_CORPUS_DIR` | `./corpus` | RAG ingestion source (not yet used) |
 | `AGENTCHAT_SIMULATE_FAILURE` | `0` | Make the second model fail on load, to exercise error handling |
@@ -119,7 +119,7 @@ src/agentchat/
     local.py       real backend (transformers)
     mock.py        the stub backend
   storage/
-    base.py        ConversationStore protocol + in-memory implementation
+    base.py        ConversationStore protocol + shared ordering/guard helpers
     schema.py      the DDL, the default-group seed, and the old-database guard
     sqlite.py      durable implementation — three tables, one save per turn
   ui/
@@ -145,8 +145,9 @@ imports a concrete backend.
 - Backend failure surfaces as a UI error, not a crash — set
   `AGENTCHAT_SIMULATE_FAILURE=1` and switch to the second model to see it.
 - Assistant messages record which model produced them.
-- Durable storage — conversations survive a restart via `SqliteStore`.
-  `InMemoryStore` remains available with `AGENTCHAT_STORE=memory`.
+- Durable storage — conversations survive a restart via `SqliteStore`. For a
+  throwaway run, point `AGENTCHAT_DATA_DIR` at a scratch directory, e.g.
+  `AGENTCHAT_DATA_DIR=$(mktemp -d) uv run agentchat`.
 - Conversation list, switching and deletion — `Ctrl+L` opens an overview of
   saved conversations and switches to one; `Ctrl+X` deletes the highlighted
   one behind a confirmation, and the overview stays open so several can be

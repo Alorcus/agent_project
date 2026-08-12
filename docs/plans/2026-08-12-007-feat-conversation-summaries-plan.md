@@ -214,7 +214,6 @@ flowchart TD
     subgraph storage["storage/"]
         Proto["ConversationStore<br/>+ save_summary / summary / list_summaries"]
         Sql["SqliteStore"]
-        Mem["InMemoryStore"]
     end
 
     App -->|"@work(group=extraction)"| CS
@@ -226,7 +225,6 @@ flowchart TD
     EX -.produces.-> MD
     Proto -.stores.-> MD
     Sql -.implements.-> Proto
-    Mem -.implements.-> Proto
 ```
 
 `ExtractionService` knows nothing about storage: it returns an object and
@@ -446,20 +444,13 @@ provider and no store in the picture.
    model_id=excluded.model_id, updated_at=excluded.updated_at` — `created_at` is
    omitted from the SET list on purpose, so it keeps meaning "first summarised".
    Wrap `sqlite3.Error` in `StorageError` like every neighbour.
-5. `InMemoryStore`: a `dict[str, ConversationSummary]`, and — as with
-   `delete_group`'s hand-written cascade — `delete()` pops the conversation's
-   summary and `delete_group()` pops every summary whose `group_id` matches.
-   A stub that keeps orphans the real store cannot hold would let R8 break in
-   every test using it.
-6. `tests/factories.py`: `make_summary(**overrides)` beside the existing
+5. `tests/factories.py`: `make_summary(**overrides)` beside the existing
    factories.
 
 **Patterns to follow:** `_save_group` / `_list_groups` in `storage/sqlite.py`
-for the to_thread + `closing(self._connect())` + `StorageError` shape;
-`InMemoryStore.delete_group` for the by-hand cascade and its comment.
+for the to_thread + `closing(self._connect())` + `StorageError` shape.
 
-**Test scenarios** (add to `tests/test_storage.py`, parameterised over both
-stores where the assertion is not SQL-specific):
+**Test scenarios** (add to `tests/test_storage.py`):
 - Round-trip: save a summary, read it back from a *new* `SqliteStore` on the
   same path — summary text, keyword tuple, `covered_messages`, `model_id` and
   both timezone-aware timestamps all match.
@@ -473,8 +464,6 @@ stores where the assertion is not SQL-specific):
 - Deleting the group removes its conversations *and* their summary rows — the
   two-hop cascade, which is the one R8 case the FKs could get wrong.
 - `list_summaries("g1")` returns only `g1`'s, most-recently-updated first.
-- `InMemoryStore` matches on all of the above that are not raw-SQL assertions,
-  including both cascades.
 - Saving a summary for a conversation that does not exist raises `StorageError`
   (the FK from the summary side).
 
@@ -597,7 +586,7 @@ and no app.
      → `None` (R7/KTD4)
    - `async with self._provider_lock:` run the extractor
    - carry `existing.created_at` onto the new row if there was one, so
-     "first summarised" survives an overwrite even in `InMemoryStore`
+     "first summarised" survives an overwrite
    - `await self.store.save_summary(summary)`; return it
    - The two LLM calls happen **outside** any store transaction, and the write
      is one call at the end.
@@ -618,8 +607,7 @@ loudly.
 **Patterns to follow:** `ChatService.persist` — a method whose whole reason to
 exist is one rule, stated in its docstring.
 
-**Test scenarios** (`tests/test_extraction.py`, against `InMemoryStore` and
-`SqliteStore(tmp_path)`):
+**Test scenarios** (`tests/test_extraction.py`, against `SqliteStore(tmp_path)`):
 - `summarise()` on a conversation with no messages stores nothing and returns
   `None`.
 - `summarise()` on a two-message conversation stores a row readable through
@@ -975,7 +963,7 @@ length; adjust after U8.
 | A small model answers the keyword prompt in prose, and keywords are empty everywhere. | Defensive parser (U1) with a documented fallback, KTD9 keeping the summary regardless, and U8 as the check that says whether it is actually happening. |
 | Extraction doubles the LLM calls per session and slows the demo. | `AGENTCHAT_EXTRACT_SUMMARIES=0` switches it off; the watermark stops repeat work; the quit path is bounded by `AGENTCHAT_EXTRACTION_TIMEOUT`. |
 | `conversation_summaries` collides with the schema on `feat/memory-pipeline` at merge time. | KTD2: no shared column and no shared table name; the reserved column names are left untouched. |
-| A summary row outlives its conversation, breaking NFR-S-04. | Two FKs with `ON DELETE CASCADE`, `PRAGMA foreign_keys = ON` already set per connection, the by-hand cascade in `InMemoryStore`, and U2's two-hop cascade test. |
+| A summary row outlives its conversation, breaking NFR-S-04. | Two FKs with `ON DELETE CASCADE`, `PRAGMA foreign_keys = ON` already set per connection, and U2's two-hop cascade test. |
 
 ---
 

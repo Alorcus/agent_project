@@ -40,16 +40,23 @@ def _guard_real_database(monkeypatch: pytest.MonkeyPatch) -> None:
         if Path(path).resolve().is_relative_to(_REAL_DATA_DIR):
             raise AssertionError(
                 f"refusing to open the real database at {path!r} — "
-                "pass a tmp_path-based path, or use Settings(store='memory')"
+                "pass a tmp_path-based path"
             )
         original_init(self, path, *args, **kwargs)
 
     monkeypatch.setattr(SqliteStore, "__init__", guarded_init)
 
 
+@pytest.fixture
+def store(tmp_path: Path) -> SqliteStore:
+    """A throwaway durable store — the default for tests that need a
+    ChatService and do not care where it persists."""
+    return SqliteStore(tmp_path / "chat.db")
+
+
 def mock_settings(**overrides) -> Settings:
-    """The stub backend and the non-durable store — the default for tests
-    that are about interface behaviour, not real inference or persistence.
+    """The stub backend — the default for tests that are about interface
+    behaviour, not real inference.
 
     Defaults to near-zero mock timing so tests that just drain a stream to
     completion don't pay for realistic load/chunk delays. Tests that assert
@@ -58,7 +65,7 @@ def mock_settings(**overrides) -> Settings:
     to opt back into ``mock.default_models()``'s realistic timing.
     """
     overrides.setdefault("backend", "mock")
-    overrides.setdefault("store", "memory")
+    overrides.setdefault("store", "sqlite")
     overrides.setdefault("mock_chunk_delay", 0.0)
     overrides.setdefault("mock_load_delay", 0.0)
     return Settings(**overrides)

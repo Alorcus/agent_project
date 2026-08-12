@@ -31,7 +31,7 @@ src/agentchat/
   config.py        settings + the single wiring point for backends and stores
   core/            domain model, chat orchestration, context strategy, errors
   llm/             LLMProvider protocol, mock + local (transformers) backends, registry
-  storage/         ConversationStore protocol, in-memory and SQLite implementations
+  storage/         ConversationStore protocol and its SQLite implementation
   ui/              Textual application, widgets, and modal screens
 ```
 

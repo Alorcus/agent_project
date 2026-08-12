@@ -21,7 +21,7 @@ from agentchat.llm.local import default_models as local_models
 from agentchat.llm.mock import MockProvider
 from agentchat.llm.mock import default_models as mock_models
 from agentchat.llm.registry import ModelRegistry
-from agentchat.storage.base import ConversationStore, InMemoryStore
+from agentchat.storage.base import ConversationStore
 from agentchat.storage.sqlite import SqliteStore
 
 ENV_PREFIX = "AGENTCHAT_"
@@ -35,9 +35,10 @@ load_dotenv(find_dotenv(usecwd=True))
 #: UI can be developed and tested on a machine with no GPU.
 BACKENDS = ("local", "mock")
 
-#: ``sqlite`` persists across restarts; ``memory`` is the non-durable stub,
-#: kept for tests and for working without touching disk.
-STORES = ("sqlite", "memory")
+#: ``sqlite`` is the only store. Kept as a tuple (not deleted outright) so a
+#: stale ``AGENTCHAT_STORE=memory`` in a ``.env`` fails loudly via
+#: ``_require_choice`` rather than being silently ignored.
+STORES = ("sqlite",)
 
 
 class ConfigurationError(AgentChatError):
@@ -150,8 +151,6 @@ def build_registry(settings: Settings) -> ModelRegistry:
 def build_store(settings: Settings) -> ConversationStore:
     """Assemble the conversation store. The only place stores are named."""
     _require_choice("STORE", settings.store, STORES)
-    if settings.store == "memory":
-        return InMemoryStore()
     return SqliteStore(settings.data_dir / "agentchat.db")
 
 

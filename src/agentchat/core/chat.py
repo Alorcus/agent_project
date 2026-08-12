@@ -14,7 +14,7 @@ from agentchat.core.errors import StorageError
 from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, Group, Message
 from agentchat.llm.base import GenerationOptions
 from agentchat.llm.registry import ModelRegistry
-from agentchat.storage.base import ConversationStore, InMemoryStore
+from agentchat.storage.base import ConversationStore
 
 
 @dataclass
@@ -29,11 +29,11 @@ class ChatService:
     def __init__(
         self,
         registry: ModelRegistry,
-        store: ConversationStore | None = None,
+        store: ConversationStore,
         context_strategy: ContextStrategy | None = None,
     ) -> None:
         self.registry = registry
-        self.store = store or InMemoryStore()
+        self.store = store
         self.context_strategy = context_strategy or RecencyWindowStrategy()
         self.last_turn: TurnResult | None = None
 
@@ -64,9 +64,9 @@ class ChatService:
     async def switch_conversation(self, conversation_id: str) -> Conversation:
         """Resolve an id to the authoritative `Conversation` from the store.
 
-        The single place id -> object resolution happens, so callers never
-        need to guess whether `store.load` returns the same instance they
-        already hold (`InMemoryStore` does; `SqliteStore` doesn't).
+        `store.load` returns a fresh instance, not the one a caller already
+        holds — callers must not compare what they hold against what they
+        load by identity.
         """
         conversation = await self.store.load(conversation_id)
         if conversation is None:
