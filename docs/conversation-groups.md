@@ -1,0 +1,237 @@
+# Conversation groups — design extract and implementation status
+
+**Sources:** `docs/plans/memory-and-groups.md` (v6), the skeleton
+`docs/plans/2026-08-10-002-memory-and-groups-skeleton.md`, and the landed stage
+plans (`…-003-memory-stage-0-scaffolding.md`,
+`…-004-memory-stage-1-schema-and-stores.md`,
+`…-005-memory-stage-2-extraction-write-path.md`,
+`…-006-memory-stage-3-read-path.md`).
+
+**Scope of this file:** groups as a feature of their own — what a group is, how
+a conversation acquires one, how they are listed, and what deleting one means.
+Features that *scope data by group* specify their own behaviour in their own
+documents; nothing about them is restated here, including the two columns the
+schema carries on their behalf (§ 1.1). Part 2 records what exists in the tree
+today, checked against `src/` rather than taken from the plans.
+
+---
+
+# Part 1 — What the design plans for groups
+
+## 1.1 What a group is
+
+A group is the container a conversation belongs to, and the unit downstream
+features scope by.
+
+| Field | Meaning |
+|---|---|
+| `id` | PK, text |
+| `name` | display name |
+| `kind` | `default` or `project` — the only field that carries behaviour |
+| `created_at` | ordering key for listing |
+
+Relation: `GROUPS ||--o{ CONVERSATIONS`. The FK is NOT NULL and CASCADE, so the
+database cannot represent a conversation without a group (I-1) nor a
+conversation whose group is gone.
+
+Two further columns exist on these tables and are **not part of the group
+model**: `groups.last_consolidated_at` and the pair
+`conversations.extracted_at` / `conversations.extracted_id`. They are trigger
+and watermark state owned by the feature that scopes by group; the group model
+neither reads nor maintains them.
+
+## 1.2 Two kinds, and the group that is always there
+
+`kind` is `default` or `project`.
+
+- **The default group is seeded with the schema** and is the group a
+  conversation lands in when no other is chosen. It always exists, so no code
+  path has to handle its absence.
+- **It is not deletable** (§ 2.4.1's first guard).
+- The kind is the branch point downstream features read. The group model's
+  contribution is only that the distinction exists, is durable, and has exactly
+  **one predicate** expressing it (`Group.is_memory_scope()` in the current
+  code) rather than a `kind == "default"` comparison scattered across callers.
+
+## 1.3 Membership: exactly one group, chosen once (§ 2.5)
+
+A conversation is assigned its group **at creation** and **bound to it for
+life**.
+
+What immutability buys is that anything derived per group can copy the group id
+instead of deriving it by JOIN, with no risk of drift (§ 1.1's "derive what is
+mutable, copy what is immutable").
+
+What it costs, stated plainly in the design: **you cannot retroactively file a
+chat into a project.** Starting a conversation, realising three turns in that it
+belongs to an existing project, and moving it there is a thing both ChatGPT and
+Claude support and this design does not. The mitigation is entirely at creation
+time — **the new-conversation flow has to make the group choice obvious and
+cheap, because it is the only chance to get it right.**
+
+## 1.4 Deleting a group (§ 2.4.1)
+
+**Deleting a group deletes its conversations.** They are *not* re-homed to the
+default group: re-homing is a move, and § 2.5 forbids moves. Permitting it would
+make the immutability claim false in exactly one path, which is the path
+everything derived per group relies on.
+
+```
+delete group G
+  ├─ is G the default group? → refuse
+  ├─ confirm, naming the blast radius
+  └─ one transaction:
+       DELETE group G
+         → cascade: conversations in G → their messages
+```
+
+- **The confirmation has to state the blast radius**, not merely ask. Under the
+  old move-to-default behaviour a group delete lost the grouping and kept the
+  content, which is recoverable-ish; now it destroys conversations and messages
+  outright, making it the most destructive action in the application (NFR-U-06).
+  The count of what is about to go is what makes the confirmation mean anything.
+  Features that scope data by group contribute their own counts and their own
+  cascade.
+- "For life" is meant literally, including here. The obvious escape hatch —
+  re-home a group's conversations instead of deleting them — is the one thing
+  § 2.5 cannot permit. If that ever feels too harsh, the section to reopen is
+  § 2.5, not this one.
+
+## 1.5 Listing
+
+| Method | Contract |
+|---|---|
+| `list_conversations(group_id)` | one group's conversations, most-recently-updated first. `group_id` is **required** |
+| `list_all_conversations()` | every conversation regardless of group |
+| `list_groups()` | **default group first**, then by `created_at` — the tree wants a stable order and the default group is the one that is always there |
+| `save_group(group)` | create or update |
+| `default_group()` | the seeded group |
+
+`list_conversations(group_id=None)` meaning "every conversation" is the nullable
+ambiguity I-1 exists to remove; the unfiltered case gets its own method instead
+(§ 1.8).
+
+## 1.6 Ownership
+
+**The conversation store owns `groups` rows** — it is what the UI's group tree
+reads through, and the only thing that creates a group. Stores that merely scope
+by group read the table and never write it.
+
+## 1.7 Invariants
+
+| ID | Invariant | Enforced by |
+|---|---|---|
+| I-1 | Every conversation belongs to exactly one group; `group_id` is NOT NULL | schema (FK) and the type (`str`, not `str \| None`) |
+| — | The default group always exists and is not deletable | schema seed; the delete guard |
+
+## 1.8 Knock-on corrections to plan 001
+
+Plan 001 shipped `conversations.group_id TEXT` — nullable, no FK, no `groups`
+table. This design supersedes that schema, with **no migration path, written
+deliberately**: single-user prototype, so the resolution is to drop the
+development database and recreate it. There is no `PRAGMA user_version` and none
+is proposed. If that stops being true — a second user, or data anyone minds
+losing — this is the first thing that has to change.
+
+- `conversations.group_id` becomes NOT NULL with an FK to `groups`, so the
+  database cannot represent a state I-1 forbids.
+- `list_conversations(group_id=None)`'s null overload is removed.
+
+## 1.9 UI (all of it stage 6 in the skeleton)
+
+- **Group picker modal at creation** — the one chance § 2.5 allows. NFR-P-03: a
+  modal, no drag-and-drop.
+- **Group tree sidebar** (`ui/widgets.py`), reading through the conversation
+  store, default group first.
+- **Delete-with-blast-radius confirmation** (§ 1.4).
+- The conversation header states which group a chat belongs to, in a place that
+  does not repeat per turn.
+
+---
+
+# Part 2 — What is implemented, and where
+
+Stages 0–3 have landed. **Effectively all group functionality is stage 1's**;
+the later stages consume `group_id` as a scope key and add nothing to the group
+model itself.
+
+## 2.1 The group model
+
+| Piece | Location |
+|---|---|
+| `Group` dataclass — `id`, `name`, `kind`, `created_at`, plus the downstream column of § 1.1 | `src/agentchat/core/memory/models.py:16-26` |
+| The single kind predicate | `src/agentchat/core/memory/models.py:24-26` |
+| `DEFAULT_GROUP_ID = "default"` | `src/agentchat/core/models.py:12-14` |
+| `Conversation.group_id: str = DEFAULT_GROUP_ID` — I-1 in the type | `src/agentchat/core/models.py:50-51` |
+
+Note the `Group` dataclass lives under `core/memory/` rather than
+`core/models.py`, a placement inherited from the plan that introduced it. Stage
+1 recorded the resulting `storage → core/memory` import as intentional.
+
+## 2.2 Schema
+
+| Piece | Location |
+|---|---|
+| `groups` table | `src/agentchat/storage/schema.py:18-20` |
+| `conversations.group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE` | `src/agentchat/storage/schema.py:22-26` |
+| Default group seeded on creation (`id="default"`, `name="Chats"`, `kind="default"`) | `src/agentchat/storage/schema.py:15`, `:99-125` |
+| Old-database guard — a pre-`groups` database is **refused** with a `StorageError` naming the file, never rewritten, so first launch cannot destroy real conversations | `src/agentchat/storage/schema.py:112-119` |
+| `connect()` sets `PRAGMA foreign_keys = ON` — without it the FK above is decorative | `src/agentchat/storage/schema.py:89-97` |
+
+## 2.3 Stores
+
+| Piece | Location |
+|---|---|
+| `ConversationStore` group surface: `list_conversations(group_id)`, `list_all_conversations()`, `list_groups()`, `save_group()`, `default_group()` — null overload gone | `src/agentchat/storage/base.py:27-41` |
+| `by_default_first()` — the ordering every implementation's `list_groups` shares | `src/agentchat/storage/base.py:19-23` |
+| `InMemoryStore`: same surface, seeds the default group, and **rejects a conversation whose group does not exist** — it has no FK to do it for it, and a stub that permits what the real store forbids lets I-1 break in every test using it | `src/agentchat/storage/base.py:59-86` |
+| `SqliteStore` group methods and their sync bodies | `src/agentchat/storage/sqlite.py:34-48`, `:59-115` |
+
+## 2.4 Service and UI
+
+| Piece | Location |
+|---|---|
+| `new_conversation(group_id=DEFAULT_GROUP_ID)` | `src/agentchat/core/chat.py:49-50` |
+| `list_all_conversations()` passthrough | `src/agentchat/core/chat.py:59-60` |
+| UI listing call sites use `list_all_conversations()`; the picker is group-blind until stage 6 | `src/agentchat/ui/app.py:163`, `:194`, `:202` |
+| New chats always land in the default group — no picker | `src/agentchat/ui/app.py:102`, `:154` |
+
+## 2.5 Tests
+
+| Test | File |
+|---|---|
+| `test_i1_conversation_requires_a_group` — the annotation is `str`, and a null group fails through the store as `StorageError` | `tests/test_invariants.py:64-78` |
+| `test_default_group_is_seeded_and_is_not_a_memory_scope` — a fresh database has exactly one group, `kind="default"` | `tests/test_storage.py` |
+| `test_groups_round_trip_with_the_default_group_first` | `tests/test_storage.py` |
+| `test_saving_a_conversation_into_an_unknown_group_raises` — the FK from the conversation side | `tests/test_storage.py` |
+| `test_list_all_conversations_spans_groups_and_scoped_listing_does_not` — both readings have a name | `tests/test_storage.py` |
+| `test_list_conversations_filters_by_group_id` | `tests/test_storage.py` |
+| `test_in_memory_store_holds_i1_too` | `tests/test_storage.py` |
+| `test_store_scopes_listing_by_group` | `tests/test_core.py` |
+| `make_group()` factory; `GraphBuilder(group)` builds group → conversations → messages; `write(store, graph)` persists it | `tests/factories.py:51`, `:129-150` |
+
+---
+
+# Part 3 — Group work not yet implemented
+
+| Item | State |
+|---|---|
+| **Group deletion** (§ 1.4) — the refuse-default guard, the cascade transaction, and the blast-radius counts the confirmation needs | Not implemented anywhere. The conversation store has no `delete_group`; the FK cascade would fire if a row were deleted by hand, but nothing calls for it. Planned for stage 4 |
+| **Group picker modal at creation** (§ 1.9, and § 2.5's only chance to get membership right) | Not started — `new_conversation()` always takes the default group |
+| **Group tree sidebar** | Not started; `ui/widgets.py` contains no group surface |
+| **Delete-with-blast-radius confirmation** | Not started |
+| **Group name in the conversation header** | Not started |
+
+## Deviations worth knowing
+
+- **No group can be created through the application.** `save_group` exists on
+  both stores and is exercised by tests, but nothing under `src/` calls it, so
+  a `project` group is currently something only a test or a `sqlite3` prompt can
+  create. Everything real runs in the seeded default group.
+- **The null-`group_id` overload survives one level up.** It is gone from
+  `ConversationStore` (`src/agentchat/storage/base.py:27`), but
+  `ChatService.list_conversations` still accepts `group_id: str | None = None`
+  and delegates to `list_all_conversations()` when it is `None`
+  (`src/agentchat/core/chat.py:52-57`). Harmless today, since the two readings
+  do have separate names underneath, but it is the same ambiguity § 1.8 asked to
+  be removed — worth collapsing when the UI becomes group-aware.
