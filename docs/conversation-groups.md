@@ -203,10 +203,14 @@ that choice gets made deliberately instead of silently.
 
 | Piece | Location |
 |---|---|
-| `new_conversation(group_id=DEFAULT_GROUP_ID)` | `src/agentchat/core/chat.py:40-42` |
-| `list_all_conversations()` passthrough | `src/agentchat/core/chat.py:51-52` |
-| UI listing call sites use `list_all_conversations()`; the picker is group-blind until the group tree lands | `src/agentchat/ui/app.py:121`, `:152`, `:160` |
-| New chats always land in the default group — no picker | `src/agentchat/ui/app.py:69`, `:112` |
+| `new_conversation(group_id=DEFAULT_GROUP_ID)` | `src/agentchat/core/chat.py` |
+| `list_all_conversations()`, `list_groups()`, `create_group(name)` | `src/agentchat/core/chat.py` |
+| The `group › title` header, and the group-name cache it renders from | `src/agentchat/ui/widgets.py`, `src/agentchat/ui/app.py` |
+| `Ctrl+G` group chooser; `Ctrl+N` inherits the current conversation's group | `src/agentchat/ui/screens.py`, `src/agentchat/ui/app.py` |
+| Grouped conversation overview, default group's block last | `src/agentchat/ui/screens.py` |
+
+The UI these describe is designed in `docs/conversation-groups-ui.md`, which
+supersedes § 1.9's first two bullets: there is no group tree sidebar.
 
 ## 2.5 Tests
 
@@ -232,26 +236,11 @@ that choice gets made deliberately instead of silently.
 | Item | State |
 |---|---|
 | **Group deletion** (§ 1.4) — the refuse-default guard, the cascade transaction, and the blast-radius counts the confirmation needs | Not implemented. The conversation store has no `delete_group`; the FK cascade fires if a row is deleted by hand, which is all `test_deleting_a_group_cascades_to_its_conversations` can pin |
-| **Group picker modal at creation** (§ 1.9, and § 2.5's only chance to get membership right) | Not started — `new_conversation()` always takes the default group |
-| **Group tree sidebar** | Not started; `ui/widgets.py` contains no group surface |
-| **Delete-with-blast-radius confirmation** | Not started |
-| **Group name in the conversation header** | Not started |
+| **Delete-with-blast-radius confirmation** | Not started. The overview's group header rows are its natural home, which is why they are real `ListItem`s rather than decorations |
+| **Group tree sidebar** | Dropped, not deferred — the UI design replaces it with a header breadcrumb and group blocks in the overview |
 
 ## Deviations worth knowing
 
-- **No group can be created through the application.** `save_group` exists on
-  both stores and is exercised by tests, but nothing under `src/` calls it, so
-  a `project` group is currently something only a test or a `sqlite3` prompt can
-  create. Everything real runs in the seeded default group. This is the gap
-  § 1.3 is least forgiving about: membership is chosen at creation or never,
-  and right now there is no way to choose.
-- **The null-`group_id` overload survives one level up.** It is gone from
-  `ConversationStore` (`src/agentchat/storage/base.py:25`), but
-  `ChatService.list_conversations` still accepts `group_id: str | None = None`
-  and delegates to `list_all_conversations()` when it is `None`
-  (`src/agentchat/core/chat.py:44-49`). Harmless today, since the two readings
-  do have separate names underneath, but it is the same ambiguity § 1.8 asked to
-  be removed — worth collapsing when the UI becomes group-aware.
 - **`Group.is_project()` is spelled for the group model alone.** On the branch
   this was extracted from it reads `is_memory_scope()`, naming the feature that
   consumes it. Same predicate, same branch point (§ 1.2); a consumer that wants

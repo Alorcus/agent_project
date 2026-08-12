@@ -7,6 +7,7 @@ scrolling, switching models and stopping all stay live while tokens arrive.
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from pathlib import Path
 
 from textual import work
@@ -14,15 +15,15 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, VerticalScroll
 from textual.screen import Screen
-from textual.widgets import Footer, Header, Input, Static
+from textual.widgets import Footer, Input, Static
 
 from agentchat.config import Settings, build_registry, build_store
 from agentchat.core.chat import ChatService
 from agentchat.core.errors import AgentChatError, ModelNotFoundError
-from agentchat.core.models import Conversation, Message
+from agentchat.core.models import Conversation, Group, Message
 from agentchat.llm.base import GenerationOptions
-from agentchat.ui.screens import ConversationPicker
-from agentchat.ui.widgets import MessageBubble
+from agentchat.ui.screens import ConversationPicker, GroupChooser
+from agentchat.ui.widgets import ConversationHeader, MessageBubble
 
 _GENERATION_GROUP = "generation"
 
@@ -35,6 +36,7 @@ class ChatApp(App[None]):
         Binding("ctrl+d", "quit", "Exit"),
         Binding("escape", "stop", "Stop"),
         Binding("ctrl+n", "new_conversation", "New chat"),
+        Binding("ctrl+g", "choose_group", "New chat in…"),
         Binding("ctrl+l", "open_conversations", "Chats"),
         Binding("ctrl+o", "cycle_model", "Model"),
         Binding("ctrl+t", "toggle_thinking", "Thinking"),
@@ -49,11 +51,14 @@ class ChatApp(App[None]):
         self.options = GenerationOptions()
         self.status_text = ""
         self._generating = False
+        # The header renders synchronously and holds only a group id, so it
+        # cannot await the store per repaint.
+        self._groups: dict[str, Group] = {}
 
     # -- composition ------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
+        yield ConversationHeader(id="conversation-header")
         yield VerticalScroll(
             Static(self._placeholder_text(), classes="placeholder"),
             id="chat-log",
@@ -66,6 +71,10 @@ class ChatApp(App[None]):
         yield Footer()
 
     async def on_mount(self) -> None:
+        await self._refresh_groups()
+        # The first conversation of a session has no current group to inherit
+        # and nothing has been typed yet, so it lands in the default group
+        # rather than opening the chooser. Ctrl+G is right there.
         self.conversation = await self.chat.new_conversation()
         self._chat_screen.query_one("#prompt", Input).focus()
         self._refresh_status()
@@ -107,20 +116,58 @@ class ChatApp(App[None]):
         self.workers.cancel_group(self, _GENERATION_GROUP)
 
     async def action_new_conversation(self) -> None:
+        """Instant, and inherits the current conversation's group — the group
+        you are in is the one you were last thinking about. The header states
+        which it is, which is what keeps inheritance from surprising anyone."""
+        await self._start_conversation(self.conversation.group_id)
+
+    @work
+    async def action_choose_group(self) -> None:
+        # Bare @work, like the picker: choosing a group must never cancel a
+        # running generation.
+        groups = await self._refresh_groups()
+        counts = Counter(c.group_id for c in await self.chat.list_all_conversations())
+        choice = await self.push_screen_wait(
+            GroupChooser(groups, counts, self.conversation.group_id)
+        )
+        if choice is None:
+            return
+        kind, chosen = choice
+        if kind == "existing":
+            await self._start_conversation(chosen)
+            return
+        # The chooser does no I/O, so creating the group happens here and a
+        # StorageError surfaces through notify rather than inside a modal with
+        # no way to report it.
+        try:
+            group = await self.chat.create_group(chosen)
+        except AgentChatError as error:
+            self.notify(str(error), severity="error")
+            return
+        await self._refresh_groups()
+        await self._start_conversation(group.id)
+
+    async def _start_conversation(self, group_id: str) -> None:
         self.action_stop()
         await self.chat.persist(self.conversation)
-        self.conversation = await self.chat.new_conversation()
+        self.conversation = await self.chat.new_conversation(group_id)
         await self._show_conversation(self.conversation)
         self._refresh_status()
         self._chat_screen.query_one("#prompt", Input).focus()
+
+    async def _refresh_groups(self) -> list[Group]:
+        groups = await self.chat.list_groups()
+        self._groups = {group.id: group for group in groups}
+        return groups
 
     @work
     async def action_open_conversations(self) -> None:
         # Bare @work (not the generation group, not exclusive): opening the
         # picker must never cancel a running generation.
         conversations = await self.chat.list_all_conversations()
+        groups = await self._refresh_groups()
         result = await self.push_screen_wait(
-            ConversationPicker(conversations, self.conversation.id)
+            ConversationPicker(conversations, self.conversation.id, groups)
         )
         if result is None:
             return
@@ -129,6 +176,10 @@ class ChatApp(App[None]):
             await self._switch_to(conversation_id)
         elif action == "new":
             await self.action_new_conversation()
+        elif action == "choose":
+            # The picker is already gone, so the chooser is pushed after it
+            # rather than on top of it.
+            self.action_choose_group()
 
     async def on_conversation_picker_delete_requested(
         self, event: ConversationPicker.DeleteRequested
@@ -267,3 +318,16 @@ class ChatApp(App[None]):
         bar = self._chat_screen.query_one("#statusbar", Static)
         bar.set_class(busy is not None, "-busy")
         bar.update(self.status_text)
+        self._refresh_header()
+
+    def _refresh_header(self) -> None:
+        """Folded into `_refresh_status` so the two cannot drift: every point
+        where the conversation changes already refreshes the status bar, and
+        the header picks up the auto-derived title at the first streamed chunk
+        for free."""
+        group = self._groups.get(self.conversation.group_id)
+        header = self._chat_screen.query_one("#conversation-header", ConversationHeader)
+        header.show(
+            self.conversation.title,
+            group_name=group.name if group is not None and group.is_project() else None,
+        )

@@ -10,12 +10,12 @@ from agentchat.storage.sqlite import SqliteStore
 from conftest import fast_registry
 
 
-async def test_list_conversations_on_fresh_service_is_empty():
+async def test_list_all_conversations_on_fresh_service_is_empty():
     chat = ChatService(fast_registry())
-    assert await chat.list_conversations() == []
+    assert await chat.list_all_conversations() == []
 
 
-async def test_list_conversations_returns_most_recently_updated_first():
+async def test_list_all_conversations_returns_most_recently_updated_first():
     chat = ChatService(fast_registry())
     a = await chat.new_conversation()
     b = await chat.new_conversation()
@@ -25,7 +25,7 @@ async def test_list_conversations_returns_most_recently_updated_first():
     async for _ in chat.stream_reply(b, "second"):
         pass
 
-    listed = await chat.list_conversations()
+    listed = await chat.list_all_conversations()
     assert [c.id for c in listed] == [b.id, a.id]
 
 
@@ -33,12 +33,12 @@ async def test_new_conversation_alone_does_not_appear_in_listing():
     chat = ChatService(fast_registry())
     conversation = await chat.new_conversation()
 
-    assert await chat.list_conversations() == []
+    assert await chat.list_all_conversations() == []
 
     async for _ in chat.stream_reply(conversation, "hello"):
         pass
 
-    listed = await chat.list_conversations()
+    listed = await chat.list_all_conversations()
     assert [c.id for c in listed] == [conversation.id]
 
 
@@ -104,11 +104,11 @@ async def test_delete_conversation_removes_it_from_listing():
     conversation = await chat.new_conversation()
     async for _ in chat.stream_reply(conversation, "hello"):
         pass
-    assert len(await chat.list_conversations()) == 1
+    assert len(await chat.list_all_conversations()) == 1
 
     await chat.delete_conversation(conversation.id)
 
-    assert await chat.list_conversations() == []
+    assert await chat.list_all_conversations() == []
 
 
 async def test_switch_round_trip_does_not_corrupt_conversations_in_memory():

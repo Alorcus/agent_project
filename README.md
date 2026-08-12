@@ -62,12 +62,20 @@ checkpoint fails loudly instead.
 |---|---|
 | `Enter` | Send |
 | `Escape` | Stop the running generation |
-| `Ctrl+N` | New conversation |
+| `Ctrl+N` | New conversation, in the group the current one belongs to |
+| `Ctrl+G` | New conversation, choosing the group — or making one |
 | `Ctrl+L` | Open the conversation overview |
 | `Ctrl+X` | Delete the highlighted conversation (in the overview) |
 | `Ctrl+O` | Cycle model |
 | `Ctrl+T` | Toggle thinking mode |
 | `Ctrl+D` | Exit |
+
+`Ctrl+N` inherits rather than asking: working inside a project means starting
+several chats inside it, so the group you are in is a better guess than "no
+group" is. The line at the top of the screen states which group that is, and
+so answers "where will the next chat land?" before you press it. A
+conversation's group is fixed at creation and cannot be changed afterwards,
+which is why `Ctrl+G` exists and why the header is worth a permanent row.
 
 ## Configuration
 
@@ -116,8 +124,8 @@ src/agentchat/
     sqlite.py      durable implementation — three tables, one save per turn
   ui/
     app.py         Textual application
-    widgets.py     message bubbles
-    screens.py     conversation picker, with its inline delete confirmation
+    widgets.py     message bubbles and the group/title header
+    screens.py     conversation overview and group chooser
     app.tcss       styling
 ```
 
@@ -143,6 +151,9 @@ imports a concrete backend.
   saved conversations and switches to one; `Ctrl+X` deletes the highlighted
   one behind a confirmation, and the overview stays open so several can be
   cleared in a row.
+- Conversation groups — chats can be filed into projects, chosen at creation
+  with `Ctrl+G` and inherited by `Ctrl+N`. The overview shows one block per
+  group; deleting a group is not built yet.
 
 ## Not yet built
 

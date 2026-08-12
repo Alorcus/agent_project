@@ -8,12 +8,43 @@ grows.
 from __future__ import annotations
 
 from textual.app import ComposeResult
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.widgets import Static
 
 from agentchat.core.models import Message
 
 _ROLE_LABEL = {"user": "You", "assistant": "Assistant", "system": "System"}
+
+_SEPARATOR = "  ›  "
+
+
+class ConversationHeader(Horizontal):
+    """The line above the chat: `group › title`, or the title alone.
+
+    The default group prints as no group at all — it is the absence of one as
+    far as a user is concerned, and prefixing every unfiled chat with it would
+    make the common case look like the special one.
+
+    Two children rather than one styled line: `$text-muted` is `auto 60%`,
+    which only the CSS engine can resolve against a background, so the two
+    halves have to be separate widgets to be coloured differently. It buys the
+    widths as well — the group sizes to its content and the title takes the
+    rest, so the title is what an overflow ellipsises.
+    """
+
+    def compose(self) -> ComposeResult:
+        # markup=False on both: group names and titles alike are user text,
+        # so a chat opening with "[bold]" is text and not a tag — the same
+        # trap MessageBubble avoids.
+        yield Static("", id="header-group", markup=False)
+        yield Static("", id="header-title", markup=False)
+
+    def show(self, title: str, group_name: str | None = None) -> None:
+        group = self.query_one("#header-group", Static)
+        group.display = group_name is not None
+        if group_name is not None:
+            group.update(f"{group_name}{_SEPARATOR}")
+        self.query_one("#header-title", Static).update(title)
 
 
 class MessageBubble(Vertical):

@@ -2,6 +2,27 @@ Screen {
     layers: base;
 }
 
+#conversation-header {
+    dock: top;
+    height: 1;
+    padding: 0 2;
+    background: $panel;
+}
+
+#header-group {
+    width: auto;
+    color: $text-muted;
+}
+
+/* The title takes what is left, so it is the half an overflow eats — the
+   group name is fixed-width per group and never ellipsises, which is what
+   keeps the line from jittering as you switch chats. */
+#header-title {
+    width: 1fr;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
 #chat-log {
     height: 1fr;
     padding: 1 2;
@@ -79,16 +100,27 @@ Screen {
     padding: 1 0;
 }
 
-ConversationPicker {
+ConversationPicker, GroupChooser {
     align: center middle;
 }
 
-#picker {
-    width: 60;
+/* 62 = the round border's two cells, this padding's four, and the 56 the
+   hint line needs: "enter switch · ctrl+g group · ctrl+x delete · esc
+   cancel" is 56 exactly, and a fifth binding here would need a second row. */
+#picker, #chooser {
+    width: 62;
     max-height: 80%;
     border: round $accent;
     background: $panel;
     padding: 1 2;
+}
+
+#chooser {
+    height: auto;
+}
+
+#chooser-body {
+    height: auto;
 }
 
 .picker__title {
@@ -111,10 +143,55 @@ ConversationPicker {
     text-style: bold;
 }
 
-.picker__meta {
+.picker__group {
+    text-style: bold;
+}
+
+.picker__group-empty {
     color: $text-muted;
+    padding-left: 4;
+}
+
+/* Indentation is the whole "these belong to that header" signal now that
+   rows are a single line with no vertical rhythm between them. */
+.picker__item.-nested {
+    padding-left: 4;
 }
 
 .picker__item.-current {
     color: $accent;
+    text-style: bold;
+}
+
+#picker-body > ListItem.-spaced, #chooser-body > ListItem.-spaced {
+    margin-top: 1;
+}
+
+.chooser__row {
+    height: 1;
+}
+
+/* Naming a group edits the row in place, so the field has to occupy one
+   line like the label it replaced — an Input's default border is three. */
+#group-name {
+    height: 1;
+    border: none;
+    padding: 0;
+    background: $panel;
+}
+
+.chooser__name {
+    width: 1fr;
+}
+
+.chooser__current {
+    width: auto;
+    padding-right: 2;
+    color: $text-muted;
+}
+
+.chooser__count {
+    width: 8;
+    text-align: right;
+    color: $text-muted;
 }

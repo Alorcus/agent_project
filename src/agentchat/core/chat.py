@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 from agentchat.core.context import ContextDecision, ContextStrategy, RecencyWindowStrategy
 from agentchat.core.errors import StorageError
-from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, Message
+from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, Group, Message
 from agentchat.llm.base import GenerationOptions
 from agentchat.llm.registry import ModelRegistry
 from agentchat.storage.base import ConversationStore, InMemoryStore
@@ -41,15 +41,20 @@ class ChatService:
         """Membership is chosen here and bound for life — there is no move."""
         return Conversation(group_id=group_id)
 
-    async def list_conversations(self, group_id: str | None = None) -> list[Conversation]:
-        """Every conversation when `group_id` is omitted, one group's
-        otherwise — the picker is group-blind until it grows a group tree."""
-        if group_id is None:
-            return await self.store.list_all_conversations()
+    async def list_conversations(self, group_id: str) -> list[Conversation]:
         return await self.store.list_conversations(group_id)
 
     async def list_all_conversations(self) -> list[Conversation]:
         return await self.store.list_all_conversations()
+
+    async def list_groups(self) -> list[Group]:
+        return await self.store.list_groups()
+
+    async def create_group(self, name: str) -> Group:
+        """The only way a group comes into existence in the application."""
+        group = Group(name=name)
+        await self.store.save_group(group)
+        return group
 
     async def switch_conversation(self, conversation_id: str) -> Conversation:
         """Resolve an id to the authoritative `Conversation` from the store.
