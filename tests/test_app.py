@@ -397,7 +397,7 @@ async def test_ctrl_x_shows_inline_confirm_and_y_deletes():
         await pilot.pause()
 
         hint = app.screen.query_one("#picker-hint")
-        assert "y confirms" in hint.content
+        assert "Y confirms" in hint.content
         assert hint.has_class("-confirming")
 
         await pilot.press("y")
@@ -1032,7 +1032,7 @@ async def test_ctrl_x_in_the_chooser_deletes_the_group_and_its_conversations():
         hint = chooser.query_one("#chooser-hint", Static)
         # The confirmation names the blast radius, not merely the group.
         assert "Thesis" in hint.content and "1 chat" in hint.content
-        assert "y confirms" in hint.content
+        assert "Y confirms" in hint.content
         assert hint.has_class("-confirming")
 
         await pilot.press("y")
