@@ -23,8 +23,9 @@ from agentchat.llm.registry import ModelRegistry
 
 SUMMARY_MAX_TOKENS = 256
 KEYWORDS_MAX_TOKENS = 64
-#: Head-room for the instruction text around the transcript.
-PROMPT_OVERHEAD_TOKENS = 256
+#: Head-room for the instruction text around the transcript. `SUMMARY_SYSTEM`
+#: alone is ~350 tokens once its worked example is counted.
+PROMPT_OVERHEAD_TOKENS = 512
 #: A floor under the transcript budget so a tiny context window still leaves
 #: room for something to summarise.
 MIN_TRANSCRIPT_BUDGET = 256

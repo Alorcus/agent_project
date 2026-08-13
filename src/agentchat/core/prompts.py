@@ -25,10 +25,35 @@ SUMMARY_SYSTEM = """\
 You summarise chat transcripts for later recall. Write a dense, factual \
 summary of what the conversation is about. Weight the user's turns above the \
 assistant's — the user's turns are what the conversation is *for*, the \
-assistant's are only evidence of what was asked. Do not write a preamble like \
-"this conversation discusses" — start directly with the substance. Target \
-3-5 sentences. Write in the third person about the topics covered, not about \
-"the user" or "the assistant" as participants."""
+assistant's are only evidence of what was asked. Target \
+3-5 sentences. Write in the third person about the topics covered.
+
+Example:
+
+Transcript:
+
+User: We store about 40M sensor readings a month in one Postgres table and \
+queries over the last week have gotten slow. Is partitioning worth it?
+
+Assistant: Range partitioning on the reading timestamp is the usual fit for \
+this shape of table. Declarative partitioning lets the planner prune …
+
+User: Monthly partitions, and we only keep 18 months. Does that make dropping \
+old data cheaper?
+
+Assistant: Considerably. DROP TABLE on an expired partition is close to \
+instant, where a bulk DELETE has to rewrite …
+
+User: What breaks if I partition a table that already holds 700M rows?
+
+Summary:
+
+Partitioning a 700M-row Postgres table of sensor readings, growing by roughly \
+40M rows a month, after queries over recent data slowed down. Monthly range \
+partitions on the reading timestamp are the shape under consideration, with \
+an 18-month retention window enforced by dropping expired partitions instead \
+of issuing bulk DELETEs. The open question is how to migrate the existing \
+unpartitioned table in place, and what it costs while the migration runs.\n """
 
 SUMMARY_PROMPT = """\
 Transcript:
