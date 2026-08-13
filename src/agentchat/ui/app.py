@@ -17,7 +17,13 @@ from textual.containers import Container, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Footer, Input, Static
 
-from agentchat.config import Settings, build_extractor, build_registry, build_store
+from agentchat.config import (
+    Settings,
+    build_enricher,
+    build_extractor,
+    build_registry,
+    build_store,
+)
 from agentchat.core.chat import ChatService
 from agentchat.core.errors import AgentChatError, ModelNotFoundError
 from agentchat.core.models import Conversation, Group, Message
@@ -52,10 +58,12 @@ class ChatApp(App[None]):
         super().__init__()
         self.settings = settings or Settings.from_env()
         self.registry = build_registry(self.settings)
+        store = build_store(self.settings)
         self.chat = ChatService(
             self.registry,
-            store=build_store(self.settings),
+            store=store,
             extractor=build_extractor(self.settings, self.registry),
+            enricher=build_enricher(self.settings, store),
         )
         self.conversation: Conversation = Conversation()
         self.options = GenerationOptions()
@@ -403,7 +411,8 @@ class ChatApp(App[None]):
         log = self._chat_screen.query_one("#chat-log", VerticalScroll)
         await log.query(".placeholder").remove()
 
-        await log.mount(MessageBubble(Message(role="user", content=text)))
+        user_bubble = MessageBubble(Message(role="user", content=text))
+        await log.mount(user_bubble)
         log.scroll_end(animate=False)
 
         model_name = info.name if (info := self.registry.active_info) else None
@@ -422,6 +431,7 @@ class ChatApp(App[None]):
                     first = False
                     if self.chat.last_turn is not None:
                         bubble.bind_message(self.chat.last_turn.message)
+                        user_bubble.show_enrichment(self.chat.last_turn.enrichment)
                     self._refresh_status(busy="generating…")
                 bubble.append(chunk)
                 log.scroll_end(animate=False)
@@ -432,6 +442,12 @@ class ChatApp(App[None]):
         except AgentChatError as error:
             bubble.mark_error(str(error))
         finally:
+            # A reply that errors or is stopped before its first chunk still
+            # spent the memories (`stream_reply` marks them used before it
+            # starts streaming) — show_enrichment is idempotent, so repeating
+            # the call here is what makes the note appear regardless.
+            if self.chat.last_turn is not None:
+                user_bubble.show_enrichment(self.chat.last_turn.enrichment)
             self._generating = False
             self.call_later(self._refresh_status)
             log.scroll_end(animate=False)

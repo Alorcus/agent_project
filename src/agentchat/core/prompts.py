@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from agentchat.core.context import estimate_tokens
-from agentchat.core.models import Message
+from agentchat.core.models import ConversationSummary, Message
 
 MAX_KEYWORDS = 5
 KEYWORD_SEPARATOR = "; "
@@ -62,6 +62,27 @@ Summary:
 {summary}
 
 Keywords:"""
+
+ENRICHMENT_HEADER = """\
+---
+The following notes were extracted from the user's earlier conversations in \
+this project. They are background that may or may not be relevant — the \
+user did not write them and cannot see them. Use them only where they help \
+answer the message above; do not mention them otherwise."""
+
+ENRICHMENT_BULLET = "- "
+
+
+def enriched_text(user_text: str, summaries: Sequence[ConversationSummary]) -> str:
+    """`user_text` with `summaries` appended behind `ENRICHMENT_HEADER`, one
+    bulleted line per summary. Returns `user_text` unchanged when `summaries`
+    is empty."""
+    if not summaries:
+        return user_text
+    bullets = "\n".join(
+        f"{ENRICHMENT_BULLET}{' '.join(summary.summary.split())}" for summary in summaries
+    )
+    return f"{user_text}\n\n{ENRICHMENT_HEADER}\n\n{bullets}"
 
 
 def render_transcript(messages: Sequence[Message], *, budget: int) -> str:

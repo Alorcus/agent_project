@@ -98,6 +98,7 @@ Environment variables, all prefixed `AGENTCHAT_`:
 | `AGENTCHAT_SIMULATE_FAILURE` | `0` | Make the second model fail on load, to exercise error handling |
 | `AGENTCHAT_EXTRACT_SUMMARIES` | `1` | Derive a summary and keywords for a conversation when it is left |
 | `AGENTCHAT_EXTRACTION_TIMEOUT` | `30.0` | Seconds `Ctrl+D`/`Ctrl+Q` wait for extraction before exiting anyway |
+| `AGENTCHAT_ENRICH_MESSAGES` | `1` | Append matching summaries from the group to a user message before it reaches the model |
 
 Variables can also go in a `.env` file at the project root (copy
 `.env.example`) instead of being exported in the shell. Real environment
@@ -121,9 +122,33 @@ shows `summarising…` for as long as it's in flight, without blocking the next
 turn; quitting (`Ctrl+D`/`Ctrl+Q`) shows the same status line but waits for
 it, bounded by `AGENTCHAT_EXTRACTION_TIMEOUT`. A conversation with no new
 messages since its last summary is not re-summarised.
-`AGENTCHAT_EXTRACT_SUMMARIES=0` switches the feature off. Nothing in the UI
-reads the table yet — it exists so a later group overview and prompt-recall
-feature can be additive.
+`AGENTCHAT_EXTRACT_SUMMARIES=0` switches the feature off.
+
+## Recalling earlier conversations
+
+In a **project** group, sending a message checks the group's other
+conversations' summaries for a keyword hit against what you typed — a
+whole-phrase, case-insensitive match, not a substring. Up to three matching
+summaries are appended to the copy of your message the model sees, behind a
+short note explaining they're background from earlier chats. Under your
+message a muted line appears — `▸ enriched by 2 memories` — that expands on
+click to show what was sent.
+
+Each summary is used at most once per visit to a conversation; switching away
+and back makes it available again. Nothing about the enrichment reaches the
+database: `conversation.messages` keeps exactly what you typed, and reopening
+the conversation later shows no trace of it. It never runs in the default
+group, and never at the cost of your own message — if the appended summaries
+would push a reply over the model's context window, the turn is resent
+without them rather than dropped.
+
+**Known limitation:** an enriched reply is itself summarised when that
+conversation is later left, so injected material can be folded into *that*
+conversation's own summary and recalled a second time from a third
+conversation. Accepted as a limitation of a keyword-only recall mechanism
+rather than engineered around.
+
+`AGENTCHAT_ENRICH_MESSAGES=0` switches the feature off.
 
 ## Layout
 
@@ -134,8 +159,9 @@ src/agentchat/
     models.py      Message, Conversation, ConversationSummary
     chat.py        turn orchestration — the only thing that knows how a reply is made
     context.py     ContextStrategy seam (context-management elective)
-    prompts.py     the two extraction prompts, transcript rendering, keyword parsing
+    prompts.py     extraction and enrichment prompt text, transcript rendering, keyword parsing
     extraction.py  ExtractionService — two LLM calls, summary then keywords
+    enrichment.py  MemoryEnricher — keyword matching and the once-per-visit session ledger
     errors.py      every failure the UI is expected to render
   llm/
     base.py        LLMProvider protocol — the app/backend boundary
@@ -185,6 +211,10 @@ imports a concrete backend.
 - Conversation summaries — a dense summary and up to five keywords, derived
   on leaving a conversation and stored per group. See "Conversation
   summaries" above.
+- Message enrichment — a user message in a project group is checked against
+  the group's other conversations' summaries, and up to three keyword matches
+  are appended before the model sees it. See "Recalling earlier
+  conversations" above.
 
 ## Not yet built
 

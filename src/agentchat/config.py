@@ -14,6 +14,7 @@ from pathlib import Path
 
 from dotenv import find_dotenv, load_dotenv
 
+from agentchat.core.enrichment import MemoryEnricher
 from agentchat.core.errors import AgentChatError
 from agentchat.core.extraction import ExtractionService
 from agentchat.llm.base import ModelInfo
@@ -132,6 +133,12 @@ class Settings:
             30.0 if (v := _env_float("EXTRACTION_TIMEOUT")) is None else v
         )
     )
+    #: On by default, same reasoning as `extract_summaries`. Off switches
+    #: enrichment entirely, with no flag threaded through call sites
+    #: (`ChatService.stream_reply` just checks for `None`).
+    enrich_messages: bool = field(
+        default_factory=lambda: _env_flag("ENRICH_MESSAGES", True)
+    )
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -175,6 +182,16 @@ def build_extractor(
     if not settings.extract_summaries:
         return None
     return ExtractionService(registry)
+
+
+def build_enricher(settings: Settings, store: ConversationStore) -> MemoryEnricher | None:
+    """Assemble the enrichment service. The only place enrichment is switched
+    on; `None` when `enrich_messages` is off. Takes `store` rather than
+    building its own, so the caller can hand it the same instance `ChatService`
+    uses."""
+    if not settings.enrich_messages:
+        return None
+    return MemoryEnricher(store)
 
 
 def _register_local(registry: ModelRegistry, settings: Settings) -> None:

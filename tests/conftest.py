@@ -66,13 +66,17 @@ def mock_settings(**overrides) -> Settings:
 
     Extraction defaults to off, so the existing suite doesn't grow two silent
     LLM calls per switch; tests that are about extraction pass
-    ``extract_summaries=True`` explicitly.
+    ``extract_summaries=True`` explicitly. Enrichment defaults to off for the
+    same reason — otherwise every turn in the existing suite would grow a
+    ``list_summaries`` query; tests that are about enrichment pass
+    ``enrich_messages=True`` explicitly.
     """
     overrides.setdefault("backend", "mock")
     overrides.setdefault("store", "sqlite")
     overrides.setdefault("mock_chunk_delay", 0.0)
     overrides.setdefault("mock_load_delay", 0.0)
     overrides.setdefault("extract_summaries", False)
+    overrides.setdefault("enrich_messages", False)
     return Settings(**overrides)
 
 

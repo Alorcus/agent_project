@@ -95,6 +95,11 @@ Screen {
     padding-top: 0;
 }
 
+.bubble__memo {
+    color: $text-muted;
+    text-style: italic;
+}
+
 .placeholder {
     color: $text-muted;
     padding: 1 0;

@@ -30,9 +30,13 @@ would need, delete it.
 src/agentchat/
   config.py        settings + the single wiring point for backends and stores
   core/            domain model, chat orchestration, context strategy, errors
-    prompts.py     the extraction prompts and nothing else — edit this file to
-                    tune summary/keyword quality, not extraction.py
+    prompts.py     the extraction and enrichment prompt text and nothing else
+                    — edit this file to tune summary/keyword quality or the
+                    wording of the injected memory block, not extraction.py
+                    or enrichment.py
     extraction.py  ExtractionService: two LLM calls, summary then keywords
+    enrichment.py  MemoryEnricher: keyword-matches a user message against the
+                    group's other summaries and tracks what's been used
   llm/             LLMProvider protocol, mock + local (transformers) backends, registry
   storage/         ConversationStore protocol and its SQLite implementation
   ui/              Textual application, widgets, and modal screens

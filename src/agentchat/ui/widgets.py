@@ -7,11 +7,14 @@ grows.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
+from textual import events
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Static
 
-from agentchat.core.models import Message
+from agentchat.core.models import ConversationSummary, Message
 
 _ROLE_LABEL = {"user": "You", "assistant": "Assistant", "system": "System"}
 
@@ -47,6 +50,34 @@ class ConversationHeader(Horizontal):
         self.query_one("#header-title", Static).update(title)
 
 
+class EnrichmentNote(Static):
+    """One line under a user turn: how many memories were appended, and —
+    on click — which."""
+
+    def __init__(self, summaries: Sequence[ConversationSummary]) -> None:
+        self._summaries = tuple(summaries)
+        self._collapsed = True
+        # markup=False: summary text is model output and may contain
+        # brackets — the same trap MessageBubble's own body avoids.
+        super().__init__(self._text(), markup=False, classes="bubble__memo")
+
+    def on_click(self, event: events.Click) -> None:
+        # Its own widget, not a handler on the bubble, so a click anywhere
+        # else in the bubble does nothing.
+        self._collapsed = not self._collapsed
+        self.update(self._text())
+        event.stop()
+
+    def _text(self) -> str:
+        count = len(self._summaries)
+        noun = "memory" if count == 1 else "memories"
+        header = f"{'▸' if self._collapsed else '▾'} enriched by {count} {noun}"
+        if self._collapsed:
+            return header
+        lines = (f"    {' '.join(summary.summary.split())}" for summary in self._summaries)
+        return "\n".join([header, *lines])
+
+
 class MessageBubble(Vertical):
     """One turn: a role/model header plus a growing body."""
 
@@ -56,6 +87,7 @@ class MessageBubble(Vertical):
         self._model_name = model_name
         self._buffer = message.content
         self._status: str | None = None
+        self._note: EnrichmentNote | None = None
         # Built eagerly and held by reference: streaming updates can arrive
         # before compose() finishes. markup=False so model output containing
         # brackets is never parsed as Textual markup.
@@ -104,6 +136,14 @@ class MessageBubble(Vertical):
     def mark_done(self) -> None:
         self._status = None
         self._refresh_header()
+
+    def show_enrichment(self, summaries: Sequence[ConversationSummary]) -> None:
+        """Mount the note under the body, once. Empty input and a second call
+        are both no-ops."""
+        if self._note is not None or not summaries:
+            return
+        self._note = EnrichmentNote(summaries)
+        self.mount(self._note)
 
     # -- internals --------------------------------------------------------
 

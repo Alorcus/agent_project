@@ -4,7 +4,14 @@ import asyncio
 
 import pytest
 
-from agentchat.config import ConfigurationError, Settings, build_extractor, build_store
+from agentchat.config import (
+    ConfigurationError,
+    Settings,
+    build_enricher,
+    build_extractor,
+    build_store,
+)
+from agentchat.core.enrichment import MemoryEnricher
 from agentchat.core.chat import ChatService
 from agentchat.core.context import RecencyWindowStrategy
 from agentchat.core.errors import ModelNotFoundError, ProviderError
@@ -192,6 +199,17 @@ def test_build_extractor_is_switched_by_extract_summaries():
 def test_agentchat_extract_summaries_env_flag_is_honoured(monkeypatch):
     monkeypatch.setenv("AGENTCHAT_EXTRACT_SUMMARIES", "0")
     assert Settings().extract_summaries is False
+
+
+def test_build_enricher_is_switched_by_enrich_messages(store):
+    assert build_enricher(mock_settings(enrich_messages=False), store) is None
+    enricher = build_enricher(mock_settings(enrich_messages=True), store)
+    assert isinstance(enricher, MemoryEnricher)
+
+
+def test_agentchat_enrich_messages_env_flag_is_honoured(monkeypatch):
+    monkeypatch.setenv("AGENTCHAT_ENRICH_MESSAGES", "0")
+    assert Settings().enrich_messages is False
 
 
 def test_agentchat_extraction_timeout_bad_value_raises_configuration_error(monkeypatch):
