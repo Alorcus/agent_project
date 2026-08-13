@@ -17,6 +17,7 @@ from agentchat.core.prompts import (
     parse_keywords,
     render_transcript,
 )
+from agentchat.llm import transcript as llm_transcript
 from agentchat.llm.base import GenerationOptions, complete
 from agentchat.llm.registry import ModelRegistry
 
@@ -48,26 +49,28 @@ class ExtractionService:
         )
         transcript = render_transcript(conversation.messages, budget=budget)
 
-        summary_text = await complete(
-            provider,
-            [
-                Message(role="system", content=SUMMARY_SYSTEM),
-                Message(role="user", content=SUMMARY_PROMPT.format(transcript=transcript)),
-            ],
-            GenerationOptions(max_tokens=SUMMARY_MAX_TOKENS, **_EXTRACTION_OPTIONS_BASE),
-        )
+        with llm_transcript.label("extraction.summary"):
+            summary_text = await complete(
+                provider,
+                [
+                    Message(role="system", content=SUMMARY_SYSTEM),
+                    Message(role="user", content=SUMMARY_PROMPT.format(transcript=transcript)),
+                ],
+                GenerationOptions(max_tokens=SUMMARY_MAX_TOKENS, **_EXTRACTION_OPTIONS_BASE),
+            )
         summary_text = summary_text.strip()
         if not summary_text:
             raise ExtractionError("summarisation produced an empty reply")
 
-        keywords_reply = await complete(
-            provider,
-            [
-                Message(role="system", content=KEYWORDS_SYSTEM),
-                Message(role="user", content=KEYWORDS_PROMPT.format(summary=summary_text)),
-            ],
-            GenerationOptions(max_tokens=KEYWORDS_MAX_TOKENS, **_EXTRACTION_OPTIONS_BASE),
-        )
+        with llm_transcript.label("extraction.keywords"):
+            keywords_reply = await complete(
+                provider,
+                [
+                    Message(role="system", content=KEYWORDS_SYSTEM),
+                    Message(role="user", content=KEYWORDS_PROMPT.format(summary=summary_text)),
+                ],
+                GenerationOptions(max_tokens=KEYWORDS_MAX_TOKENS, **_EXTRACTION_OPTIONS_BASE),
+            )
         # An unparseable reply loses the keywords, not the summary (KTD9):
         # the summary is the expensive artefact and stands alone.
         keywords = parse_keywords(keywords_reply)

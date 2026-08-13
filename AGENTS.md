@@ -28,6 +28,7 @@ would need, delete it.
 
 ```
 src/agentchat/
+  log.py           file-handler plumbing shared by the app log and the LLM transcript
   config.py        settings + the single wiring point for backends and stores
   core/            domain model, chat orchestration, context strategy, errors
     prompts.py     the extraction and enrichment prompt text and nothing else
@@ -38,6 +39,12 @@ src/agentchat/
     enrichment.py  MemoryEnricher: keyword-matches a user message against the
                     group's other summaries and tracks what's been used
   llm/             LLMProvider protocol, mock + local (transformers) backends, registry
+    transcript.py  verbatim request/response log, recorded *inside* local.py
+                    and mock.py on purpose — it sits below the streamer's
+                    cleanup and the app's message trimming, which a wrapper
+                    around LLMProvider.generate() could not see. Don't "tidy"
+                    the recording calls out of the backends into one; that
+                    silently makes the transcript describe the wrong thing.
   storage/         ConversationStore protocol and its SQLite implementation
   ui/              Textual application, widgets, and modal screens
 ```

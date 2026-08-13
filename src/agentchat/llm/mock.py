@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator, Sequence
 
 from agentchat.core.errors import ProviderError
 from agentchat.core.models import Message
+from agentchat.llm import transcript
 from agentchat.llm.base import GenerationOptions, ModelInfo
 
 _LOREM = (
@@ -78,11 +79,37 @@ class MockProvider:
             raise ProviderError(f"{self._info.name} is not loaded")
         options = options or GenerationOptions()
 
+        call_id = transcript.new_call_id()
+        label = transcript.current_label()
+        transcript.record_request(
+            call_id=call_id,
+            label=label,
+            model_id=self._info.id,
+            backend="mock",
+            messages=messages,
+            prompt_text=None,  # no template on this backend (KTD5)
+            prompt_tokens=None,  # no tokenizer on this backend
+            options=options,
+        )
         text = self._compose(messages, options)
-        for token in _tokenize(text):
-            # Jitter keeps the UI honest: no fixed cadence to accidentally rely on.
-            await asyncio.sleep(self._chunk_delay * self._rng.uniform(0.5, 1.5))
-            yield token
+        emitted: list[str] = []
+        try:
+            for token in _tokenize(text):
+                # Jitter keeps the UI honest: no fixed cadence to accidentally rely on.
+                await asyncio.sleep(self._chunk_delay * self._rng.uniform(0.5, 1.5))
+                emitted.append(token)
+                yield token
+        finally:
+            output = "".join(emitted)
+            transcript.record_response(
+                call_id=call_id,
+                label=label,
+                model_id=self._info.id,
+                backend="mock",
+                output=output,
+                completion_tokens=None,
+                outcome="complete" if output == text else "stopped",
+            )
 
     def _compose(self, messages: Sequence[Message], options: GenerationOptions) -> str:
         last_user = next(

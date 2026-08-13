@@ -82,6 +82,10 @@ def _env_float(name: str) -> float | None:
         ) from None
 
 
+def _p(raw: str | None) -> Path | None:
+    return Path(raw) if raw else None
+
+
 @dataclass
 class Settings:
     data_dir: Path = field(
@@ -139,10 +143,20 @@ class Settings:
     enrich_messages: bool = field(
         default_factory=lambda: _env_flag("ENRICH_MESSAGES", True)
     )
+    #: On by default: an instrument that has to be switched on is an
+    #: instrument nobody has running when the interesting turn happens.
+    log_llm_io: bool = field(default_factory=lambda: _env_flag("LOG_LLM_IO", True))
+    #: Where both log files land. Defaults under `data_dir` so one directory
+    #: holds the database and the transcripts of the calls that filled it.
+    log_dir: Path | None = field(default_factory=lambda: _p(_env("LOG_DIR")))
 
     @classmethod
     def from_env(cls) -> "Settings":
         return cls()
+
+    @property
+    def resolved_log_dir(self) -> Path:
+        return self.log_dir or self.data_dir / "logs"
 
 
 def _require_choice(var_name: str, value: str, choices: tuple[str, ...]) -> None:

@@ -99,6 +99,8 @@ Environment variables, all prefixed `AGENTCHAT_`:
 | `AGENTCHAT_EXTRACT_SUMMARIES` | `1` | Derive a summary and keywords for a conversation when it is left |
 | `AGENTCHAT_EXTRACTION_TIMEOUT` | `30.0` | Seconds `Ctrl+D`/`Ctrl+Q` wait for extraction before exiting anyway |
 | `AGENTCHAT_ENRICH_MESSAGES` | `1` | Append matching summaries from the group to a user message before it reaches the model |
+| `AGENTCHAT_LOG_LLM_IO` | `1` | Write a verbatim request/response transcript of every model call to `llm.jsonl` |
+| `AGENTCHAT_LOG_DIR` | `<data_dir>/logs` | Where `agentchat.log` and `llm.jsonl` are written |
 
 Variables can also go in a `.env` file at the project root (copy
 `.env.example`) instead of being exported in the shell. Real environment
@@ -150,10 +152,36 @@ rather than engineered around.
 
 `AGENTCHAT_ENRICH_MESSAGES=0` switches the feature off.
 
+## Logs
+
+Every call into a model backend writes two JSON lines to
+`<data_dir>/logs/llm.jsonl`, appended across runs: a **request** record
+holding exactly the string handed to the tokenizer (the mock backend has no
+tokenizer, so its `prompt_text` is `null`), and a **response** record holding
+exactly what the model returned — special tokens included, un-stripped. The
+two share a `call_id`; a `label` (`chat`, `extraction.summary`,
+`extraction.keywords`) says which call site produced them. Nothing is
+truncated, redacted, or summarised, at any size — the file is an instrument,
+not a second opinion, and it **contains full conversation text in
+cleartext**, the same exposure `agentchat.db` already has.
+
+Reading it:
+
+```bash
+jq -r 'select(.label=="chat" and .type=="request") | .prompt_text' data/logs/llm.jsonl
+jq -c 'select(.call_id=="<id>")' data/logs/llm.jsonl        # one exchange
+jq -r 'select(.outcome=="error") | .error' data/logs/llm.jsonl
+```
+
+`AGENTCHAT_LOG_LLM_IO=0` switches it off — no file is opened and no record is
+built. `AGENTCHAT_LOG_DIR` moves both this and the application log
+(`agentchat.log`) out from under `data_dir`.
+
 ## Layout
 
 ```
 src/agentchat/
+  log.py           file-handler plumbing shared by the app log and the LLM transcript
   config.py        settings + the single wiring point for backends
   core/
     models.py      Message, Conversation, ConversationSummary
@@ -168,6 +196,7 @@ src/agentchat/
     registry.py    model catalogue, residency, runtime switching
     local.py       real backend (transformers)
     mock.py        the stub backend
+    transcript.py  verbatim request/response log of every `generate()` call — see "Logs"
   storage/
     base.py        ConversationStore protocol + shared ordering/guard helpers
     schema.py      the DDL, the default-group seed, and the old-database guard
@@ -215,6 +244,9 @@ imports a concrete backend.
   the group's other conversations' summaries, and up to three keyword matches
   are appended before the model sees it. See "Recalling earlier
   conversations" above.
+- LLM I/O transcript — every model call writes a verbatim request/response
+  pair to `llm.jsonl`, recorded from inside the backend so it reflects what
+  the model actually saw and said. See "Logs" above.
 
 ## Not yet built
 

@@ -18,6 +18,7 @@ from typing import Any
 
 from agentchat.core.errors import ProviderError
 from agentchat.core.models import Message
+from agentchat.llm import transcript
 from agentchat.llm.base import GenerationOptions, ModelInfo
 from agentchat.llm._hf_compat import (
     DONE,
@@ -181,7 +182,11 @@ class TransformersProvider:
         # A previous stopped generation may still be unwinding on the GPU.
         await self._settle()
 
-        streamer, state = self._start_generation(messages, options)
+        call_id = transcript.new_call_id()
+        # Read here, not inside the worker thread: a ContextVar set by the
+        # caller does not propagate into `threading.Thread` targets.
+        label = transcript.current_label()
+        streamer, state = self._start_generation(messages, options, call_id, label)
         try:
             while True:
                 chunk = await asyncio.to_thread(
@@ -202,7 +207,11 @@ class TransformersProvider:
             self._stop.set()
 
     def _start_generation(
-        self, messages: Sequence[Message], options: GenerationOptions
+        self,
+        messages: Sequence[Message],
+        options: GenerationOptions,
+        call_id: str,
+        label: str,
     ) -> tuple[Any, dict[str, Any]]:
         """Build the prompt and hand generation to a worker thread."""
         import torch
@@ -213,7 +222,19 @@ class TransformersProvider:
             prompt,
             return_tensors="pt",
             add_special_tokens=False,  # the chat template already emitted them
-        ).to(self._model.device)
+        )
+        prompt_len = int(inputs["input_ids"].shape[-1])
+        transcript.record_request(
+            call_id=call_id,
+            label=label,
+            model_id=self._info.id,
+            backend="local",
+            messages=messages,
+            prompt_text=prompt,
+            prompt_tokens=prompt_len,
+            options=options,
+        )
+        inputs = inputs.to(self._model.device)
 
         streamer = TextIteratorStreamer(
             self._tokenizer,
@@ -243,7 +264,7 @@ class TransformersProvider:
         state: dict[str, Any] = {}
         thread = threading.Thread(
             target=self._run_generation,
-            args=(torch, kwargs, streamer, state),
+            args=(torch, kwargs, streamer, state, prompt_len, call_id, label),
             name=f"generate:{self._info.id}",
             daemon=True,
         )
@@ -252,16 +273,65 @@ class TransformersProvider:
         return streamer, state
 
     def _run_generation(
-        self, torch: Any, kwargs: dict[str, Any], streamer: Any, state: dict[str, Any]
+        self,
+        torch: Any,
+        kwargs: dict[str, Any],
+        streamer: Any,
+        state: dict[str, Any],
+        prompt_len: int,
+        call_id: str,
+        label: str,
     ) -> None:
+        sequences = None
         try:
             with torch.inference_mode():
-                self._model.generate(**kwargs)
+                sequences = self._model.generate(**kwargs)
         except BaseException as error:  # noqa: BLE001 — reported to the consumer
             state["error"] = error
             # generate() ends the stream itself on success; on failure nothing
             # would, and the consumer would block until the token timeout.
             streamer.end()
+        finally:
+            # This thread is the only place that knows how generation truly
+            # ended — completion, stop-event, or exception — in all three
+            # cases, so the response record is written from here rather than
+            # from the async `generate()` wrapper.
+            self._record_completion(sequences, state, prompt_len, call_id, label)
+
+    def _record_completion(
+        self,
+        sequences: Any,
+        state: dict[str, Any],
+        prompt_len: int,
+        call_id: str,
+        label: str,
+    ) -> None:
+        completion_ids = sequences[0][prompt_len:] if sequences is not None else None
+        output = (
+            self._tokenizer.decode(completion_ids, skip_special_tokens=False)
+            if completion_ids is not None
+            else ""
+        )
+        error = state.get("error")
+        outcome = (
+            "error"
+            if error is not None
+            else "stopped"
+            if self._stop.is_set()
+            else "complete"
+        )
+        transcript.record_response(
+            call_id=call_id,
+            label=label,
+            model_id=self._info.id,
+            backend="local",
+            output=output,
+            completion_tokens=(
+                int(completion_ids.shape[-1]) if completion_ids is not None else None
+            ),
+            outcome=outcome,
+            error=repr(error) if error is not None else None,
+        )
 
     def _pad_token_id(self) -> int | None:
         tokenizer = self._tokenizer

@@ -7,12 +7,15 @@ developer's own machine: the repo's `.env` must not steer what a test thinks
 
 from __future__ import annotations
 
+import logging
 import os
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from agentchat.config import ENV_PREFIX, Settings, build_registry
+from agentchat.llm import transcript
 from agentchat.llm.registry import ModelRegistry
 from agentchat.storage.sqlite import SqliteStore
 
@@ -45,6 +48,40 @@ def _guard_real_database(monkeypatch: pytest.MonkeyPatch) -> None:
         original_init(self, path, *args, **kwargs)
 
     monkeypatch.setattr(SqliteStore, "__init__", guarded_init)
+
+
+@pytest.fixture(autouse=True)
+def _guard_real_transcript(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail with the offending test's name if the LLM transcript is ever
+    opened under the repo's real data directory, mirroring
+    `_guard_real_database` above. Belt to `transcript`'s own inert-by-default
+    behaviour (KTD9), not a substitute for it."""
+    original_attach = transcript.attach_jsonl_handler
+
+    def guarded_attach(logger: logging.Logger, path: Path) -> Path:
+        if Path(path).resolve().is_relative_to(_REAL_DATA_DIR):
+            raise AssertionError(
+                f"refusing to open the real transcript at {path!r} — "
+                "pass a tmp_path-based log_dir"
+            )
+        return original_attach(logger, path)
+
+    monkeypatch.setattr(transcript, "attach_jsonl_handler", guarded_attach)
+
+
+@pytest.fixture(autouse=True)
+def _reset_llm_transcript() -> Iterator[None]:
+    """Undo whatever a test's `setup_llm_log` call left behind. The module
+    holds enabled-state and a file handler at import scope; leaking either
+    into the next test would silently start writing a transcript no one
+    asked for, or point one at a path this test session has already torn
+    down."""
+    yield
+    transcript._enabled = False
+    for handler in list(transcript._log.handlers):
+        if isinstance(handler, logging.FileHandler):
+            transcript._log.removeHandler(handler)
+            handler.close()
 
 
 @pytest.fixture

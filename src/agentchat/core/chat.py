@@ -16,6 +16,7 @@ from agentchat.core.errors import StorageError
 from agentchat.core.extraction import ExtractionService
 from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, ConversationSummary, Group, Message
 from agentchat.core.prompts import enriched_text
+from agentchat.llm import transcript
 from agentchat.llm.base import GenerationOptions
 from agentchat.llm.registry import ModelRegistry
 from agentchat.storage.base import ConversationStore
@@ -168,10 +169,14 @@ class ChatService:
 
             parts: list[str] = []
             try:
-                async for chunk in provider.generate(decision.messages, options):
-                    parts.append(chunk)
-                    reply.content = "".join(parts)
-                    yield chunk
+                # Scoped to the generation only, not the persist below — a
+                # cancelled consumer must not carry "chat" across the store
+                # I/O's own await boundaries.
+                with transcript.label("chat"):
+                    async for chunk in provider.generate(decision.messages, options):
+                        parts.append(chunk)
+                        reply.content = "".join(parts)
+                        yield chunk
             finally:
                 reply.content = "".join(parts)
                 conversation.touch()
