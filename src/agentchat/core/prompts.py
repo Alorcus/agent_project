@@ -1,17 +1,37 @@
-"""The extraction prompts, and the pure functions that prepare their input and
+"""The assistant's own system prompt, the extraction, enrichment and
+consultation prompts, and the pure functions that prepare their input and
 parse their output. No I/O, no provider, no store — this is the file a
-non-programmer edits to tune summary or keyword quality.
+non-programmer edits to tune reply, summary, keyword, routing or consultation
+quality.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 
+from agentchat.core.agents import DEFAULT_AGENT_ID, SubAgent
 from agentchat.core.context import estimate_tokens
 from agentchat.core.models import ConversationSummary, Message
 
 MAX_KEYWORDS = 5
 KEYWORD_SEPARATOR = "; "
+
+#: The system prompt for the assistant the user actually talks to — the
+#: `default` entry in the router's roster, which names no `SubAgent` and so
+#: has no `system_prompt` field of its own. Kept short on purpose: it is
+#: prepended to every turn and counts against the same context budget as the
+#: conversation.
+DEFAULT_SYSTEM = """\
+You are a general advisor. Answer the question you were asked, then stop.
+
+Match the answer to the question: a short question gets a short answer, a \
+sentence or two. Give a long or step-by-step answer only when the user asks \
+for one, or when a short answer would be wrong.
+
+Do not restate the question, announce what you are about to do, or close with \
+a summary or an offer of further help. Use headings and lists only where the \
+answer really is a list. Say plainly when you don't know."""
 
 #: A long assistant reply contributes its shape to the transcript, not its
 #: bulk — the summary is about what was asked, not how much was answered.
@@ -108,6 +128,154 @@ def enriched_text(user_text: str, summaries: Sequence[ConversationSummary]) -> s
         f"{ENRICHMENT_BULLET}{' '.join(summary.summary.split())}" for summary in summaries
     )
     return f"{user_text}\n\n{ENRICHMENT_HEADER}\n\n{bullets}"
+
+
+#: What the router is told `default` covers — `default` names no `SubAgent`
+#: (agents.DEFAULT_AGENT_ID), so its description lives here rather than in a
+#: roster entry.
+DEFAULT_PURPOSE = "general conversation, coding, writing, and anything not clearly covered below"
+
+ROUTER_SYSTEM = """\
+You route a user's message to the assistant best suited to answer it. Reply \
+with exactly one name from the list below and nothing else: no explanation, \
+no punctuation, no quotation marks. Choose `default` when no specialist \
+clearly fits — most messages do.
+
+Example:
+
+Assistants:
+
+default — general conversation, coding, writing, and anything not clearly \
+covered below
+ask_vet — animal health, symptoms, diet, and behaviour for pets and livestock
+
+Message:
+
+My dog has been limping since this morning, is that something to worry about?
+
+Name:
+
+ask_vet"""
+
+ROUTER_PROMPT = "Assistants:\n\n{roster}\n\nMessage:\n\n{message}\n\nName:"
+
+TASK_SYSTEM = """\
+You write the task for a specialist assistant who will answer without seeing \
+this conversation. You are shown the conversation so far: the last user turn \
+is the one that needs answering, and the earlier turns are there so you can \
+resolve what it refers to. In one or two sentences, address the specialist \
+directly and restate every detail they need — they cannot see the \
+conversation, so anything you don't restate is lost to them. Do not answer \
+the question yourself.
+
+Example:
+
+Specialist: ask_vet — animal health, symptoms, diet, and behaviour for pets \
+and livestock
+
+Conversation:
+
+User: My dog has been limping since this morning, is that something to worry \
+about?
+
+Assistant: Sudden limping in an otherwise healthy dog is usually a \
+soft-tissue strain or something lodged in a paw pad. Check between the toes \
+and along the pads first …
+
+User: Nothing in the pads, and he hasn't been anywhere unusual. He's nine \
+though — does his age change the answer?
+
+Task:
+
+A nine-year-old dog has been limping since this morning with no known injury; \
+the owner has already checked the paw pads for anything lodged and found \
+nothing, and the dog has not been anywhere unusual. Explain what else causes \
+sudden limping in a dog that age, whether being nine changes how urgent it \
+is, and when it warrants an urgent vet visit."""
+
+TASK_PROMPT = "Specialist: {name} — {purpose}\n\nConversation:\n\n{transcript}\n\nTask:"
+
+#: The point past which `parse_task` cuts an over-long authored task, on a
+#: word boundary — `TASK_MAX_TOKENS` already bounds the model's own reply,
+#: this is a second floor under whatever gets this far.
+TASK_CHAR_CAP = 600
+
+CONSULTATION_HEADER = """\
+---
+A specialist was consulted for this reply. It was given only the task shown \
+below and could not see this conversation. Use its answer where it helps, \
+correct it where it does not fit what the user actually asked, and answer in \
+your own voice."""
+
+
+def roster_text(agents: Sequence[SubAgent]) -> str:
+    """One line per assistant the router can choose, `default` first."""
+    lines = [f"{DEFAULT_AGENT_ID} — {DEFAULT_PURPOSE}"]
+    lines += [f"{agent.id} — {agent.purpose}" for agent in agents]
+    return "\n".join(lines)
+
+
+def consulted_text(user_text: str, agent: SubAgent, task: str, answer: str) -> str:
+    """`user_text` with the specialist's task and answer appended behind
+    `CONSULTATION_HEADER`."""
+    return (
+        f"{user_text}\n\n{CONSULTATION_HEADER}\n\n"
+        f"Task given to {agent.name}:\n{task}\n\n"
+        f"{agent.name}'s answer:\n{answer}"
+    )
+
+
+def parse_agent_id(text: str, *, agent_ids: Sequence[str]) -> str | None:
+    """The agent id in a router reply, or `None` for `default` and for
+    anything that cannot be read as a listed id. Never raises."""
+    raw = text.strip().strip("`").strip()
+    raw = raw.strip("'\"").strip()
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if not lines:
+        return None
+
+    line = lines[0]
+    if line.lower().startswith("name:"):
+        line = line[len("name:") :].strip()
+    line = _clean_keyword(line)
+    candidate = line.lower()
+
+    lower_ids = {agent_id.lower(): agent_id for agent_id in agent_ids}
+    if candidate in lower_ids:
+        return lower_ids[candidate]
+    if not candidate or candidate == DEFAULT_AGENT_ID:
+        return None
+
+    for agent_id in agent_ids:
+        prefix_stripped = agent_id.split("_", 1)[-1] if "_" in agent_id else agent_id
+        if candidate == prefix_stripped.lower():
+            return agent_id
+
+    # Last resort: the first listed id occurring as a whole word anywhere in
+    # the line — a rambling reply routes reproducibly rather than randomly.
+    best: tuple[int, str] | None = None
+    for agent_id in agent_ids:
+        match = re.search(rf"(?<!\w){re.escape(agent_id)}(?!\w)", line, re.IGNORECASE)
+        if match and (best is None or match.start() < best[0]):
+            best = (match.start(), agent_id)
+    return best[1] if best else None
+
+
+def parse_task(text: str, *, fallback: str) -> str:
+    """A defensively-cleaned task: a leading `Task:` label dropped, whitespace
+    collapsed, capped at `TASK_CHAR_CAP` on a word boundary. `fallback` when
+    nothing survives — losing the authored task costs phrasing, not the
+    turn."""
+    text = text.strip()
+    if text.lower().startswith("task:"):
+        text = text[len("task:") :].strip()
+    text = " ".join(text.split())
+    if not text:
+        return fallback
+    if len(text) > TASK_CHAR_CAP:
+        cut = text.rfind(" ", 0, TASK_CHAR_CAP)
+        text = (text[:cut] if cut > 0 else text[:TASK_CHAR_CAP]).rstrip() + "…"
+    return text
 
 
 def render_transcript(messages: Sequence[Message], *, budget: int) -> str:

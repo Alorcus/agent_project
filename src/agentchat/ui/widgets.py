@@ -7,18 +7,23 @@ grows.
 
 from __future__ import annotations
 
+import textwrap
 from collections.abc import Sequence
+from typing import Any
 
 from textual import events
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Static
 
+from agentchat.core.delegation import Consultation
 from agentchat.core.models import ConversationSummary, Message
 
 _ROLE_LABEL = {"user": "You", "assistant": "Assistant", "system": "System"}
 
 _SEPARATOR = "  ›  "
+
+_DETAIL_INDENT = "    "
 
 
 class ConversationHeader(Horizontal):
@@ -50,14 +55,15 @@ class ConversationHeader(Horizontal):
         self.query_one("#header-title", Static).update(title)
 
 
-class EnrichmentNote(Static):
-    """One line under a user turn: how many memories were appended, and —
-    on click — which."""
+class CollapsibleNote(Static):
+    """A muted line under a bubble that expands on click. Subclasses supply
+    the collapsed header text and the indented lines shown under it once
+    expanded — this base owns only the toggle and the marker."""
 
-    def __init__(self, summaries: Sequence[ConversationSummary]) -> None:
-        self._summaries = tuple(summaries)
+    def __init__(self) -> None:
         self._collapsed = True
-        # markup=False: summary text is model output and may contain
+        self._wrapped_width = 0
+        # markup=False: the detail lines are model output and may contain
         # brackets — the same trap MessageBubble's own body avoids.
         super().__init__(self._text(), markup=False, classes="bubble__memo")
 
@@ -68,14 +74,99 @@ class EnrichmentNote(Static):
         self.update(self._text())
         event.stop()
 
+    def on_resize(self, event: events.Resize) -> None:
+        # The detail lines are wrapped against a measured width, so a width
+        # change has to re-wrap them. Comparing widths keeps the update from
+        # bouncing off its own relayout.
+        if not self._collapsed and self.content_size.width != self._wrapped_width:
+            self.update(self._text())
+
     def _text(self) -> str:
-        count = len(self._summaries)
-        noun = "memory" if count == 1 else "memories"
-        header = f"{'▸' if self._collapsed else '▾'} enriched by {count} {noun}"
+        marker = "▸" if self._collapsed else "▾"
+        header = f"{marker} {self._header_text()}"
         if self._collapsed:
             return header
-        lines = (f"    {' '.join(summary.summary.split())}" for summary in self._summaries)
-        return "\n".join([header, *lines])
+        return "\n".join([header, *self._wrapped_detail_lines()])
+
+    def _wrapped_detail_lines(self) -> Sequence[str]:
+        """The detail lines indented, and wrapped here rather than by the
+        widget: a wrap `Static` performs restarts the continuation at column
+        zero, which reads as a line that lost its indent."""
+        width = self.content_size.width
+        self._wrapped_width = width
+        lines: list[str] = []
+        for detail in self._detail_lines():
+            text = " ".join(detail.split())
+            if width <= len(_DETAIL_INDENT) + 1:
+                # Unmeasured (built before the first layout) or too narrow to
+                # wrap into; let Static do what it can with the whole line.
+                lines.append(_DETAIL_INDENT + text)
+                continue
+            lines.extend(
+                textwrap.wrap(
+                    text,
+                    width=width,
+                    initial_indent=_DETAIL_INDENT,
+                    subsequent_indent=_DETAIL_INDENT,
+                )
+                or [_DETAIL_INDENT + text]
+            )
+        return lines
+
+    def _header_text(self) -> str:
+        raise NotImplementedError
+
+    def _detail_lines(self) -> Sequence[str]:
+        """One unindented, unwrapped line per detail; the base indents and
+        wraps them."""
+        raise NotImplementedError
+
+
+class EnrichmentNote(CollapsibleNote):
+    """One line under a user turn: how many memories were appended, and —
+    on click — which."""
+
+    def __init__(self, summaries: Sequence[ConversationSummary]) -> None:
+        self._summaries = tuple(summaries)
+        super().__init__()
+
+    def _header_text(self) -> str:
+        count = len(self._summaries)
+        noun = "memory" if count == 1 else "memories"
+        return f"enriched by {count} {noun}"
+
+    def _detail_lines(self) -> Sequence[str]:
+        return [summary.summary for summary in self._summaries]
+
+
+class ConsultationNote(CollapsibleNote):
+    """One line under a reply written with a specialist's help: which one,
+    and — on click — the task it was given and what it answered."""
+
+    def __init__(self, agent_name: str, task: str, answer: str) -> None:
+        self._agent_name = agent_name
+        # Not `self._task`: `MessagePump.__init__` (a Textual base class)
+        # owns that name for its own running task and overwrites it the
+        # moment this widget is mounted.
+        self._agent_task = task
+        self._agent_answer = answer
+        super().__init__()
+
+    def _header_text(self) -> str:
+        return f"answered with help from {self._agent_name}"
+
+    def _detail_lines(self) -> Sequence[str]:
+        return [f"Task: {self._agent_task}", f"Answer: {self._agent_answer}"]
+
+
+def _consultation_note_from(metadata: dict[str, Any]) -> ConsultationNote | None:
+    """Rebuild the note from a persisted `Message.metadata["subagent"]` block
+    — used to restore a conversation, where no `Consultation` object exists.
+    `None` when the message carries no such block."""
+    block = metadata.get("subagent")
+    if not block:
+        return None
+    return ConsultationNote(block["name"], block["task"], block["answer"])
 
 
 class MessageBubble(Vertical):
@@ -88,6 +179,7 @@ class MessageBubble(Vertical):
         self._buffer = message.content
         self._status: str | None = None
         self._note: EnrichmentNote | None = None
+        self._consultation_note: ConsultationNote | None = None
         # Built eagerly and held by reference: streaming updates can arrive
         # before compose() finishes. markup=False so model output containing
         # brackets is never parsed as Textual markup.
@@ -145,7 +237,36 @@ class MessageBubble(Vertical):
         self._note = EnrichmentNote(summaries)
         self.mount(self._note)
 
+    def show_consultation(self, consultation: Consultation | None) -> None:
+        """Mount the note between the header and the body, once. `None` and a
+        second call are both no-ops. No header change: the turn *was* written
+        by the assistant on the active model, so the note carries the
+        attribution rather than the header."""
+        if self._consultation_note is not None or consultation is None:
+            return
+        self._consultation_note = ConsultationNote(
+            consultation.agent.name, consultation.task, consultation.answer
+        )
+        self._mount_consultation_note(self._consultation_note)
+
+    def show_consultation_metadata(self, metadata: dict[str, Any]) -> None:
+        """The restart path for `show_consultation`: rebuilds the note from
+        persisted `Message.metadata` rather than a live `Consultation`, since
+        no `SubAgent` is reconstructed from storage."""
+        if self._consultation_note is not None:
+            return
+        note = _consultation_note_from(metadata)
+        if note is None:
+            return
+        self._consultation_note = note
+        self._mount_consultation_note(note)
+
     # -- internals --------------------------------------------------------
+
+    def _mount_consultation_note(self, note: ConsultationNote) -> None:
+        # Above the body: the attribution belongs with the header that names
+        # who is speaking, not trailing the answer it qualifies.
+        self.mount(note, after=self._header)
 
     def _refresh_header(self) -> None:
         self._header.update(self._header_text())

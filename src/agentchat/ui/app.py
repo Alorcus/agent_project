@@ -19,6 +19,7 @@ from textual.widgets import Footer, Input, Static
 
 from agentchat.config import (
     Settings,
+    build_delegator,
     build_enricher,
     build_extractor,
     build_registry,
@@ -64,6 +65,7 @@ class ChatApp(App[None]):
             store=store,
             extractor=build_extractor(self.settings, self.registry),
             enricher=build_enricher(self.settings, store),
+            delegator=build_delegator(self.settings, self.registry),
         )
         self.conversation: Conversation = Conversation()
         self.options = GenerationOptions()
@@ -324,9 +326,12 @@ class ChatApp(App[None]):
             await log.mount(Static("New conversation.", classes="placeholder"))
             return
         for message in conversation.messages:
-            await log.mount(
-                MessageBubble(message, model_name=self._model_name_for(message))
-            )
+            bubble = MessageBubble(message, model_name=self._model_name_for(message))
+            await log.mount(bubble)
+            # The only way a consultation note survives a restart (R12,
+            # KTD8): there is no live `Consultation` here, only what was
+            # persisted.
+            bubble.show_consultation_metadata(message.metadata)
         log.scroll_end(animate=False)
 
     def _model_name_for(self, message: Message) -> str | None:
@@ -423,7 +428,12 @@ class ChatApp(App[None]):
         self._generating = True
         self._refresh_status(busy="loading model…")
 
-        stream = self.chat.stream_reply(self.conversation, text, self.options)
+        stream = self.chat.stream_reply(
+            self.conversation,
+            text,
+            self.options,
+            on_progress=lambda phase: self._refresh_status(busy=phase),
+        )
         first = True
         try:
             async for chunk in stream:
@@ -432,6 +442,7 @@ class ChatApp(App[None]):
                     if self.chat.last_turn is not None:
                         bubble.bind_message(self.chat.last_turn.message)
                         user_bubble.show_enrichment(self.chat.last_turn.enrichment)
+                        bubble.show_consultation(self.chat.last_turn.consultation)
                     self._refresh_status(busy="generating…")
                 bubble.append(chunk)
                 log.scroll_end(animate=False)
@@ -444,10 +455,13 @@ class ChatApp(App[None]):
         finally:
             # A reply that errors or is stopped before its first chunk still
             # spent the memories (`stream_reply` marks them used before it
-            # starts streaming) — show_enrichment is idempotent, so repeating
-            # the call here is what makes the note appear regardless.
+            # starts streaming) and, on a consulted turn, the specialist
+            # still ran — show_enrichment/show_consultation are idempotent,
+            # so repeating the calls here is what makes the notes appear
+            # regardless.
             if self.chat.last_turn is not None:
                 user_bubble.show_enrichment(self.chat.last_turn.enrichment)
+                bubble.show_consultation(self.chat.last_turn.consultation)
             self._generating = False
             self.call_later(self._refresh_status)
             log.scroll_end(animate=False)

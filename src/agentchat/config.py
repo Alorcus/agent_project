@@ -14,6 +14,7 @@ from pathlib import Path
 
 from dotenv import find_dotenv, load_dotenv
 
+from agentchat.core.delegation import DelegationService
 from agentchat.core.enrichment import MemoryEnricher
 from agentchat.core.errors import AgentChatError
 from agentchat.core.extraction import ExtractionService
@@ -143,6 +144,18 @@ class Settings:
     enrich_messages: bool = field(
         default_factory=lambda: _env_flag("ENRICH_MESSAGES", True)
     )
+    #: On by default, same reasoning as `extract_summaries`. Off switches
+    #: sub-agent consultation entirely, with no flag threaded through call
+    #: sites (`ChatService.stream_reply` just checks for `None`).
+    subagents: bool = field(default_factory=lambda: _env_flag("SUBAGENTS", True))
+    #: Seconds each consultation phase (routing+task, then the specialist's
+    #: answer) is allowed. Materially larger than `extraction_timeout`'s 30 —
+    #: a consulted turn is three generations, not two.
+    subagent_timeout: float = field(
+        default_factory=lambda: (
+            60.0 if (v := _env_float("SUBAGENT_TIMEOUT")) is None else v
+        )
+    )
     #: On by default: an instrument that has to be switched on is an
     #: instrument nobody has running when the interesting turn happens.
     log_llm_io: bool = field(default_factory=lambda: _env_flag("LOG_LLM_IO", True))
@@ -206,6 +219,16 @@ def build_enricher(settings: Settings, store: ConversationStore) -> MemoryEnrich
     if not settings.enrich_messages:
         return None
     return MemoryEnricher(store)
+
+
+def build_delegator(
+    settings: Settings, registry: ModelRegistry
+) -> DelegationService | None:
+    """Assemble the delegation service. The only place sub-agent consultation
+    is switched on; `None` when `subagents` is off."""
+    if not settings.subagents:
+        return None
+    return DelegationService(registry, timeout=settings.subagent_timeout)
 
 
 def _register_local(registry: ModelRegistry, settings: Settings) -> None:

@@ -31,13 +31,18 @@ src/agentchat/
   log.py           file-handler plumbing shared by the app log and the LLM transcript
   config.py        settings + the single wiring point for backends and stores
   core/            domain model, chat orchestration, context strategy, errors
-    prompts.py     the extraction and enrichment prompt text and nothing else
-                    — edit this file to tune summary/keyword quality or the
-                    wording of the injected memory block, not extraction.py
-                    or enrichment.py
+    prompts.py     the assistant's own system prompt (DEFAULT_SYSTEM) plus the
+                    extraction, enrichment and consultation prompt text, and
+                    nothing else — edit this file to tune how the assistant
+                    answers, summary/keyword quality, routing quality, or the
+                    wording of the injected memory/consultation block, not
+                    chat.py, extraction.py, enrichment.py, or delegation.py
     extraction.py  ExtractionService: two LLM calls, summary then keywords
     enrichment.py  MemoryEnricher: keyword-matches a user message against the
                     group's other summaries and tracks what's been used
+    agents.py      SubAgent, the shipped roster, and @mention parsing
+    delegation.py  DelegationService: route → task → specialist, one
+                    Consultation or None, one entry point for every failure
   llm/             LLMProvider protocol, mock + local (transformers) backends, registry
     transcript.py  verbatim request/response log, recorded *inside* local.py
                     and mock.py on purpose — it sits below the streamer's

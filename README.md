@@ -99,6 +99,8 @@ Environment variables, all prefixed `AGENTCHAT_`:
 | `AGENTCHAT_EXTRACT_SUMMARIES` | `1` | Derive a summary and keywords for a conversation when it is left |
 | `AGENTCHAT_EXTRACTION_TIMEOUT` | `30.0` | Seconds `Ctrl+D`/`Ctrl+Q` wait for extraction before exiting anyway |
 | `AGENTCHAT_ENRICH_MESSAGES` | `1` | Append matching summaries from the group to a user message before it reaches the model |
+| `AGENTCHAT_SUBAGENTS` | `1` | Route a user message to a specialist, when one clearly fits, before answering |
+| `AGENTCHAT_SUBAGENT_TIMEOUT` | `60.0` | Seconds each consultation phase (routing+task, then the specialist's answer) is allowed |
 | `AGENTCHAT_LOG_LLM_IO` | `1` | Write a verbatim request/response transcript of every model call to `llm.jsonl` |
 | `AGENTCHAT_LOG_DIR` | `<data_dir>/logs` | Where `agentchat.log` and `llm.jsonl` are written |
 
@@ -152,6 +154,44 @@ rather than engineered around.
 
 `AGENTCHAT_ENRICH_MESSAGES=0` switches the feature off.
 
+## Consulting a specialist
+
+Before answering, the active model is asked which of a small roster of
+specialists — if any — best fits the message:
+
+| `@id` | Handles |
+|---|---|
+| `ask_chef` | cooking, recipes, ingredients, kitchen technique, meal planning |
+| `ask_bank` | personal banking, interest rates, loans, mortgages, budgeting |
+| `ask_tutor` | explaining a concept step by step, teaching, worked examples |
+
+A turn that routes to a specialist is four LLM calls, in sequence, on the one
+resident model: **route** (which specialist, or none), **task** (what exactly
+to ask it — the specialist never sees the conversation, only this restated
+task), **specialist** (its answer), and **reply** (the assistant folds that
+answer into the response it actually writes). The specialist advises the
+assistant and never speaks to the user directly — its answer is appended to a
+throwaway copy of your message, and the reply you see is written by the model
+you're talking to, in its own voice, free to correct what the specialist got
+wrong.
+
+Under a reply written with a specialist's help, a muted line appears —
+`▸ answered with help from Banking` — that expands on click to show the task
+it was given and what it answered. Unlike message enrichment, this **is**
+persisted: `Message.metadata["subagent"]` survives a restart, since the
+specialist's own words appear nowhere else.
+
+Starting a message with `@<id>` (e.g. `@ask_bank what's a good rate right
+now?`) forces that specialist and skips the routing call; `@default` forces a
+plain turn. An unrecognised `@mention` is not an error — it just falls through
+to normal routing.
+
+Grep `llm.jsonl` (see "Logs" below) for `"label":"route"`,
+`"label":"subagent.task"`, `"label":"subagent.<id>"`, and `"label":"chat"` to
+see each of the four calls in a consulted turn.
+
+`AGENTCHAT_SUBAGENTS=0` switches the feature off.
+
 ## Logs
 
 Every call into a model backend writes two JSON lines to
@@ -187,9 +227,11 @@ src/agentchat/
     models.py      Message, Conversation, ConversationSummary
     chat.py        turn orchestration — the only thing that knows how a reply is made
     context.py     ContextStrategy seam (context-management elective)
-    prompts.py     extraction and enrichment prompt text, transcript rendering, keyword parsing
+    prompts.py     the assistant's system prompt, extraction, enrichment and consultation prompt text, transcript rendering, keyword/agent-id parsing
     extraction.py  ExtractionService — two LLM calls, summary then keywords
     enrichment.py  MemoryEnricher — keyword matching and the once-per-visit session ledger
+    agents.py      SubAgent, the shipped roster, and @mention parsing
+    delegation.py  DelegationService — route → task → specialist, one Consultation or None
     errors.py      every failure the UI is expected to render
   llm/
     base.py        LLMProvider protocol — the app/backend boundary
@@ -221,6 +263,10 @@ imports a concrete backend.
   one model resident at a time.
 - Every prompt is assembled by a `ContextStrategy`, so smarter context
   management is a swap of one object.
+- The assistant answers under a system prompt (`prompts.DEFAULT_SYSTEM`) that
+  keeps a reply as short as the question asked for. It is prepended per turn
+  and never stored, so editing it changes the next reply in an old
+  conversation too.
 - Backend failure surfaces as a UI error, not a crash — set
   `AGENTCHAT_SIMULATE_FAILURE=1` and switch to the second model to see it.
 - Assistant messages record which model produced them.
@@ -247,13 +293,20 @@ imports a concrete backend.
 - LLM I/O transcript — every model call writes a verbatim request/response
   pair to `llm.jsonl`, recorded from inside the backend so it reflects what
   the model actually saw and said. See "Logs" above.
+- Sub-agent consultation — a user message is routed to a specialist roster
+  entry (or none), which answers a restated task in an isolated context; its
+  answer is folded into the assistant's own reply, never streamed to the user
+  directly. See "Consulting a specialist" above.
 
 ## Not yet built
 
 Deliberately stubbed, with the seam in place:
 
 - The two required fine-tunes.
-- Adaptive RAG, sub-agent deployment, intelligent context management (electives).
+- Adaptive RAG, intelligent context management (electives).
+- Specialists on their own weights (LoRA adapters over the shared resident
+  base) — the roster is prompt-differentiated for now; `SubAgent` has no
+  `model_id`.
 - History virtualisation for very long conversations.
 
 See `requirements.md` for the full non-functional requirement set.

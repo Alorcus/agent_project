@@ -26,3 +26,8 @@ class StorageError(AgentChatError):
 
 class ExtractionError(AgentChatError):
     """Summarising a conversation produced nothing worth storing."""
+
+
+class DelegationError(AgentChatError):
+    """Consulting a sub-agent failed — routing, task authoring, or the
+    specialist's own answer produced nothing worth injecting."""

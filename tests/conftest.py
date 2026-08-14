@@ -106,7 +106,10 @@ def mock_settings(**overrides) -> Settings:
     ``extract_summaries=True`` explicitly. Enrichment defaults to off for the
     same reason — otherwise every turn in the existing suite would grow a
     ``list_summaries`` query; tests that are about enrichment pass
-    ``enrich_messages=True`` explicitly.
+    ``enrich_messages=True`` explicitly. Sub-agent consultation defaults to
+    off for the same reason again — otherwise every turn in the existing
+    suite would grow up to three silent LLM calls; tests that are about
+    consultation pass ``subagents=True`` explicitly.
     """
     overrides.setdefault("backend", "mock")
     overrides.setdefault("store", "sqlite")
@@ -114,6 +117,7 @@ def mock_settings(**overrides) -> Settings:
     overrides.setdefault("mock_load_delay", 0.0)
     overrides.setdefault("extract_summaries", False)
     overrides.setdefault("enrich_messages", False)
+    overrides.setdefault("subagents", False)
     return Settings(**overrides)
 
 

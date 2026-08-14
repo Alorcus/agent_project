@@ -7,15 +7,16 @@ providers, context strategies, or the store.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, replace
 
 from agentchat.core.context import ContextDecision, ContextStrategy, RecencyWindowStrategy
+from agentchat.core.delegation import Consultation, DelegationService
 from agentchat.core.enrichment import MemoryEnricher
 from agentchat.core.errors import StorageError
 from agentchat.core.extraction import ExtractionService
 from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, ConversationSummary, Group, Message
-from agentchat.core.prompts import enriched_text
+from agentchat.core.prompts import DEFAULT_SYSTEM, consulted_text, enriched_text
 from agentchat.llm import transcript
 from agentchat.llm.base import GenerationOptions
 from agentchat.llm.registry import ModelRegistry
@@ -31,6 +32,9 @@ class TurnResult:
     #: The summaries actually sent with this turn — `()` if none matched, or
     #: the enrichment was rebuilt away because it didn't survive trimming.
     enrichment: tuple[ConversationSummary, ...] = ()
+    #: The sub-agent consulted for this turn, if any — `None` on a plain turn
+    #: or when the consultation didn't survive trimming.
+    consultation: Consultation | None = None
 
 
 class ChatService:
@@ -41,6 +45,7 @@ class ChatService:
         context_strategy: ContextStrategy | None = None,
         extractor: ExtractionService | None = None,
         enricher: MemoryEnricher | None = None,
+        delegator: DelegationService | None = None,
     ) -> None:
         self.registry = registry
         self.store = store
@@ -51,6 +56,8 @@ class ChatService:
         self.extractor = extractor
         #: `None` switches enrichment off, the same way.
         self.enricher = enricher
+        #: `None` switches sub-agent consultation off, the same way.
+        self.delegator = delegator
         # Held by both `stream_reply` and `summarise`: `TransformersProvider`
         # kills one `generate()` call when a second starts on it (KTD7), so
         # only one of the two may run at a time.
@@ -118,10 +125,17 @@ class ChatService:
         conversation: Conversation,
         user_text: str,
         options: GenerationOptions | None = None,
+        on_progress: Callable[[str], None] | None = None,
     ) -> AsyncIterator[str]:
         """Append the user turn, then stream the assistant turn, yielding each
         chunk. Cancelling the consumer stops generation but keeps the partial
-        reply in history."""
+        reply in history.
+
+        `on_progress`, when given, is called with a short phase label
+        whenever the turn enters a phase that produces no output yet —
+        routing, consulting a sub-agent — since three of a consulted turn's
+        four generations happen before the first streamed chunk.
+        """
         conversation.add_user(user_text)
         conversation.autotitle()
 
@@ -136,18 +150,40 @@ class ChatService:
         # lock, or every later `summarise()` on this provider deadlocks.
         async with self._provider_lock:
             provider = await self.registry.active_provider()
-            prompt_messages = self._prompt_messages(conversation, selected)
+
+            consultation: Consultation | None = None
+            if self.delegator is not None:
+                if on_progress is not None:
+                    on_progress("routing…")
+                # `conversation.messages` already ends with this turn's user
+                # message, so the task is written from the exchange it belongs
+                # to rather than from one message with its referents missing.
+                consultation = await self.delegator.consult(
+                    user_text, on_progress, history=conversation.messages
+                )
+            if consultation is not None:
+                # No enrichment alongside an injected consultation (KTD12):
+                # generations were already spent reaching this point, and
+                # appending both blocks to one user turn would double the
+                # overflow risk the trimming fallback below exists to absorb.
+                selected = ()
+
+            prompt_messages = self._prompt_messages(conversation, selected, consultation)
             decision = self.context_strategy.build(
                 prompt_messages, context_window=provider.info.context_window
             )
-            if selected and any(m is prompt_messages[-1] for m in decision.dropped):
-                # The enriched turn didn't survive trimming whole — rebuild
+            if (selected or consultation) and any(
+                m is prompt_messages[-1] for m in decision.dropped
+            ):
+                # The injected turn didn't survive trimming whole — rebuild
                 # without it rather than cost the user their own question.
-                # Clearing `selected` here also keeps it from being marked
-                # used below: nothing was actually sent.
+                # Clearing the injected state here also keeps it from being
+                # marked used / recorded below: nothing was actually sent.
                 selected = ()
+                consultation = None
                 decision = self.context_strategy.build(
-                    conversation.messages, context_window=provider.info.context_window
+                    self._prompt_messages(conversation, ()),
+                    context_window=provider.info.context_window,
                 )
             if selected and self.enricher is not None:
                 self.enricher.mark_used(selected)
@@ -164,9 +200,27 @@ class ChatService:
             # The enrichment is deliberately absent from `metadata`, which is
             # persisted verbatim on every turn (`_save` rewrites every row
             # from `conversation.messages`); `TurnResult.enrichment` is the
-            # only place it is recorded.
-            self.last_turn = TurnResult(message=reply, context=decision, enrichment=selected)
+            # only place it is recorded. Consultation provenance, unlike
+            # enrichment, *is* persisted (KTD8) — written only when the block
+            # actually reached the model, so the trimming rollback above
+            # leaves no metadata claiming a source the reply never saw.
+            if consultation is not None:
+                reply.metadata["subagent"] = {
+                    "id": consultation.agent.id,
+                    "name": consultation.agent.name,
+                    "task": consultation.task,
+                    "answer": consultation.answer,
+                    "trigger": consultation.trigger,
+                }
+            self.last_turn = TurnResult(
+                message=reply,
+                context=decision,
+                enrichment=selected,
+                consultation=consultation,
+            )
 
+            if on_progress is not None:
+                on_progress("writing the reply…")
             parts: list[str] = []
             try:
                 # Scoped to the generation only, not the persist below — a
@@ -183,19 +237,30 @@ class ChatService:
                 await self.persist(conversation)
 
     def _prompt_messages(
-        self, conversation: Conversation, selected: Sequence[ConversationSummary]
+        self,
+        conversation: Conversation,
+        selected: Sequence[ConversationSummary],
+        consultation: Consultation | None = None,
     ) -> list[Message]:
-        """`conversation.messages`, unchanged when `selected` is empty;
-        otherwise a copy whose last message — the user turn just added — has
-        `selected`'s summaries appended to its content. The original in
-        `conversation.messages` is never touched, which is what keeps the
-        enrichment out of the database without needing a rule anyone has to
-        remember."""
-        if not selected:
-            return conversation.messages
+        """The assistant's system prompt followed by `conversation.messages`,
+        the last of which — the user turn just added — carries the
+        consultation's or `selected`'s material appended to its content when
+        there is anything to inject. The two are mutually exclusive (KTD12).
+        Nothing in `conversation.messages` is touched, which is what keeps
+        both the system prompt and the injection out of the database without
+        needing a rule anyone has to remember."""
+        system = Message(role="system", content=DEFAULT_SYSTEM)
         last = conversation.messages[-1]
-        enriched = replace(last, content=enriched_text(last.content, selected))
-        return [*conversation.messages[:-1], enriched]
+        if consultation is not None:
+            content = consulted_text(
+                last.content, consultation.agent, consultation.task, consultation.answer
+            )
+        elif selected:
+            content = enriched_text(last.content, selected)
+        else:
+            return [system, *conversation.messages]
+        copy = replace(last, content=content)
+        return [system, *conversation.messages[:-1], copy]
 
     async def summarise(self, conversation: Conversation) -> ConversationSummary | None:
         """Extract and persist a summary for `conversation`, unless there is

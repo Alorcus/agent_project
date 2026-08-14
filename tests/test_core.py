@@ -17,11 +17,13 @@ from agentchat.core.context import RecencyWindowStrategy
 from agentchat.core.errors import ModelNotFoundError, ProviderError
 from agentchat.core.extraction import ExtractionService
 from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, Message
+from agentchat.core.prompts import DEFAULT_SYSTEM
 from agentchat.llm.base import GenerationOptions, ModelInfo
 from agentchat.llm.mock import MockProvider
+from agentchat.llm.registry import ModelRegistry
 from agentchat.storage.sqlite import SqliteStore
 from conftest import fast_registry, mock_settings
-from factories import make_group
+from factories import make_group, scripted_provider
 
 
 async def test_mock_provider_streams_multiple_chunks():
@@ -91,6 +93,32 @@ async def test_chat_service_records_both_turns_and_provenance(store):
     assert conversation.messages[1].content == "".join(chunks)
     assert conversation.messages[1].model_id == registry.active_id
     assert conversation.title.startswith("hello there")
+
+
+async def test_every_turn_is_sent_with_the_system_prompt_and_stores_none(store):
+    provider = scripted_provider("a reply", "another reply")
+    registry = ModelRegistry()
+    registry.register(provider.info, lambda: provider)
+    chat = ChatService(registry, store=store)
+    conversation = await chat.new_conversation()
+
+    async for _ in chat.stream_reply(conversation, "hello"):
+        pass
+    async for _ in chat.stream_reply(conversation, "and again"):
+        pass
+
+    for call in provider.calls:
+        assert call.messages[0].role == "system"
+        assert call.messages[0].content == DEFAULT_SYSTEM
+    assert [m.role for m in conversation.messages] == ["user", "assistant"] * 2
+    stored = await chat.store.load(conversation.id)
+    assert all(m.role != "system" for m in stored.messages)
+
+
+def test_system_prompt_asks_for_short_answers_unless_length_was_asked_for():
+    prompt = DEFAULT_SYSTEM.lower()
+    assert "short answer" in prompt
+    assert "asks" in prompt, "the long-answer exception has to be stated"
 
 
 async def test_stopping_mid_stream_keeps_the_partial_reply(store):
