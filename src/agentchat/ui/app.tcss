@@ -42,11 +42,33 @@ Screen {
     border: round $accent;
 }
 
-#statusbar {
+#statusrow {
     height: 1;
     padding: 0 2;
-    color: $text-muted;
     background: $panel;
+}
+
+/* The status text takes what is left so the meter keeps its column on the
+   right — the bar is read by its length, which a moving left edge would ruin. */
+#statusbar {
+    width: 1fr;
+    color: $text-muted;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+#context-meter {
+    width: auto;
+    padding-left: 2;
+    color: $text-muted;
+}
+
+#context-meter.-tight {
+    color: $warning;
+}
+
+#context-meter.-full {
+    color: $error;
 }
 
 #statusbar.-busy {

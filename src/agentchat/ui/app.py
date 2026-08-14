@@ -13,7 +13,7 @@ from pathlib import Path
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, VerticalScroll
+from textual.containers import Container, Horizontal, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Footer, Input, Static
 
@@ -30,7 +30,7 @@ from agentchat.core.errors import AgentChatError, ModelNotFoundError
 from agentchat.core.models import Conversation, Group, Message
 from agentchat.llm.base import GenerationOptions
 from agentchat.ui.screens import ConversationPicker, GroupChooser
-from agentchat.ui.widgets import ConversationHeader, MessageBubble
+from agentchat.ui.widgets import ContextMeter, ConversationHeader, MessageBubble
 
 _GENERATION_GROUP = "generation"
 _EXTRACTION_GROUP = "extraction"
@@ -88,7 +88,15 @@ class ChatApp(App[None]):
             Static(self._placeholder_text(), classes="placeholder"),
             id="chat-log",
         )
-        yield Static("", id="statusbar")
+        # Two widgets on one row rather than one line of text: the meter is
+        # coloured by how full it is, which it can only be as a widget of its
+        # own, and right-aligning it keeps the bar still while the status text
+        # on the left changes length.
+        yield Horizontal(
+            Static("", id="statusbar"),
+            ContextMeter(id="context-meter"),
+            id="statusrow",
+        )
         yield Container(
             Input(placeholder="Message…", id="prompt"),
             id="composer",
@@ -488,7 +496,24 @@ class ChatApp(App[None]):
         bar = self._chat_screen.query_one("#statusbar", Static)
         bar.set_class(busy is not None, "-busy")
         bar.update(self.status_text)
+        self._refresh_meter()
         self._refresh_header()
+
+    def _refresh_meter(self) -> None:
+        """The meter tracks `last_turn.usage`, which is the live collector for
+        a turn still streaming — so refreshing the status bar at each phase is
+        all it takes for the bar to grow as the turn spends its context."""
+        turn = self.chat.last_turn
+        info = self.registry.active_info
+        meter = self._chat_screen.query_one("#context-meter", ContextMeter)
+        meter.show(
+            turn.usage.peak if turn is not None else None,
+            # Only reached before the first turn (or after a switch clears
+            # `last_turn`): with a peak in hand the window comes from it, so
+            # the figure and the scale always describe the same call even
+            # after Ctrl+O.
+            context_window=info.context_window if info else 0,
+        )
 
     def _refresh_header(self) -> None:
         """Folded into `_refresh_status` so the two cannot drift: every point

@@ -16,6 +16,7 @@ from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
 
+from agentchat.core import usage
 from agentchat.core.errors import ProviderError
 from agentchat.core.models import Message
 from agentchat.llm import transcript
@@ -234,6 +235,14 @@ class TransformersProvider:
             prompt_tokens=prompt_len,
             options=options,
         )
+        # Held until the thread below knows what was generated: the cache
+        # holds the prompt and the completion together.
+        metered = usage.record(
+            label=label,
+            messages=messages,
+            prompt_tokens=prompt_len,
+            context_window=self._info.context_window,
+        )
         inputs = inputs.to(self._model.device)
 
         streamer = TextIteratorStreamer(
@@ -264,7 +273,7 @@ class TransformersProvider:
         state: dict[str, Any] = {}
         thread = threading.Thread(
             target=self._run_generation,
-            args=(torch, kwargs, streamer, state, prompt_len, call_id, label),
+            args=(torch, kwargs, streamer, state, prompt_len, call_id, label, metered),
             name=f"generate:{self._info.id}",
             daemon=True,
         )
@@ -281,6 +290,7 @@ class TransformersProvider:
         prompt_len: int,
         call_id: str,
         label: str,
+        metered: usage.Call | None,
     ) -> None:
         sequences = None
         try:
@@ -296,7 +306,9 @@ class TransformersProvider:
             # ended — completion, stop-event, or exception — in all three
             # cases, so the response record is written from here rather than
             # from the async `generate()` wrapper.
-            self._record_completion(sequences, state, prompt_len, call_id, label)
+            self._record_completion(
+                sequences, state, prompt_len, call_id, label, metered
+            )
 
     def _record_completion(
         self,
@@ -305,6 +317,7 @@ class TransformersProvider:
         prompt_len: int,
         call_id: str,
         label: str,
+        metered: usage.Call | None,
     ) -> None:
         completion_ids = sequences[0][prompt_len:] if sequences is not None else None
         output = (
@@ -320,18 +333,23 @@ class TransformersProvider:
             if self._stop.is_set()
             else "complete"
         )
+        completion_tokens = (
+            int(completion_ids.shape[-1]) if completion_ids is not None else None
+        )
         transcript.record_response(
             call_id=call_id,
             label=label,
             model_id=self._info.id,
             backend="local",
             output=output,
-            completion_tokens=(
-                int(completion_ids.shape[-1]) if completion_ids is not None else None
-            ),
+            completion_tokens=completion_tokens,
             outcome=outcome,
             error=repr(error) if error is not None else None,
         )
+        if metered is not None:
+            # A generation that died before returning sequences wrote nothing
+            # we can count, so it stands at its prompt alone.
+            metered.complete(completion_tokens=completion_tokens or 0)
 
     def _pad_token_id(self) -> int | None:
         tokenizer = self._tokenizer
