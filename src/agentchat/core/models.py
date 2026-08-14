@@ -92,6 +92,66 @@ class ConversationSummary:
         return tuple(piece.strip() for piece in text.split(";") if piece.strip())
 
 
+@dataclass(frozen=True)
+class Author:
+    """Who wrote the words a phrase quotes — not who asserted the claim a
+    fact built from it makes."""
+
+    kind: Literal["user", "model"]
+    label: str
+
+    @property
+    def is_user(self) -> bool:
+        return self.kind == "user"
+
+    @staticmethod
+    def of(message: Message) -> "Author":
+        if message.role == "user":
+            return Author("user", "user")
+        return Author("model", message.model_id or "unknown")
+
+
+@dataclass(frozen=True)
+class Phrase:
+    """A span of one message, in that message's original coordinates."""
+
+    message_id: str
+    start: int
+    end: int
+    author: Author
+
+    def text(self, message: Message) -> str:
+        assert message.id == self.message_id, (
+            f"Phrase for message {self.message_id!r} sliced against {message.id!r}"
+        )
+        return message.content[self.start : self.end]
+
+
+@dataclass
+class Fact:
+    """A claim grounded in one or more `Phrase`s, produced by `FactExtractor`
+    from one sliding window of a conversation."""
+
+    id: str = field(default_factory=_new_id)
+    conversation_id: str = ""
+    group_id: str = ""
+    text: str = ""
+    phrases: tuple[Phrase, ...] = ()
+    #: Half-open range of countable message indices this came from.
+    window_start: int = 0
+    window_end: int = 0
+    model_id: str | None = None
+    created_at: datetime = field(default_factory=_now)
+
+    @property
+    def message_ids(self) -> tuple[str, ...]:
+        seen: list[str] = []
+        for phrase in self.phrases:
+            if phrase.message_id not in seen:
+                seen.append(phrase.message_id)
+        return tuple(seen)
+
+
 @dataclass
 class Conversation:
     """An ordered list of messages."""

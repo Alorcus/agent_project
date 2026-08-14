@@ -58,17 +58,27 @@ src/agentchat/
   config.py        settings + the single wiring point for backends and stores
   core/            domain model, chat orchestration, context strategy, errors
     prompts.py     the assistant's own system prompt (DEFAULT_SYSTEM) plus the
-                    extraction, enrichment and consultation prompt text, and
-                    nothing else — edit this file to tune how the assistant
-                    answers, summary/keyword quality, routing quality, or the
-                    wording of the injected memory/consultation block, not
-                    chat.py, extraction.py, enrichment.py, or delegation.py
+                    extraction, enrichment, consultation and fact/quote prompt
+                    text, and nothing else — edit this file to tune how the
+                    assistant answers, summary/keyword quality, routing
+                    quality, fact/quote quality, or the wording of the
+                    injected memory/consultation block, not chat.py,
+                    extraction.py, enrichment.py, delegation.py, or facts.py
     extraction.py  ExtractionService: two LLM calls, summary then keywords
     enrichment.py  MemoryEnricher: keyword-matches a user message against the
                     group's other summaries and tracks what's been used
     agents.py      SubAgent, the shipped roster, and @mention parsing
     delegation.py  DelegationService: route → task → specialist, one
                     Consultation or None, one entry point for every failure
+    anchoring.py   pure functions that locate a quote in a real message by
+                    code, never by asking the model: normalise, anchor,
+                    anchor_in, significant, coverage. No I/O, no provider, no
+                    store — must stay that way
+    facts.py       countable, windows, FactExtractor: a sliding window of six
+                    messages stepping four, one fact call and one quotes call
+                    per full window. The window arithmetic is derived from the
+                    stored watermark (fact_extraction_state) on every call,
+                    never held in memory between them
   llm/             LLMProvider protocol, mock + local (transformers) backends, registry
     transcript.py  verbatim request/response log, recorded *inside* local.py
                     and mock.py on purpose — it sits below the streamer's

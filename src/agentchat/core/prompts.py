@@ -108,6 +108,158 @@ Summary:
 
 Keywords:"""
 
+#: R5 — the most quotes a single fact call can be given supporting evidence
+#: from.
+MAX_QUOTES = 4
+
+FACT_SYSTEM = """\
+The text below is a short extract from the middle of a conversation — it may \
+open mid-topic and end mid-thought. Read it and state exactly one short \
+factual statement: the single most important thing the extract *establishes*, \
+not what it merely asks about.
+
+Prefer what the text states over what it asks: when the extract is mostly \
+questions, state the smallest true thing it establishes rather than \
+inflating an answer that isn't there. When the text states *why* something \
+holds, include the reason in the same sentence.
+
+Reply with the fact alone: no preamble, no numbering, no quotation marks.
+
+Example:
+
+Text:
+
+User: We're moving our staging environment to Kubernetes next month.
+
+Assistant: Which distribution are you targeting — a managed offering or \
+something self-hosted?
+
+User: A managed one, we don't have anyone to run control planes.
+
+Fact:
+
+The team is moving its staging environment to a managed Kubernetes offering \
+next month.
+
+Example:
+
+Text:
+
+User: Can we drop the nightly backup job? It's been failing for a week and \
+nobody's looked at why.
+
+Assistant: I wouldn't recommend it — even a failing job is a signal \
+something changed; dropping it just removes the alarm.
+
+User: Fair, but it's paging someone every night for nothing.
+
+Fact:
+
+The team is considering dropping its nightly backup job because it has been \
+failing for a week and paging someone every night."""
+
+FACT_PROMPT = "Text:\n\n{text}\n\nFact:"
+
+#: No prompt below may ask for an index, offset, position or line number —
+#: the model never sees character positions, so anchoring a quote is
+#: `anchoring.py`'s job by design, not something a reply can be asked to do.
+QUOTES_SYSTEM = f"""\
+You are given the same text and a fact drawn from it. Copy the exact \
+wording from the text that supports the fact — verbatim, do not paraphrase, \
+add words, or fix typos. One quote per line, at most {MAX_QUOTES} quotes, \
+each long enough to identify uniquely within the text.
+
+Reply with the quotes alone: no preamble, no numbering, no quotation marks.
+
+Example:
+
+Text:
+
+User: We're moving our staging environment to Kubernetes next month.
+
+Assistant: Which distribution are you targeting — a managed offering or \
+something self-hosted?
+
+User: A managed one, we don't have anyone to run control planes.
+
+Fact:
+
+The team is moving its staging environment to a managed Kubernetes offering \
+next month.
+
+Quotes:
+
+moving our staging environment to Kubernetes next month
+A managed one, we don't have anyone to run control planes"""
+
+QUOTES_PROMPT = "Text:\n\n{text}\n\nFact: {fact}\n\nQuotes:"
+
+
+def parse_quotes(text: str, *, limit: int = MAX_QUOTES) -> tuple[str, ...]:
+    """Defensively parse a quotes reply: one quote per non-empty line,
+    bullets/numbering stripped, surrounding quotation marks stripped, empties
+    and duplicates dropped, capped at `limit`. Mirrors `parse_keywords`'s
+    contract — returns `()` when nothing survives, the caller decides what
+    that means. Unlike `parse_keywords`, never strips a trailing period: a
+    quote's own punctuation is part of what must anchor in the source
+    message."""
+    text = text.strip()
+    if text.lower().startswith("quotes:"):
+        text = text[len("quotes:") :].strip()
+
+    quotes: list[str] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        cleaned = _clean_quote(line)
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        quotes.append(cleaned)
+        if len(quotes) >= limit:
+            break
+    return tuple(quotes)
+
+
+def _clean_quote(line: str) -> str:
+    cleaned = line.strip().strip("'\"").strip()
+    while cleaned[:1] in ("-", "*"):
+        cleaned = cleaned[1:].strip()
+    stripped = cleaned.lstrip("0123456789")
+    if stripped != cleaned and stripped[:1] in (".", ")"):
+        cleaned = stripped[1:].strip()
+    return cleaned
+
+
+def render_window(messages: Sequence[Message], *, budget: int) -> str:
+    """Render `messages` as a `User:`/`Assistant:` transcript that fits
+    `budget` tokens, dropping whole assistant turns oldest-first when it
+    doesn't fit. Unlike `render_transcript`, no per-turn character cap — a
+    quote the model is asked to copy verbatim has to exist somewhere in a
+    real message, and a cap would put text in the prompt that exists in no
+    message and so could never anchor."""
+    turns = [
+        (message.role, message.content)
+        for message in messages
+        if message.role != "system" and not message.is_empty
+    ]
+
+    elided = False
+    while turns and _rendered_tokens(turns) > budget:
+        drop_index = _oldest_droppable(turns)
+        if drop_index is None:
+            break
+        del turns[drop_index]
+        elided = True
+
+    rendered = _render(turns)
+    if elided:
+        rendered = f"{ELISION}\n\n{rendered}" if rendered else ELISION
+    return rendered
+
+
 ENRICHMENT_HEADER = """\
 ---
 The following notes were extracted from the user's earlier conversations in \

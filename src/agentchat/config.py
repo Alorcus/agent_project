@@ -18,6 +18,7 @@ from agentchat.core.delegation import DelegationService
 from agentchat.core.enrichment import MemoryEnricher
 from agentchat.core.errors import AgentChatError
 from agentchat.core.extraction import ExtractionService
+from agentchat.core.facts import FactExtractor
 from agentchat.llm.base import ModelInfo
 from agentchat.llm.local import DEFAULT_MODEL_ROOT, TransformersProvider
 from agentchat.llm.local import default_models as local_models
@@ -145,6 +146,11 @@ class Settings:
         default_factory=lambda: _env_flag("ENRICH_MESSAGES", True)
     )
     #: On by default, same reasoning as `extract_summaries`. Off switches
+    #: fact extraction entirely, with no flag threaded through call sites
+    #: (`ChatService.extract_facts` just checks for `None`) — and off means
+    #: no LLM calls at all (R14).
+    extract_facts: bool = field(default_factory=lambda: _env_flag("EXTRACT_FACTS", True))
+    #: On by default, same reasoning as `extract_summaries`. Off switches
     #: sub-agent consultation entirely, with no flag threaded through call
     #: sites (`ChatService.stream_reply` just checks for `None`).
     subagents: bool = field(default_factory=lambda: _env_flag("SUBAGENTS", True))
@@ -219,6 +225,16 @@ def build_enricher(settings: Settings, store: ConversationStore) -> MemoryEnrich
     if not settings.enrich_messages:
         return None
     return MemoryEnricher(store)
+
+
+def build_fact_extractor(
+    settings: Settings, registry: ModelRegistry
+) -> FactExtractor | None:
+    """Assemble the fact extractor. The only place fact extraction is
+    switched on; `None` when `extract_facts` is off."""
+    if not settings.extract_facts:
+        return None
+    return FactExtractor(registry)
 
 
 def build_delegator(

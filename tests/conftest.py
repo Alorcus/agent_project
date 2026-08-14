@@ -109,7 +109,10 @@ def mock_settings(**overrides) -> Settings:
     ``enrich_messages=True`` explicitly. Sub-agent consultation defaults to
     off for the same reason again — otherwise every turn in the existing
     suite would grow up to three silent LLM calls; tests that are about
-    consultation pass ``subagents=True`` explicitly.
+    consultation pass ``subagents=True`` explicitly. Fact extraction defaults
+    to off for the same reason again — otherwise every turn in the existing
+    suite would grow up to two silent LLM calls per window; tests that are
+    about fact extraction pass ``extract_facts=True`` explicitly.
     """
     overrides.setdefault("backend", "mock")
     overrides.setdefault("store", "sqlite")
@@ -118,6 +121,7 @@ def mock_settings(**overrides) -> Settings:
     overrides.setdefault("extract_summaries", False)
     overrides.setdefault("enrich_messages", False)
     overrides.setdefault("subagents", False)
+    overrides.setdefault("extract_facts", False)
     return Settings(**overrides)
 
 

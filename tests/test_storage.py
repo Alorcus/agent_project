@@ -8,11 +8,11 @@ from pathlib import Path
 import pytest
 
 from agentchat.core.errors import StorageError
-from agentchat.core.models import DEFAULT_GROUP_ID, Message
+from agentchat.core.models import DEFAULT_GROUP_ID, Author, Fact, Message, Phrase
 from agentchat.storage.schema import connect
 from agentchat.storage.sqlite import SqliteStore
 
-from factories import make_conversation, make_group, make_summary
+from factories import make_conversation, make_fact, make_group, make_phrase, make_summary
 
 
 async def test_round_trip_title_group_messages_and_model_id(tmp_path: Path):
@@ -423,3 +423,153 @@ async def test_saving_a_summary_for_a_missing_conversation_raises(tmp_path: Path
     store = SqliteStore(tmp_path / "chat.db")
     with pytest.raises(StorageError):
         await store.save_summary(make_summary(conversation_id="no-such-conversation"))
+
+
+# -- facts ------------------------------------------------------------------
+
+
+async def test_facts_round_trip_two_facts_with_phrases_and_reconstructed_author(
+    tmp_path: Path,
+):
+    path = tmp_path / "chat.db"
+    store = SqliteStore(path)
+    conversation = make_conversation(
+        messages=[
+            Message(id="m1", role="user", content="Where should I go?"),
+            Message(id="m2", role="assistant", content="Try Kyoto.", model_id="qwen"),
+        ]
+    )
+    await store.save(conversation)
+    fact_a = make_fact(
+        conversation_id=conversation.id,
+        text="The user wants a trip suggestion.",
+        phrases=(
+            make_phrase(
+                message_id="m1", start=0, end=5, author=Author(kind="user", label="user")
+            ),
+        ),
+    )
+    fact_b = make_fact(
+        conversation_id=conversation.id,
+        text="Kyoto was suggested.",
+        phrases=(
+            make_phrase(
+                message_id="m2", start=4, end=9, author=Author(kind="model", label="qwen")
+            ),
+        ),
+    )
+    await store.save_facts([fact_a, fact_b])
+
+    loaded = {f.text: f for f in await store.list_facts(conversation.group_id)}
+
+    assert set(loaded) == {fact_a.text, fact_b.text}
+    reloaded_a = loaded[fact_a.text]
+    assert reloaded_a.window_start == fact_a.window_start
+    assert reloaded_a.window_end == fact_a.window_end
+    assert reloaded_a.model_id == fact_a.model_id
+    assert len(reloaded_a.phrases) == 1
+    assert reloaded_a.phrases[0] == Phrase(
+        message_id="m1", start=0, end=5, author=Author(kind="user", label="user")
+    )
+    reloaded_b = loaded[fact_b.text]
+    assert reloaded_b.phrases[0].author == Author(kind="model", label="qwen")
+
+
+async def test_list_facts_scopes_to_group(tmp_path: Path):
+    path = tmp_path / "chat.db"
+    store = SqliteStore(path)
+    other_group = make_group(name="other")
+    await store.save_group(other_group)
+    in_group = make_conversation()
+    in_other = make_conversation(group_id=other_group.id)
+    await store.save(in_group)
+    await store.save(in_other)
+    await store.save_facts([make_fact(conversation_id=in_group.id, group_id=DEFAULT_GROUP_ID)])
+    await store.save_facts(
+        [make_fact(conversation_id=in_other.id, group_id=other_group.id, text="other fact")]
+    )
+
+    scoped = await store.list_facts(DEFAULT_GROUP_ID)
+
+    assert [f.group_id for f in scoped] == [DEFAULT_GROUP_ID]
+
+
+async def test_deleting_the_conversation_removes_facts_and_phrases(tmp_path: Path):
+    path = tmp_path / "chat.db"
+    store = SqliteStore(path)
+    conversation = make_conversation()
+    await store.save(conversation)
+    await store.save_facts([make_fact(conversation_id=conversation.id)])
+
+    await store.delete(conversation.id)
+
+    with closing(connect(path)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM fact_phrases").fetchone()[0] == 0
+
+
+async def test_deleting_the_group_removes_its_conversations_facts(tmp_path: Path):
+    path = tmp_path / "chat.db"
+    store = SqliteStore(path)
+    project = make_group()
+    await store.save_group(project)
+    conversation = make_conversation(group_id=project.id)
+    await store.save(conversation)
+    await store.save_facts([make_fact(conversation_id=conversation.id, group_id=project.id)])
+
+    await store.delete_group(project.id)
+
+    with closing(connect(path)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
+
+
+async def test_resaving_the_conversation_leaves_its_facts_intact(tmp_path: Path):
+    """The regression the missing FK to `messages` exists to prevent:
+    `SqliteStore._save` deletes and re-inserts every message row on every
+    turn, and a real FK there would cascade every fact away with it."""
+    path = tmp_path / "chat.db"
+    store = SqliteStore(path)
+    conversation = make_conversation()
+    await store.save(conversation)
+    await store.save_facts([make_fact(conversation_id=conversation.id)])
+
+    conversation.add(Message(role="user", content="one more turn"))
+    await store.save(conversation)
+
+    assert len(await store.list_facts(conversation.group_id)) == 1
+    with closing(connect(path)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM fact_phrases").fetchone()[0] == 1
+
+
+async def test_save_facts_twice_appends(tmp_path: Path):
+    path = tmp_path / "chat.db"
+    store = SqliteStore(path)
+    conversation = make_conversation()
+    await store.save(conversation)
+
+    await store.save_facts([make_fact(conversation_id=conversation.id, text="first")])
+    await store.save_facts([make_fact(conversation_id=conversation.id, text="second")])
+
+    facts = await store.list_facts(conversation.group_id)
+    assert {f.text for f in facts} == {"first", "second"}
+
+
+async def test_save_facts_empty_is_a_no_op(tmp_path: Path):
+    store = SqliteStore(tmp_path / "chat.db")
+    await store.save_facts([])  # must not raise
+    assert await store.list_facts(DEFAULT_GROUP_ID) == []
+
+
+async def test_fact_watermark_is_zero_when_unknown_and_round_trips(tmp_path: Path):
+    path = tmp_path / "chat.db"
+    store = SqliteStore(path)
+    conversation = make_conversation()
+    await store.save(conversation)
+
+    assert await store.fact_watermark(conversation.id) == 0
+
+    await store.set_fact_watermark(conversation.id, 6)
+    assert await store.fact_watermark(conversation.id) == 6
+
+    await store.set_fact_watermark(conversation.id, 10)
+    assert await store.fact_watermark(conversation.id) == 10

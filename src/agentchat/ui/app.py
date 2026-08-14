@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+from collections.abc import Coroutine
 from pathlib import Path
 
 from textual import work
@@ -22,6 +23,7 @@ from agentchat.config import (
     build_delegator,
     build_enricher,
     build_extractor,
+    build_fact_extractor,
     build_registry,
     build_store,
 )
@@ -66,6 +68,7 @@ class ChatApp(App[None]):
             extractor=build_extractor(self.settings, self.registry),
             enricher=build_enricher(self.settings, store),
             delegator=build_delegator(self.settings, self.registry),
+            fact_extractor=build_fact_extractor(self.settings, self.registry),
         )
         self.conversation: Conversation = Conversation()
         self.options = GenerationOptions()
@@ -150,7 +153,9 @@ class ChatApp(App[None]):
         await super().action_quit()
 
     async def _summarise_before_exit(self) -> None:
-        if self.chat.extractor is None or not self.conversation.messages:
+        if self.chat.extractor is None and self.chat.fact_extractor is None:
+            return
+        if not self.conversation.messages:
             return
         # A background run from an earlier switch may still hold the
         # provider lock this call needs.
@@ -162,7 +167,7 @@ class ChatApp(App[None]):
         await asyncio.sleep(0)
         try:
             await asyncio.wait_for(
-                self.chat.summarise(self.conversation),
+                self._flush_facts_then_summarise(self.conversation),
                 timeout=self.settings.extraction_timeout,
             )
         except TimeoutError:
@@ -361,29 +366,63 @@ class ChatApp(App[None]):
     # -- extraction ---------------------------------------------------------
 
     def _maybe_summarise(self, conversation: Conversation) -> None:
-        """Start the background extraction worker, unless extraction is off
-        — checked here, not inside the worker, so a disabled feature starts
-        no worker at all rather than one that immediately no-ops.
+        """Start the background extraction worker, unless both summary and
+        fact extraction are off — checked here, not inside the worker, so a
+        disabled feature starts no worker at all rather than one that
+        immediately no-ops.
 
         Incrementing the counter here, before the worker has even started,
         means the caller's own trailing `_refresh_status()` (after the switch
         completes) already shows the indicator — no race with the worker's
         first tick.
         """
-        if self.chat.extractor is None:
+        if self.chat.extractor is None and self.chat.fact_extractor is None:
             return
         self._summarising_count += 1
         self._summarise(conversation)
 
     @work(group=_EXTRACTION_GROUP, exclusive=True)
     async def _summarise(self, conversation: Conversation) -> None:
-        """Summarise `conversation` in the background, once it is left. Not
-        in `_GENERATION_GROUP`: sharing it would make switching cancel a
-        running generation, the exact regression plan 001's U5 guarded
-        against (R9). `exclusive=True` within its own group so two fast
-        switches leave one extraction in flight, not two."""
+        """Flush any partial fact window (R7) and summarise `conversation` in
+        the background, once it is left. Not in `_GENERATION_GROUP`: sharing
+        it would make switching cancel a running generation, the exact
+        regression plan 001's U5 guarded against (R9). `exclusive=True`
+        within its own group so two fast switches leave one extraction in
+        flight, not two."""
+        await self._run_extraction(self._flush_facts_then_summarise(conversation))
+
+    async def _maybe_extract_facts(self, conversation: Conversation) -> None:
+        """Start the background fact-extraction worker after a turn, when a
+        window came up full (R6). Probes with `pending_fact_windows` first —
+        no provider call — so the status indicator does not blink after
+        every single turn."""
+        if self.chat.fact_extractor is None:
+            return
+        if not await self.chat.pending_fact_windows(conversation):
+            return
+        self._summarising_count += 1
+        self._extract_pending_facts(conversation)
+
+    @work(group=_EXTRACTION_GROUP, exclusive=True)
+    async def _extract_pending_facts(self, conversation: Conversation) -> None:
+        """Extract whatever full windows are due, mid-conversation (R6).
+        Shares `_EXTRACTION_GROUP` with `_summarise` so a fast next turn's
+        `cancel_group` in `_turn` pre-empts this the same way it pre-empts a
+        pending leave-summarisation."""
+        await self._run_extraction(self.chat.extract_facts(conversation))
+
+    async def _flush_facts_then_summarise(self, conversation: Conversation) -> None:
+        await self.chat.extract_facts(conversation, flush=True)
+        await self.chat.summarise(conversation)
+
+    async def _run_extraction(self, coro: Coroutine[None, None, None]) -> None:
+        """Shared bookkeeping for both extraction workers: correct the
+        busy-counter and report a failure as a warning toast, never an
+        error — a missing summary or fact costs the user nothing they asked
+        for, and a red toast every time a model misbehaves would be worse
+        than the missing row (R11)."""
         try:
-            await self.chat.summarise(conversation)
+            await coro
         except asyncio.CancelledError:
             # Cancellation is the designed path (a new turn pre-empts a
             # stale extraction, or the app is shutting down, KTD7) — not a
@@ -394,9 +433,6 @@ class ChatApp(App[None]):
             self._summarising_count -= 1
             raise
         except AgentChatError as error:
-            # Warning, not error: a missing summary costs the user nothing
-            # they asked for, and a red toast every time a model misbehaves
-            # would be worse than the missing row (R11).
             self._summarising_count -= 1
             self._refresh_status()
             self.notify(str(error), severity="warning")
@@ -465,6 +501,7 @@ class ChatApp(App[None]):
             self._generating = False
             self.call_later(self._refresh_status)
             log.scroll_end(animate=False)
+            await self._maybe_extract_facts(self.conversation)
 
     # -- status -----------------------------------------------------------
 

@@ -42,6 +42,36 @@ CREATE TABLE IF NOT EXISTS conversation_summaries (
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_summaries_group
   ON conversation_summaries(group_id);
+
+CREATE TABLE IF NOT EXISTS facts (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+  text TEXT NOT NULL,
+  window_start INTEGER NOT NULL, window_end INTEGER NOT NULL,
+  model_id TEXT, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_facts_group ON facts(group_id);
+CREATE INDEX IF NOT EXISTS idx_facts_conversation ON facts(conversation_id);
+
+-- No FK to `messages`: `SqliteStore._save` deletes and re-inserts every
+-- message row on every turn, so an FK here would cascade every fact in the
+-- conversation away on the next turn. The cascade that matters is carried by
+-- `facts.conversation_id` above.
+CREATE TABLE IF NOT EXISTS fact_phrases (
+  fact_id TEXT NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL,
+  message_id TEXT NOT NULL,
+  start INTEGER NOT NULL, "end" INTEGER NOT NULL,
+  author_kind TEXT NOT NULL, author_label TEXT NOT NULL,
+  PRIMARY KEY (fact_id, ordinal));
+
+-- `covered_messages` here counts *countable* messages (core.facts.countable),
+-- not rows in `messages` — not comparable with
+-- `conversation_summaries.covered_messages` despite the shared name.
+CREATE TABLE IF NOT EXISTS fact_extraction_state (
+  conversation_id TEXT PRIMARY KEY
+    REFERENCES conversations(id) ON DELETE CASCADE,
+  covered_messages INTEGER NOT NULL, updated_at TEXT NOT NULL);
 """
 
 

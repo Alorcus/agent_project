@@ -12,7 +12,7 @@ import asyncio
 from textual.widgets import Input, ListView, Static
 
 from agentchat.core.errors import ProviderError, StorageError
-from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, Group, Message
+from agentchat.core.models import DEFAULT_GROUP_ID, Author, Conversation, Fact, Group, Message, Phrase
 from agentchat.ui.app import _EXTRACTION_GROUP, ChatApp
 from agentchat.ui.screens import ConversationPicker, GroupChooser
 from agentchat.ui.widgets import ConversationHeader, MessageBubble
@@ -1355,6 +1355,83 @@ async def test_extraction_disabled_switching_writes_nothing_and_starts_no_worker
 
         assert await app.chat.store.summary(outgoing_id) is None
         assert not any(worker.group == _EXTRACTION_GROUP for worker in app.workers)
+
+
+# -- fact extraction (R6, R7) ------------------------------------------
+
+
+class _FakeFactExtractor:
+    """Stands in for the real `FactExtractor`: grounds a trivial fact in the
+    window's last message without touching a provider, so these tests are
+    about the app's cadence (when a worker starts, what the indicator shows)
+    rather than re-proving grounding, which `test_facts.py` already covers."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def extract(self, messages) -> Fact | None:
+        self.calls += 1
+        message = messages[-1]
+        end = min(3, len(message.content))
+        return Fact(
+            text="A fake fact.",
+            phrases=(
+                Phrase(message_id=message.id, start=0, end=end, author=Author.of(message)),
+            ),
+        )
+
+
+async def test_facts_extract_after_three_exchanges_without_leaving_r6():
+    app = ChatApp(mock_settings(extract_facts=True, extract_summaries=False))
+    app.chat.fact_extractor = _FakeFactExtractor()
+    async with app.run_test() as pilot:
+        for i in range(3):
+            await _submit(pilot, f"exchange {i}")
+            await _wait_until_done(pilot, app)
+        conversation_id = app.conversation.id
+
+        for _ in range(100):
+            await pilot.pause()
+            facts = await app.chat.store.list_facts(app.conversation.group_id)
+            if any(f.conversation_id == conversation_id for f in facts):
+                break
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError("no fact ever appeared without leaving the conversation")
+
+
+async def test_leaving_the_conversation_produces_the_partial_window_flush_r7():
+    app = ChatApp(mock_settings(extract_facts=True, extract_summaries=False))
+    app.chat.fact_extractor = _FakeFactExtractor()
+    async with app.run_test() as pilot:
+        await _submit(pilot, "only one exchange")
+        await _wait_until_done(pilot, app)
+        outgoing_id = app.conversation.id
+
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+
+        for _ in range(100):
+            await pilot.pause()
+            facts = await app.chat.store.list_facts(app.conversation.group_id)
+            if any(f.conversation_id == outgoing_id for f in facts):
+                break
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError("leaving never produced the partial-window flush")
+
+
+async def test_indicator_shows_nothing_on_a_turn_that_fills_no_window():
+    app = ChatApp(mock_settings(extract_facts=True, extract_summaries=False))
+    fake = _FakeFactExtractor()
+    app.chat.fact_extractor = fake
+    async with app.run_test() as pilot:
+        await _submit(pilot, "not a full window yet")
+        await _wait_until_done(pilot, app)
+        await pilot.pause()
+
+        assert "summarising…" not in app.status_text
+        assert fake.calls == 0
 
 
 # -- extraction on quit, and Ctrl+D --------------------------------------

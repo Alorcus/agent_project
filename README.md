@@ -101,6 +101,7 @@ Environment variables, all prefixed `AGENTCHAT_`:
 | `AGENTCHAT_ENRICH_MESSAGES` | `1` | Append matching summaries from the group to a user message before it reaches the model |
 | `AGENTCHAT_SUBAGENTS` | `1` | Route a user message to a specialist, when one clearly fits, before answering |
 | `AGENTCHAT_SUBAGENT_TIMEOUT` | `60.0` | Seconds each consultation phase (routing+task, then the specialist's answer) is allowed |
+| `AGENTCHAT_EXTRACT_FACTS` | `1` | Extract one grounded fact per six-message window as a conversation goes on |
 | `AGENTCHAT_LOG_LLM_IO` | `1` | Write a verbatim request/response transcript of every model call to `llm.jsonl` |
 | `AGENTCHAT_LOG_DIR` | `<data_dir>/logs` | Where `agentchat.log` and `llm.jsonl` are written |
 
@@ -127,6 +128,27 @@ turn; quitting (`Ctrl+D`/`Ctrl+Q`) shows the same status line but waits for
 it, bounded by `AGENTCHAT_EXTRACTION_TIMEOUT`. A conversation with no new
 messages since its last summary is not re-summarised.
 `AGENTCHAT_EXTRACT_SUMMARIES=0` switches the feature off.
+
+## What gets remembered
+
+Alongside the conversation summary, the conversation is read through a
+sliding window of six messages stepping four, and each full window is sent
+through two LLM calls — one for a fact, one for the quotes that support it —
+as the conversation goes on, not only when it's left. Each quote is located
+in a real stored message by code, not by the model; a quote that can't be
+found is not evidence, and a fact with no located quotes is discarded. A
+located quote becomes a `Phrase`, carrying which message and which author (the
+user, or a specific model id) it came from — so a fact is always traceable
+back to the words that grounded it.
+
+A specialist's advice, consulted mid-turn, is never part of this: it lives
+only in `Message.metadata`, never in a message's own text, so it is counted
+in no window and quoted in no fact. Facts have no consumer yet — nothing
+reads them back into a conversation — they are stored and ready for the recall
+mechanism that will read from them later. Summary extraction runs beside this
+unchanged; the two features don't interact.
+
+`AGENTCHAT_EXTRACT_FACTS=0` switches the feature off.
 
 ## Recalling earlier conversations
 
@@ -224,14 +246,16 @@ src/agentchat/
   log.py           file-handler plumbing shared by the app log and the LLM transcript
   config.py        settings + the single wiring point for backends
   core/
-    models.py      Message, Conversation, ConversationSummary
+    models.py      Message, Conversation, ConversationSummary, Author, Phrase, Fact
     chat.py        turn orchestration — the only thing that knows how a reply is made
     context.py     ContextStrategy seam (context-management elective)
-    prompts.py     the assistant's system prompt, extraction, enrichment and consultation prompt text, transcript rendering, keyword/agent-id parsing
+    prompts.py     the assistant's system prompt, extraction, enrichment, consultation and fact/quote prompt text, transcript rendering, keyword/agent-id/quote parsing
     extraction.py  ExtractionService — two LLM calls, summary then keywords
     enrichment.py  MemoryEnricher — keyword matching and the once-per-visit session ledger
     agents.py      SubAgent, the shipped roster, and @mention parsing
     delegation.py  DelegationService — route → task → specialist, one Consultation or None
+    anchoring.py   pure functions that locate a quote in a real message: normalise, anchor, anchor_in, significant, coverage
+    facts.py       FactExtractor and the sliding-window arithmetic — one fact per full window, derived from the stored watermark
     errors.py      every failure the UI is expected to render
   llm/
     base.py        LLMProvider protocol — the app/backend boundary

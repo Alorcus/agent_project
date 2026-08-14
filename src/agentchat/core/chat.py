@@ -15,7 +15,15 @@ from agentchat.core.delegation import Consultation, DelegationService
 from agentchat.core.enrichment import MemoryEnricher
 from agentchat.core.errors import StorageError
 from agentchat.core.extraction import ExtractionService
-from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, ConversationSummary, Group, Message
+from agentchat.core.facts import FactExtractor, countable, windows
+from agentchat.core.models import (
+    DEFAULT_GROUP_ID,
+    Conversation,
+    ConversationSummary,
+    Fact,
+    Group,
+    Message,
+)
 from agentchat.core.prompts import DEFAULT_SYSTEM, consulted_text, enriched_text
 from agentchat.llm import transcript
 from agentchat.llm.base import GenerationOptions
@@ -46,6 +54,7 @@ class ChatService:
         extractor: ExtractionService | None = None,
         enricher: MemoryEnricher | None = None,
         delegator: DelegationService | None = None,
+        fact_extractor: FactExtractor | None = None,
     ) -> None:
         self.registry = registry
         self.store = store
@@ -58,6 +67,8 @@ class ChatService:
         self.enricher = enricher
         #: `None` switches sub-agent consultation off, the same way.
         self.delegator = delegator
+        #: `None` switches fact extraction off, the same way.
+        self.fact_extractor = fact_extractor
         # Held by both `stream_reply` and `summarise`: `TransformersProvider`
         # kills one `generate()` call when a second starts on it (KTD7), so
         # only one of the two may run at a time.
@@ -280,3 +291,39 @@ class ChatService:
 
         await self.store.save_summary(summary)
         return summary
+
+    async def pending_fact_windows(
+        self, conversation: Conversation, *, flush: bool = False
+    ) -> tuple[tuple[int, int], ...]:
+        """Which windows `extract_facts` would run. The UI's cheap probe: one
+        indexed row read, no provider."""
+        if self.fact_extractor is None:
+            return ()
+        covered = await self.store.fact_watermark(conversation.id)
+        return windows(covered, len(countable(conversation.messages)), flush=flush)
+
+    async def extract_facts(self, conversation: Conversation, *, flush: bool = False) -> tuple[Fact, ...]:
+        """Extract and persist one fact per due window. `()` when there is no
+        extractor and when nothing is due."""
+        ranges = await self.pending_fact_windows(conversation, flush=flush)
+        if not ranges:
+            return ()
+
+        items = countable(conversation.messages)
+        results: list[Fact] = []
+        for start, end in ranges:
+            async with self._provider_lock:
+                fact = await self.fact_extractor.extract(items[start:end])
+            if fact is not None:
+                fact.conversation_id = conversation.id
+                fact.group_id = conversation.group_id
+                fact.window_start = start
+                fact.window_end = end
+                await self.store.save_facts([fact])
+                results.append(fact)
+            # The watermark advances even on a barren window — a window that
+            # produced nothing cannot change, so re-running it buys the same
+            # nothing at the same price. Saved one window at a time, so a
+            # cancelled backlog keeps every window it finished.
+            await self.store.set_fact_watermark(conversation.id, end)
+        return tuple(results)

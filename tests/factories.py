@@ -8,7 +8,7 @@ import time
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 
-from agentchat.core.models import Conversation, ConversationSummary, Group, Message
+from agentchat.core.models import Author, Conversation, ConversationSummary, Fact, Group, Message, Phrase
 from agentchat.llm.base import GenerationOptions, ModelInfo
 
 
@@ -114,6 +114,28 @@ def _chunks(text: str) -> list[str]:
     if not words:
         return []
     return [w + " " for w in words[:-1]] + [words[-1]]
+
+
+def make_phrase(**overrides) -> Phrase:
+    defaults = dict(
+        message_id="m1", start=0, end=5, author=Author(kind="user", label="user")
+    )
+    defaults.update(overrides)
+    return Phrase(**defaults)
+
+
+def make_fact(**overrides) -> Fact:
+    defaults = dict(
+        conversation_id="c1",
+        group_id="default",
+        text="The team is planning a trip to Kyoto.",
+        phrases=(make_phrase(),),
+        window_start=0,
+        window_end=6,
+        model_id="mock-small",
+    )
+    defaults.update(overrides)
+    return Fact(**defaults)
 
 
 def make_summary(**overrides) -> ConversationSummary:

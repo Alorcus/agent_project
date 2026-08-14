@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from collections.abc import Sequence
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
@@ -17,10 +18,14 @@ from pathlib import Path
 from agentchat.core.errors import StorageError
 from agentchat.core.models import (
     DEFAULT_GROUP_ID,
+    Author,
     Conversation,
     ConversationSummary,
+    Fact,
     Group,
     Message,
+    Phrase,
+    _now,
 )
 from agentchat.storage import schema
 from agentchat.storage.base import by_default_first, by_recency, refuse_default_group
@@ -72,6 +77,20 @@ class SqliteStore:
 
     async def list_summaries(self, group_id: str) -> list[ConversationSummary]:
         return await asyncio.to_thread(self._list_summaries, group_id)
+
+    async def save_facts(self, facts: Sequence[Fact]) -> None:
+        if not facts:
+            return
+        await asyncio.to_thread(self._save_facts, facts)
+
+    async def list_facts(self, group_id: str) -> list[Fact]:
+        return await asyncio.to_thread(self._list_facts, group_id)
+
+    async def fact_watermark(self, conversation_id: str) -> int:
+        return await asyncio.to_thread(self._fact_watermark, conversation_id)
+
+    async def set_fact_watermark(self, conversation_id: str, covered: int) -> None:
+        await asyncio.to_thread(self._set_fact_watermark, conversation_id, covered)
 
     def _list_conversations(self, group_id: str | None) -> list[Conversation]:
         try:
@@ -278,6 +297,108 @@ class SqliteStore:
         summaries.sort(key=lambda s: s.updated_at, reverse=True)
         return summaries
 
+    def _save_facts(self, facts: Sequence[Fact]) -> None:
+        try:
+            with closing(self._connect()) as conn, conn:
+                for fact in facts:
+                    conn.execute(
+                        "INSERT INTO facts "
+                        "(id, conversation_id, group_id, text, "
+                        "window_start, window_end, model_id, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            fact.id,
+                            fact.conversation_id,
+                            fact.group_id,
+                            fact.text,
+                            fact.window_start,
+                            fact.window_end,
+                            fact.model_id,
+                            fact.created_at.isoformat(),
+                        ),
+                    )
+                    conn.executemany(
+                        "INSERT INTO fact_phrases "
+                        '(fact_id, ordinal, message_id, start, "end", '
+                        "author_kind, author_label) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            (
+                                fact.id,
+                                ordinal,
+                                phrase.message_id,
+                                phrase.start,
+                                phrase.end,
+                                phrase.author.kind,
+                                phrase.author.label,
+                            )
+                            for ordinal, phrase in enumerate(fact.phrases)
+                        ],
+                    )
+        except sqlite3.Error as exc:
+            raise StorageError("failed to save facts") from exc
+
+    def _list_facts(self, group_id: str) -> list[Fact]:
+        try:
+            with closing(self._connect()) as conn, conn:
+                fact_rows = conn.execute(
+                    "SELECT id, conversation_id, group_id, text, "
+                    "window_start, window_end, model_id, created_at "
+                    "FROM facts WHERE group_id = ?",
+                    (group_id,),
+                ).fetchall()
+                phrase_rows = conn.execute(
+                    "SELECT fact_id, ordinal, message_id, start, \"end\", "
+                    "author_kind, author_label FROM fact_phrases "
+                    "WHERE fact_id IN (SELECT id FROM facts WHERE group_id = ?) "
+                    "ORDER BY fact_id, ordinal",
+                    (group_id,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError(f"failed to list facts for group {group_id}") from exc
+
+        phrases_by_fact: dict[str, list[Phrase]] = {}
+        for fact_id, _ordinal, message_id, start, end, author_kind, author_label in phrase_rows:
+            phrases_by_fact.setdefault(fact_id, []).append(
+                Phrase(
+                    message_id=message_id,
+                    start=start,
+                    end=end,
+                    author=Author(kind=author_kind, label=author_label),
+                )
+            )
+        return [_fact_from_row(row, phrases_by_fact.get(row[0], [])) for row in fact_rows]
+
+    def _fact_watermark(self, conversation_id: str) -> int:
+        try:
+            with closing(self._connect()) as conn, conn:
+                row = conn.execute(
+                    "SELECT covered_messages FROM fact_extraction_state "
+                    "WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            raise StorageError(
+                f"failed to load fact watermark for conversation {conversation_id}"
+            ) from exc
+        return 0 if row is None else row[0]
+
+    def _set_fact_watermark(self, conversation_id: str, covered: int) -> None:
+        try:
+            with closing(self._connect()) as conn, conn:
+                conn.execute(
+                    "INSERT INTO fact_extraction_state "
+                    "(conversation_id, covered_messages, updated_at) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT(conversation_id) DO UPDATE SET "
+                    "covered_messages = excluded.covered_messages, "
+                    "updated_at = excluded.updated_at",
+                    (conversation_id, covered, _now().isoformat()),
+                )
+        except sqlite3.Error as exc:
+            raise StorageError(
+                f"failed to save fact watermark for conversation {conversation_id}"
+            ) from exc
+
 
 def _summary_from_row(row: tuple) -> ConversationSummary:
     (
@@ -299,4 +420,28 @@ def _summary_from_row(row: tuple) -> ConversationSummary:
         model_id=model_id,
         created_at=datetime.fromisoformat(created_at),
         updated_at=datetime.fromisoformat(updated_at),
+    )
+
+
+def _fact_from_row(row: tuple, phrases: list[Phrase]) -> Fact:
+    (
+        id_,
+        conversation_id,
+        group_id,
+        text,
+        window_start,
+        window_end,
+        model_id,
+        created_at,
+    ) = row
+    return Fact(
+        id=id_,
+        conversation_id=conversation_id,
+        group_id=group_id,
+        text=text,
+        phrases=tuple(phrases),
+        window_start=window_start,
+        window_end=window_end,
+        model_id=model_id,
+        created_at=datetime.fromisoformat(created_at),
     )

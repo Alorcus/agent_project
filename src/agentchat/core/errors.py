@@ -28,6 +28,11 @@ class ExtractionError(AgentChatError):
     """Summarising a conversation produced nothing worth storing."""
 
 
+class FactExtractionError(AgentChatError):
+    """Extracting a fact from one window failed — a wrapped provider error,
+    not a window that simply held no fact (that is `None`, not this)."""
+
+
 class DelegationError(AgentChatError):
     """Consulting a sub-agent failed — routing, task authoring, or the
     specialist's own answer produced nothing worth injecting."""

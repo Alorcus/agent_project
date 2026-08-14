@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from collections.abc import Sequence
+
 from agentchat.core.errors import StorageError
-from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, ConversationSummary, Group
+from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, ConversationSummary, Fact, Group
 
 
 def by_recency(conversations: list[Conversation]) -> list[Conversation]:
@@ -76,3 +78,21 @@ class ConversationStore(Protocol):
     async def list_summaries(self, group_id: str) -> list[ConversationSummary]:
         """Most-recently-updated first."""
         ...
+
+    # -- derived state: facts ----------------------------------------------
+    #
+    # No consumer yet: retrieval on facts is plan 010. Append-only — a
+    # window's fact, once saved, is never rewritten.
+
+    async def save_facts(self, facts: Sequence[Fact]) -> None:
+        """Append `facts`. A no-op for `()`."""
+        ...
+
+    async def list_facts(self, group_id: str) -> list[Fact]: ...
+
+    async def fact_watermark(self, conversation_id: str) -> int:
+        """How many countable messages have been extracted. `0` when
+        unknown."""
+        ...
+
+    async def set_fact_watermark(self, conversation_id: str, covered: int) -> None: ...

@@ -9,6 +9,7 @@ from agentchat.config import (
     Settings,
     build_enricher,
     build_extractor,
+    build_fact_extractor,
     build_store,
 )
 from agentchat.core.enrichment import MemoryEnricher
@@ -16,6 +17,7 @@ from agentchat.core.chat import ChatService
 from agentchat.core.context import RecencyWindowStrategy
 from agentchat.core.errors import ModelNotFoundError, ProviderError
 from agentchat.core.extraction import ExtractionService
+from agentchat.core.facts import FactExtractor
 from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, Message
 from agentchat.core.prompts import DEFAULT_SYSTEM
 from agentchat.llm.base import GenerationOptions, ModelInfo
@@ -244,3 +246,15 @@ def test_agentchat_extraction_timeout_bad_value_raises_configuration_error(monke
     monkeypatch.setenv("AGENTCHAT_EXTRACTION_TIMEOUT", "abc")
     with pytest.raises(ConfigurationError):
         Settings()
+
+
+def test_build_fact_extractor_is_switched_by_extract_facts():
+    registry = fast_registry()
+    assert build_fact_extractor(mock_settings(extract_facts=False), registry) is None
+    extractor = build_fact_extractor(mock_settings(extract_facts=True), registry)
+    assert isinstance(extractor, FactExtractor)
+
+
+def test_agentchat_extract_facts_env_flag_is_honoured(monkeypatch):
+    monkeypatch.setenv("AGENTCHAT_EXTRACT_FACTS", "0")
+    assert Settings().extract_facts is False
