@@ -24,6 +24,32 @@ Docstrings and comments should carry only what the code can't say for itself.
 When in doubt: if deleting a comment loses no information a careful reader
 would need, delete it.
 
+## Plan documents: what to build, not how we got there
+
+`docs/plans/*.md` describe the implementation someone is about to write. They
+are not a record of the discussion that produced them.
+
+- **Keep:** what gets built — requirements, data shapes, signatures, file
+  lists, schema, the order of operations, test scenarios, verification steps.
+- **Keep: pitfalls.** A trap a competent implementer would otherwise fall into,
+  stated as a rule with one sentence of why: "`end` is a SQLite keyword — quote
+  it", "don't NFKC the whole string first, it shifts every offset in the index
+  map". The *why* is there so the rule survives someone's tidy-up, not to
+  justify the design.
+- **Cut:** rejected alternatives, "an earlier iteration did X", the reasoning
+  that led to a decision, risk tables that restate pitfalls in prose, open
+  questions that are really musings, and research trails. State the decision;
+  delete the argument for it.
+
+**A revision should not make the plan longer.** Removing a feature means
+deleting its text, not adding a passage explaining that it was removed —
+readers of the plan need the design, and the history is in git. If an edit that
+deletes something grows the file, that is the smell: find the paragraph
+apologising for the change and cut it too.
+
+Applies equally to a plan being revised mid-discussion: answer the question in
+chat, and write to the plan only what the implementation needs.
+
 ## Layout
 
 ```
