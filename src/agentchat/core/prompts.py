@@ -115,13 +115,26 @@ MAX_QUOTES = 4
 FACT_SYSTEM = """\
 The text below is a short extract from the middle of a conversation — it may \
 open mid-topic and end mid-thought. Read it and state exactly one short \
-factual statement: the single most important thing the extract *establishes*, \
-not what it merely asks about.
+factual statement about the user: the single most important thing the extract \
+*establishes* about their world, not what it merely asks about.
+
+You are building a record of that world — the user's systems, tools, data, \
+code, colleagues, deadlines, constraints, habits, preferences and decisions — \
+so that a later conversation can be answered with it. Write the fact so it \
+still stands on its own weeks from now, naming what it is about rather than \
+saying "it" or "the file".
+
+Skip general knowledge. Anything that would hold for anyone — how a \
+technology works, what a term means, what is usually good practice — is \
+already known and useless as a fact, however much of the extract the \
+assistant spent explaining it. From the assistant's turns take only what the \
+user confirmed about themselves.
 
 Prefer what the text states over what it asks: when the extract is mostly \
-questions, state the smallest true thing it establishes rather than \
-inflating an answer that isn't there. When the text states *why* something \
-holds, include the reason in the same sentence.
+questions, state the smallest true thing it establishes about the user rather \
+than inflating an answer that isn't there — what someone asks about is itself \
+evidence of what they are working on. When the text states *why* something \
+holds for them, include the reason in the same sentence.
 
 Reply with the fact alone: no preamble, no numbering, no quotation marks.
 
@@ -138,8 +151,8 @@ User: A managed one, we don't have anyone to run control planes.
 
 Fact:
 
-The team is moving its staging environment to a managed Kubernetes offering \
-next month.
+The user's team is moving its staging environment to a managed Kubernetes \
+offering next month.
 
 Example:
 
@@ -155,8 +168,26 @@ User: Fair, but it's paging someone every night for nothing.
 
 Fact:
 
-The team is considering dropping its nightly backup job because it has been \
-failing for a week and paging someone every night."""
+The user's team is considering dropping its nightly backup job because it has \
+been failing for a week and paging someone every night.
+
+Example:
+
+Text:
+
+User: Will a group-by on 50 million distinct keys blow up in Polars?
+
+Assistant: Polars hashes the grouping keys and streams to disk once the \
+table no longer fits in memory, so the ceiling is usually disk rather than \
+RAM. The engine chooses …
+
+User: Good, because it's a 40GB parquet export of our clickstream and I only \
+have a 32GB laptop.
+
+Fact:
+
+The user groups a 40GB parquet export of their clickstream by a column with \
+50 million distinct keys, on a laptop with 32GB of memory."""
 
 FACT_PROMPT = "Text:\n\n{text}\n\nFact:"
 

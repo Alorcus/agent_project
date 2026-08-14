@@ -35,9 +35,9 @@ WINDOW_CARRY = WINDOW_SIZE - WINDOW_STEP
 
 FACT_MAX_TOKENS = 96
 QUOTES_MAX_TOKENS = 128
-#: Head-room for the instruction text around the window — `FACT_SYSTEM` and
-#: `QUOTES_SYSTEM` each carry a worked example.
-PROMPT_OVERHEAD_TOKENS = 384
+#: Head-room for the instruction text around the window — `FACT_SYSTEM` runs
+#: to three worked examples, `QUOTES_SYSTEM` to one.
+PROMPT_OVERHEAD_TOKENS = 768
 #: A floor under the window budget so a tiny context window still leaves room
 #: for something to extract from.
 MIN_WINDOW_BUDGET = 256
