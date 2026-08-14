@@ -13,7 +13,7 @@ from difflib import SequenceMatcher
 from agentchat.core.models import Message
 
 FUZZY_FLOOR = 0.85          # similarity a fuzzy window must reach
-MIN_COVERAGE = 0.4          # share of a fact's tokens that must be quoted
+MIN_COVERAGE = 0.2          # share of a fact's tokens that must be quoted
 MIN_TOKEN_LENGTH = 4        # cheap stand-in for a stopword list
 PUNCTUATION_FOLD = {        # what a tokenizer trades when it re-generates text
     "‘": "'", "’": "'", "‚": "'", "‛": "'",
