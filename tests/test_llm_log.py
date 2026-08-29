@@ -134,7 +134,7 @@ def test_local_backend_records_error_outcome_without_a_gpu(tmp_path: Path):
     error = RuntimeError("boom")
     instance._record_completion(
         sequences=None, state={"error": error}, prompt_len=0,
-        call_id="abc123", label="chat",
+        call_id="abc123", label="chat", metered=None,
     )
 
     records = _records(path)

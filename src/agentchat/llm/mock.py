@@ -11,6 +11,7 @@ import asyncio
 import random
 from collections.abc import AsyncIterator, Sequence
 
+from agentchat.core import usage
 from agentchat.core.errors import ProviderError
 from agentchat.core.models import Message
 from agentchat.llm import transcript
@@ -91,6 +92,12 @@ class MockProvider:
             prompt_tokens=None,  # no tokenizer on this backend
             options=options,
         )
+        metered = usage.record(
+            label=label,
+            messages=messages,
+            prompt_tokens=None,  # estimated from the messages instead
+            context_window=self._info.context_window,
+        )
         text = self._compose(messages, options)
         emitted: list[str] = []
         try:
@@ -110,6 +117,8 @@ class MockProvider:
                 completion_tokens=None,
                 outcome="complete" if output == text else "stopped",
             )
+            if metered is not None:
+                metered.complete(completion_tokens=None, output=output)
 
     def _compose(self, messages: Sequence[Message], options: GenerationOptions) -> str:
         last_user = next(

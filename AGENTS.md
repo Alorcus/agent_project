@@ -79,6 +79,14 @@ src/agentchat/
                     per full window. The window arithmetic is derived from the
                     stored watermark (fact_extraction_state) on every call,
                     never held in memory between them
+    usage.py       CallUsage/TurnUsage, the context meter's figures: a call's
+                    prompt plus what it generated, recorded in two steps
+                    because the halves are known at different times. Recorded
+                    from *inside* the backends, like the transcript and for
+                    the same reason — only they hold the tokenizer — but it
+                    lives here because core and ui are what read it. Inert
+                    unless a collector is installed, which only
+                    ChatService.stream_reply does
   llm/             LLMProvider protocol, mock + local (transformers) backends, registry
     transcript.py  verbatim request/response log, recorded *inside* local.py
                     and mock.py on purpose — it sits below the streamer's

@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
+from agentchat.core import usage
 from agentchat.core.context import ContextDecision, ContextStrategy, RecencyWindowStrategy
 from agentchat.core.delegation import Consultation, DelegationService
 from agentchat.core.enrichment import MemoryEnricher
@@ -25,6 +26,7 @@ from agentchat.core.models import (
     Message,
 )
 from agentchat.core.prompts import DEFAULT_SYSTEM, consulted_text, enriched_text
+from agentchat.core.usage import TurnUsage
 from agentchat.llm import transcript
 from agentchat.llm.base import GenerationOptions
 from agentchat.llm.registry import ModelRegistry
@@ -43,6 +45,11 @@ class TurnResult:
     #: The sub-agent consulted for this turn, if any — `None` on a plain turn
     #: or when the consultation didn't survive trimming.
     consultation: Consultation | None = None
+    #: What each of the turn's calls left resident, as the backend counted it.
+    #: Still filling in while the reply streams: this object exists before the
+    #: reply's prompt has been sent, let alone its completion counted, so
+    #: `usage.peak` is only final once the turn is.
+    usage: TurnUsage = field(default_factory=TurnUsage)
 
 
 class ChatService:
@@ -160,92 +167,101 @@ class ChatService:
         # mid-stream still has to reach the `finally` below and release the
         # lock, or every later `summarise()` on this provider deadlocks.
         async with self._provider_lock:
-            provider = await self.registry.active_provider()
+            # Opened around every generation this turn makes, the sub-agent
+            # pipeline's included, so the peak it collects is the turn's and
+            # not one call's — and so a background summarisation between
+            # turns, which records nothing while no collector is installed,
+            # cannot land in a turn's figure.
+            with usage.collecting() as turn_usage:
+                provider = await self.registry.active_provider()
 
-            consultation: Consultation | None = None
-            if self.delegator is not None:
-                if on_progress is not None:
-                    on_progress("routing…")
-                # `conversation.messages` already ends with this turn's user
-                # message, so the task is written from the exchange it belongs
-                # to rather than from one message with its referents missing.
-                consultation = await self.delegator.consult(
-                    user_text, on_progress, history=conversation.messages
+                consultation: Consultation | None = None
+                if self.delegator is not None:
+                    if on_progress is not None:
+                        on_progress("routing…")
+                    # `conversation.messages` already ends with this turn's user
+                    # message, so the task is written from the exchange it belongs
+                    # to rather than from one message with its referents missing.
+                    consultation = await self.delegator.consult(
+                        user_text, on_progress, history=conversation.messages
+                    )
+                if consultation is not None:
+                    # No enrichment alongside an injected consultation (KTD12):
+                    # generations were already spent reaching this point, and
+                    # appending both blocks to one user turn would double the
+                    # overflow risk the trimming fallback below exists to absorb.
+                    selected = ()
+
+                prompt_messages = self._prompt_messages(
+                    conversation, selected, consultation
                 )
-            if consultation is not None:
-                # No enrichment alongside an injected consultation (KTD12):
-                # generations were already spent reaching this point, and
-                # appending both blocks to one user turn would double the
-                # overflow risk the trimming fallback below exists to absorb.
-                selected = ()
-
-            prompt_messages = self._prompt_messages(conversation, selected, consultation)
-            decision = self.context_strategy.build(
-                prompt_messages, context_window=provider.info.context_window
-            )
-            if (selected or consultation) and any(
-                m is prompt_messages[-1] for m in decision.dropped
-            ):
-                # The injected turn didn't survive trimming whole — rebuild
-                # without it rather than cost the user their own question.
-                # Clearing the injected state here also keeps it from being
-                # marked used / recorded below: nothing was actually sent.
-                selected = ()
-                consultation = None
                 decision = self.context_strategy.build(
-                    self._prompt_messages(conversation, ()),
-                    context_window=provider.info.context_window,
+                    prompt_messages, context_window=provider.info.context_window
                 )
-            if selected and self.enricher is not None:
-                self.enricher.mark_used(selected)
+                if (selected or consultation) and any(
+                    m is prompt_messages[-1] for m in decision.dropped
+                ):
+                    # The injected turn didn't survive trimming whole — rebuild
+                    # without it rather than cost the user their own question.
+                    # Clearing the injected state here also keeps it from being
+                    # marked used / recorded below: nothing was actually sent.
+                    selected = ()
+                    consultation = None
+                    decision = self.context_strategy.build(
+                        self._prompt_messages(conversation, ()),
+                        context_window=provider.info.context_window,
+                    )
+                if selected and self.enricher is not None:
+                    self.enricher.mark_used(selected)
 
-            reply = conversation.add(
-                Message(role="assistant", content="", model_id=provider.info.id)
-            )
-            reply.metadata["context"] = {
-                "estimated_tokens": decision.estimated_tokens,
-                "budget": decision.budget,
-                "dropped": len(decision.dropped),
-                "notes": decision.notes,
-            }
-            # The enrichment is deliberately absent from `metadata`, which is
-            # persisted verbatim on every turn (`_save` rewrites every row
-            # from `conversation.messages`); `TurnResult.enrichment` is the
-            # only place it is recorded. Consultation provenance, unlike
-            # enrichment, *is* persisted (KTD8) — written only when the block
-            # actually reached the model, so the trimming rollback above
-            # leaves no metadata claiming a source the reply never saw.
-            if consultation is not None:
-                reply.metadata["subagent"] = {
-                    "id": consultation.agent.id,
-                    "name": consultation.agent.name,
-                    "task": consultation.task,
-                    "answer": consultation.answer,
-                    "trigger": consultation.trigger,
+                reply = conversation.add(
+                    Message(role="assistant", content="", model_id=provider.info.id)
+                )
+                reply.metadata["context"] = {
+                    "estimated_tokens": decision.estimated_tokens,
+                    "budget": decision.budget,
+                    "dropped": len(decision.dropped),
+                    "notes": decision.notes,
                 }
-            self.last_turn = TurnResult(
-                message=reply,
-                context=decision,
-                enrichment=selected,
-                consultation=consultation,
-            )
+                # The enrichment is deliberately absent from `metadata`, which is
+                # persisted verbatim on every turn (`_save` rewrites every row
+                # from `conversation.messages`); `TurnResult.enrichment` is the
+                # only place it is recorded. Consultation provenance, unlike
+                # enrichment, *is* persisted (KTD8) — written only when the block
+                # actually reached the model, so the trimming rollback above
+                # leaves no metadata claiming a source the reply never saw.
+                if consultation is not None:
+                    reply.metadata["subagent"] = {
+                        "id": consultation.agent.id,
+                        "name": consultation.agent.name,
+                        "task": consultation.task,
+                        "answer": consultation.answer,
+                        "trigger": consultation.trigger,
+                    }
+                self.last_turn = TurnResult(
+                    message=reply,
+                    context=decision,
+                    enrichment=selected,
+                    consultation=consultation,
+                    usage=turn_usage,
+                )
 
-            if on_progress is not None:
-                on_progress("writing the reply…")
-            parts: list[str] = []
-            try:
-                # Scoped to the generation only, not the persist below — a
-                # cancelled consumer must not carry "chat" across the store
-                # I/O's own await boundaries.
-                with transcript.label("chat"):
-                    async for chunk in provider.generate(decision.messages, options):
-                        parts.append(chunk)
-                        reply.content = "".join(parts)
-                        yield chunk
-            finally:
-                reply.content = "".join(parts)
-                conversation.touch()
-                await self.persist(conversation)
+                if on_progress is not None:
+                    on_progress("writing the reply…")
+                parts: list[str] = []
+                try:
+                    # Scoped to the generation only, not the persist below — a
+                    # cancelled consumer must not carry "chat" across the store
+                    # I/O's own await boundaries.
+                    with transcript.label("chat"):
+                        async for chunk in provider.generate(decision.messages, options):
+                            parts.append(chunk)
+                            reply.content = "".join(parts)
+                            yield chunk
+                finally:
+                    reply.content = "".join(parts)
+                    conversation.touch()
+                    await self.persist(conversation)
 
     def _prompt_messages(
         self,

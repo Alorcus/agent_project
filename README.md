@@ -214,6 +214,35 @@ see each of the four calls in a consulted turn.
 
 `AGENTCHAT_SUBAGENTS=0` switches the feature off.
 
+## The context meter
+
+The right-hand end of the status bar carries a gauge of how full the model's
+context window got on the last turn:
+
+```
+model: Qwen3-14B  ·  thinking: off  ·  turns: 8      ctx ██████▎░░░░░░░ 7.2k/16.4k
+```
+
+It measures what the model actually had to hold, not how long the
+conversation is: the **prompt plus the tokens generated from it**, which is
+what the KV cache is sized by. Both halves are the tokenizer's own counts. A
+turn that drops older messages to fit is shown at its trimmed size, since that
+is what was sent.
+
+A turn is often several calls — a consulted turn is four — and the meter shows
+the **largest** of them, since that is the one the window had to accommodate.
+Hover it for the breakdown and which call it came from (`route`,
+`subagent.task`, `subagent.<id>`, `chat`):
+
+> Largest call of the last turn: 5 412 prompt + 806 generated = 6 218 of
+> 16 384 tokens (38%), from the chat call, counted by the tokenizer.
+
+A call's completion is only known once it ends, so during a long reply the bar
+shows the prompt and catches up when the reply lands. The bar is muted until
+80% of the window, amber to 95%, red beyond it. A `~` in front of the figure
+means nothing counted it: backends without a tokenizer (the mock) are
+estimated at four characters per token.
+
 ## Logs
 
 Every call into a model backend writes two JSON lines to
@@ -321,6 +350,9 @@ imports a concrete backend.
   entry (or none), which answers a restated task in an isolated context; its
   answer is folded into the assistant's own reply, never streamed to the user
   directly. See "Consulting a specialist" above.
+- Context meter — the status bar gauges the last turn's largest call, prompt
+  and completion together, against the active model's window, counted by the
+  backend's own tokenizer. See "The context meter" above.
 
 ## Not yet built
 

@@ -18,6 +18,7 @@ from textual.widgets import Static
 
 from agentchat.core.delegation import Consultation
 from agentchat.core.models import ConversationSummary, Message
+from agentchat.core.usage import CallUsage
 
 _ROLE_LABEL = {"user": "You", "assistant": "Assistant", "system": "System"}
 
@@ -53,6 +54,91 @@ class ConversationHeader(Horizontal):
         if group_name is not None:
             group.update(f"{group_name}{_SEPARATOR}")
         self.query_one("#header-title", Static).update(title)
+
+
+#: Bar width in cells. Fixed rather than proportional: the status line's left
+#: half is variable-length text, and a bar that resized with it would make the
+#: same figure look different from one turn to the next.
+_METER_CELLS = 14
+#: Room for the widest figure the meter prints — `~999.9k/999.9k`.
+_FIGURE_CELLS = 14
+_METER_FULL = "█"
+_METER_EMPTY = "░"
+#: Left-aligned partial blocks, so the bar's leading edge moves in eighths of
+#: a cell instead of jumping a whole one.
+_METER_PARTIALS = "▏▎▍▌▋▊▉"
+
+#: Fractions at which the meter stops being muted. Set above where a trimmed
+#: prompt alone lands — the context strategy holds room back for the response,
+#: so filling its budget exactly is normal and not worth a colour. Amber is
+#: "this turn nearly filled the window", red is "it reached it", which a reply
+#: generated on top of an already-trimmed prompt can now do: the strategy's
+#: reserve is not the same number as the generation's own token limit.
+_METER_TIGHT = 0.8
+_METER_FULL_AT = 0.95
+
+
+class ContextMeter(Static):
+    """A one-line gauge of how full the model's context window got on the last
+    turn — the tokens it had to hold at once, not how long the conversation is.
+
+    Measures the turn's largest call, prompt and completion together, since
+    that is what the cache had to fit: on a consulted turn the specialist's
+    call can be the larger one, and a reply's own generation goes on top of
+    the prompt that produced it.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__("", markup=False, **kwargs)
+
+    def show(self, usage: CallUsage | None, context_window: int) -> None:
+        """Render `usage`, or an empty bar against `context_window` when no
+        turn has been sent yet. A window of zero (no model registered) hides
+        the meter — an empty gauge over an empty scale says nothing."""
+        window = usage.context_window if usage is not None else context_window
+        self.display = window > 0
+        if not self.display:
+            return
+
+        tokens = usage.tokens if usage is not None else 0
+        fraction = usage.fraction if usage is not None else 0.0
+        prefix = "~" if usage is not None and usage.estimated else ""
+        # Padded, not just written: the widget is `width: auto`, so a figure
+        # that grows a digit would otherwise slide the bar a column left and
+        # make it look like it moved when only the number did.
+        figure = f"{prefix}{_short(tokens)}/{_short(window)}"
+        self.update(f"ctx {_bar(fraction, _METER_CELLS)} {figure:<{_FIGURE_CELLS}}")
+        self.set_class(_METER_TIGHT <= fraction < _METER_FULL_AT, "-tight")
+        self.set_class(fraction >= _METER_FULL_AT, "-full")
+        self.tooltip = _meter_tooltip(usage, window)
+
+
+def _meter_tooltip(usage: CallUsage | None, window: int) -> str:
+    if usage is None:
+        return f"Nothing sent yet. Context window: {window} tokens."
+    counted = "estimated" if usage.estimated else "counted by the tokenizer"
+    return (
+        f"Largest call of the last turn: {usage.prompt_tokens} prompt + "
+        f"{usage.completion_tokens} generated = {usage.tokens} of {window} "
+        f"tokens ({usage.fraction:.0%}), from the {usage.label} call, {counted}."
+    )
+
+
+def _bar(fraction: float, width: int) -> str:
+    filled = max(0.0, min(1.0, fraction)) * width
+    cells = [_METER_FULL] * int(filled)
+    remainder = filled - int(filled)
+    if len(cells) < width and remainder > 0:
+        cells.append(_METER_PARTIALS[int(remainder * len(_METER_PARTIALS))])
+    return "".join(cells) + _METER_EMPTY * (width - len(cells))
+
+
+def _short(tokens: int) -> str:
+    """Token counts read as magnitudes here, not exact figures — the exact one
+    is in the tooltip."""
+    if tokens < 1000:
+        return str(tokens)
+    return f"{tokens / 1000:.1f}k"
 
 
 class CollapsibleNote(Static):

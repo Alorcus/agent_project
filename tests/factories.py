@@ -9,6 +9,8 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 
 from agentchat.core.models import Author, Conversation, ConversationSummary, Fact, Group, Message, Phrase
+from agentchat.core import usage
+from agentchat.llm import transcript
 from agentchat.llm.base import GenerationOptions, ModelInfo
 
 
@@ -91,12 +93,26 @@ class ScriptedProvider:
     ) -> AsyncIterator[str]:
         call = RecordedCall(messages=list(messages), options=options, started=time.monotonic())
         self.calls.append(call)
+        # Reported like a real backend's, so tests that assert on the context
+        # meter can drive it with a scripted script rather than a GPU.
+        metered = usage.record(
+            label=transcript.current_label(),
+            messages=messages,
+            prompt_tokens=None,
+            context_window=self._info.context_window,
+        )
         index = len(self.calls) - 1
         reply = self._replies[index] if index < len(self._replies) else ""
-        for chunk in _chunks(reply):
-            if self._chunk_delay:
-                await asyncio.sleep(self._chunk_delay)
-            yield chunk
+        emitted: list[str] = []
+        try:
+            for chunk in _chunks(reply):
+                if self._chunk_delay:
+                    await asyncio.sleep(self._chunk_delay)
+                emitted.append(chunk)
+                yield chunk
+        finally:
+            if metered is not None:
+                metered.complete(completion_tokens=None, output="".join(emitted))
         call.finished = time.monotonic()
 
 
