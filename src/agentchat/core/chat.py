@@ -297,6 +297,30 @@ class ChatService:
         copy = replace(last, content=content)
         return [system, *conversation.messages[:-1], copy]
 
+    async def facts_with_sources(
+        self, group_id: str, *, live: Conversation | None = None
+    ) -> tuple[list[Fact], dict[str, Conversation]]:
+        """The group's facts and, keyed by id, the conversations they were
+        extracted from — everything the evidence view needs, loaded here so the
+        screen itself does no I/O.
+
+        A conversation that `load` returns `None` for is skipped: it was deleted
+        under us and the cascade took its facts, so the next call sees neither.
+        `live` overrides the loaded copy for its own id — the stored copy lags
+        the in-memory one for the duration of a turn, and a fact extracted
+        mid-turn would otherwise render against messages the store has not seen.
+        """
+        facts = await self.store.list_facts(group_id)
+        conversations: dict[str, Conversation] = {}
+        for conversation_id in {fact.conversation_id for fact in facts}:
+            if live is not None and conversation_id == live.id:
+                conversations[conversation_id] = live
+                continue
+            loaded = await self.store.load(conversation_id)
+            if loaded is not None:
+                conversations[conversation_id] = loaded
+        return facts, conversations
+
     async def pending_fact_windows(
         self, conversation: Conversation, *, flush: bool = False
     ) -> tuple[tuple[int, int], ...]:

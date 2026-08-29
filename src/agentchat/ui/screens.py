@@ -4,19 +4,22 @@ themselves — the app awaits store work and interprets the result."""
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime, timezone
 from itertools import chain
 from typing import ClassVar, Literal
 
 from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widget import Widget
 from textual.widgets import Input, ListItem, ListView, Static
 
-from agentchat.core.models import Conversation, Group
+from agentchat.core.evidence import evidence_for
+from agentchat.core.models import Conversation, Fact, Group
+from agentchat.ui.widgets import EvidenceExcerpt
 
 #: ("switch", conversation id), ("new", None) or ("choose", None).
 PickerResult = tuple[Literal["switch", "new", "choose"], str | None]
@@ -28,6 +31,10 @@ _NEW_CONVERSATION_ID = "__new__"
 _NEW_GROUP_ID = "__new_group__"
 _NEW_GROUP_LABEL = "+ New group…"
 _HINT = "enter switch · ctrl+g group · ctrl+x delete · esc cancel"
+_FACTS_HINT = "↑↓ fact · enter open its chat · tab evidence · esc close"
+#: The fact-list pane is a fixed width, so a row's truncation is deterministic
+#: and a test can assert on it; the untruncated text opens the evidence pane.
+_LABEL_CELLS = 40
 _CHOOSER_HINT = "enter start here · ctrl+x delete group · esc cancel"
 _EDITING_HINT = "enter creates the group and starts here · esc backs out"
 
@@ -39,6 +46,33 @@ def groups_for_display(groups: list[Group]) -> list[Group]:
     presentation choice, so it lives here rather than in the store.
     """
     return sorted(groups, key=lambda g: (not g.is_project(), g.created_at))
+
+
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def facts_for_display(
+    facts: list[Fact], conversations: dict[str, Conversation]
+) -> list[Fact]:
+    """Conversations most-recently-updated first, facts within one by
+    `window_start` ascending — the order they were said in. `store.list_facts`
+    promises no order, so this is the only thing that gives the list one.
+    """
+
+    def recency(fact: Fact) -> datetime:
+        conversation = conversations.get(fact.conversation_id)
+        return conversation.updated_at if conversation is not None else _EPOCH
+
+    ordered = sorted(facts, key=lambda fact: fact.window_start)
+    ordered.sort(key=recency, reverse=True)
+    return ordered
+
+
+def _one_line(text: str) -> str:
+    collapsed = " ".join(text.split())
+    if len(collapsed) > _LABEL_CELLS:
+        return collapsed[: _LABEL_CELLS - 1] + "…"
+    return collapsed
 
 
 def _first_selectable(list_view: ListView, index: int) -> int:
@@ -457,3 +491,99 @@ class GroupChooser(ModalScreen[GroupChoice | None], _HintLine):
         # list explicitly or the chooser goes keyboard-dead with no visible
         # cause.
         self.query_one(ListView).focus()
+
+
+class FactBrowser(ModalScreen[str | None]):
+    """The group's facts on the left; highlighting one shows on the right the
+    window of messages it was extracted from, each anchored phrase highlighted
+    at its stored span. Enter opens the highlighted fact's conversation,
+    Escape closes and changes nothing.
+
+    Takes loaded data and does no I/O, exactly as `ConversationPicker` and
+    `GroupChooser` do.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(
+        self,
+        facts: list[Fact],
+        conversations: dict[str, Conversation],
+        group_name: str,
+    ) -> None:
+        super().__init__()
+        self._facts = facts_for_display(facts, conversations)
+        self._conversations = conversations
+        self._group_name = group_name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="facts"):
+            title = f"Facts · {self._group_name}" if self._group_name else "Facts"
+            yield Static(title, classes="picker__title")
+            if not self._facts:
+                yield Static("No facts extracted yet.", classes="picker__empty")
+            else:
+                yield Horizontal(
+                    ListView(
+                        *(self._row_for(fact) for fact in self._facts),
+                        id="facts-list",
+                    ),
+                    VerticalScroll(id="facts-evidence"),
+                    id="facts-panes",
+                )
+            yield Static(_FACTS_HINT, classes="picker__hint")
+
+    def _row_for(self, fact: Fact) -> ListItem:
+        item = ListItem(
+            Static(_one_line(fact.text), classes="facts__item", markup=False)
+        )
+        item.fact_id = fact.id
+        return item
+
+    def on_mount(self) -> None:
+        if self._facts:
+            self.query_one(ListView).focus()
+
+    def _fact_for(self, fact_id: str | None) -> Fact | None:
+        return next((fact for fact in self._facts if fact.id == fact_id), None)
+
+    async def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        # Fires once on mount, which is what renders the first fact — nothing
+        # renders the pane from `on_mount`. `event.item` is `None` for an empty
+        # list.
+        if event.item is None:
+            return
+        fact = self._fact_for(getattr(event.item, "fact_id", None))
+        if fact is not None:
+            await self._render_evidence(fact)
+
+    async def _render_evidence(self, fact: Fact) -> None:
+        pane = self.query_one("#facts-evidence", VerticalScroll)
+        await pane.remove_children()
+        conversation = self._conversations.get(fact.conversation_id)
+        title = conversation.title if conversation is not None else "(conversation unavailable)"
+
+        widgets: list[Widget] = [
+            Static(fact.text, classes="facts__claim", markup=False),
+            Static(
+                f"{title} · messages {fact.window_start}–{fact.window_end}",
+                classes="facts__source",
+                markup=False,
+            ),
+        ]
+        if conversation is not None:
+            evidence = evidence_for(fact, conversation)
+            widgets.extend(EvidenceExcerpt(excerpt) for excerpt in evidence.excerpts)
+            widgets.extend(
+                Static(f"“{orphan}”", classes="facts__orphan", markup=False)
+                for orphan in evidence.orphans
+            )
+        await pane.mount_all(widgets)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        fact = self._fact_for(getattr(event.item, "fact_id", None))
+        if fact is not None:
+            self.dismiss(fact.conversation_id)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)

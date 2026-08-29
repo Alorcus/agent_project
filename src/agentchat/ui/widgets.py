@@ -11,12 +11,14 @@ import textwrap
 from collections.abc import Sequence
 from typing import Any
 
+from rich.text import Text
 from textual import events
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Static
 
 from agentchat.core.delegation import Consultation
+from agentchat.core.evidence import Excerpt
 from agentchat.core.models import Message
 from agentchat.core.usage import CallUsage
 
@@ -282,6 +284,33 @@ def _consultation_note_from(metadata: dict[str, Any]) -> ConsultationNote | None
     if not block:
         return None
     return ConsultationNote(block["name"], block["task"], block["answer"])
+
+
+class EvidenceExcerpt(Vertical):
+    """One message of a fact's window: an author header and the message body
+    with the fact's phrases highlighted at their stored spans."""
+
+    def __init__(self, excerpt: Excerpt, model_name: str | None = None) -> None:
+        super().__init__(classes="facts__excerpt")
+        self._excerpt = excerpt
+        self._model_name = model_name
+
+    def compose(self) -> ComposeResult:
+        message = self._excerpt.message
+        parts = [_ROLE_LABEL.get(message.role, message.role)]
+        name = self._model_name or message.model_id
+        if message.role == "assistant" and name:
+            parts.append(name)
+        yield Static(" · ".join(parts), classes="facts__excerpt-header")
+
+        # A `Text`, never `str(text)`: it carries its spans and bypasses markup
+        # parsing, so a message containing "[bold]" stays text. `reverse`, not a
+        # colour: Rich resolves the style, not the CSS engine, so `$accent`
+        # would not resolve and a literal colour would fail one of the themes.
+        body = Text(message.content)
+        for start, end in self._excerpt.spans:
+            body.stylize("reverse", start, end)
+        yield Static(body, classes="facts__excerpt-body")
 
 
 class MessageBubble(Vertical):

@@ -77,6 +77,10 @@ src/agentchat/
                     per full window. The window arithmetic is derived from the
                     stored watermark (fact_extraction_state) on every call,
                     never held in memory between them
+    evidence.py    Excerpt, Evidence, evidence_for, merge_spans: the pure
+                    projection from a fact's stored spans to the window
+                    messages the Ctrl+F view renders them over. No store, no
+                    widget — the same contract anchoring.py holds
     retrieval.py   Hit, Recall, FactIndex, AdaptiveRetriever: the bounded RAG
                     loop over a group's facts — gate, then rewrite → retrieve →
                     assemble (deterministic, no LLM call) → judge, the judge's

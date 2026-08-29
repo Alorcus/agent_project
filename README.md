@@ -65,6 +65,7 @@ checkpoint fails loudly instead.
 | `Ctrl+N` | New conversation, in the group the current one belongs to |
 | `Ctrl+G` | New conversation, choosing the group — or making one |
 | `Ctrl+L` | Open the conversation overview |
+| `Ctrl+F` | Open the fact evidence view |
 | `Ctrl+X` | Delete the highlighted conversation (overview) or group (chooser) |
 | `Ctrl+O` | Cycle model |
 | `Ctrl+T` | Toggle thinking mode |
@@ -149,6 +150,13 @@ claim and its evidence — as it is written, so the common path never embeds at
 read time.
 
 `AGENTCHAT_EXTRACT_FACTS=0` switches the feature off.
+
+`Ctrl+F` opens the evidence view: the group's facts on the left, and for the
+highlighted one, the window of messages it was extracted from with each
+phrase highlighted in place. The highlight is drawn from the phrase's stored
+span, not by re-matching the quote at view time — it shows where anchoring
+decided the phrase was. Enter opens the highlighted fact's conversation;
+Escape closes and changes nothing.
 
 ## Recalling earlier conversations
 

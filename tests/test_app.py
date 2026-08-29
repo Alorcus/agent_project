@@ -1476,3 +1476,166 @@ async def test_recall_off_renders_no_note():
         await _submit(pilot, "what did we pick for the database?")
         await _wait_until_done(pilot, app)
         assert list(app.query(RecallNote)) == []
+
+
+# -- fact evidence view (Ctrl+F) --------------------------------------------
+
+from agentchat.ui.app import _GENERATION_GROUP  # noqa: E402
+from agentchat.ui.screens import FactBrowser  # noqa: E402
+from agentchat.ui.widgets import EvidenceExcerpt  # noqa: E402
+
+
+async def _seed_facts(app) -> str:
+    """Write a conversation and two facts of it straight to the store, in the
+    group the app's fresh conversation already belongs to. Returns its id."""
+    store = app.chat.store
+    group_id = app.conversation.group_id
+    conversation = Conversation(
+        id="seed-conv",
+        title="Ingest planning",
+        group_id=group_id,
+        messages=[
+            Message(role="user", content="Anna owns the ingest pipeline", id="s-m0"),
+            Message(role="assistant", content="Understood.", id="s-m1", model_id="qwen"),
+            Message(role="user", content="The pilot runs on two nodes", id="s-m2"),
+            Message(role="assistant", content="Two nodes, noted.", id="s-m3", model_id="qwen"),
+            Message(role="user", content="Deadline is 14 March", id="s-m4"),
+            Message(role="assistant", content="OK.", id="s-m5", model_id="qwen"),
+        ],
+    )
+    await store.save(conversation)
+    author = Author(kind="user", label="user")
+    fact_a = Fact(
+        conversation_id="seed-conv",
+        group_id=group_id,
+        text="Anna owns the ingest pipeline",
+        phrases=(
+            Phrase(message_id="s-m0", start=0, end=29, author=author,
+                   quote="Anna owns the ingest pipeline"),
+        ),
+        window_start=0,
+        window_end=6,
+    )
+    fact_b = Fact(
+        conversation_id="seed-conv",
+        group_id=group_id,
+        text="The pilot runs on two nodes",
+        phrases=(
+            Phrase(message_id="s-m2", start=0, end=27, author=author,
+                   quote="The pilot runs on two nodes"),
+        ),
+        window_start=2,
+        window_end=6,
+    )
+    await store.save_facts([fact_a, fact_b])
+    return conversation.id
+
+
+async def _wait_for_excerpts(pilot, app):
+    pane = app.screen.query_one("#facts-evidence")
+    for _ in range(60):
+        await pilot.pause()
+        excerpts = list(pane.query(EvidenceExcerpt))
+        if excerpts:
+            return excerpts
+        await asyncio.sleep(0.02)
+    raise AssertionError("evidence pane never rendered an excerpt")
+
+
+async def test_ctrl_f_opens_the_fact_browser_with_a_row_per_fact():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await _seed_facts(app)
+
+        await pilot.press("ctrl+f")
+        await _wait_for_screen(pilot, app, FactBrowser)
+
+        rows = list(app.screen.query_one(ListView).children)
+        assert len(rows) == 2
+        # facts_for_display orders by window_start: fact_a (0) then fact_b (2)
+        excerpts = await _wait_for_excerpts(pilot, app)
+        assert [e._excerpt.message.id for e in excerpts] == [f"s-m{i}" for i in range(6)]
+
+
+async def test_down_arrow_renders_the_next_facts_window():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await _seed_facts(app)
+
+        await pilot.press("ctrl+f")
+        await _wait_for_screen(pilot, app, FactBrowser)
+        await _wait_for_excerpts(pilot, app)
+
+        await pilot.press("down")
+        pane = app.screen.query_one("#facts-evidence")
+        for _ in range(60):
+            await pilot.pause()
+            ids = [e._excerpt.message.id for e in pane.query(EvidenceExcerpt)]
+            if ids == ["s-m2", "s-m3", "s-m4", "s-m5"]:
+                break
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError("second fact's window never rendered")
+
+
+async def test_enter_switches_to_the_selected_facts_conversation():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        seed_id = await _seed_facts(app)
+
+        await pilot.press("ctrl+f")
+        await _wait_for_screen(pilot, app, FactBrowser)
+        await _wait_for_excerpts(pilot, app)
+
+        await pilot.press("enter")
+        for _ in range(60):
+            await pilot.pause()
+            if app.conversation.id == seed_id:
+                break
+            await asyncio.sleep(0.05)
+        assert app.conversation.id == seed_id
+
+
+async def test_escape_closes_the_fact_browser_and_changes_nothing():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await _seed_facts(app)
+        before = app.conversation.id
+
+        await pilot.press("ctrl+f")
+        await _wait_for_screen(pilot, app, FactBrowser)
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+        assert not isinstance(app.screen, FactBrowser)
+        assert app.conversation.id == before
+
+
+async def test_ctrl_f_with_no_facts_shows_the_empty_line_and_no_list():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await pilot.press("ctrl+f")
+        await _wait_for_screen(pilot, app, FactBrowser)
+
+        assert not app.screen.query(ListView)
+        assert app.screen.query_one(".picker__empty", Static)
+
+
+async def test_ctrl_f_mid_generation_leaves_the_generation_worker_running():
+    app = ChatApp(mock_settings(**_REALISTIC_TIMING))
+    async with app.run_test() as pilot:
+        await _seed_facts(app)
+        await _submit(pilot, "a long enough prompt to stream")
+        for _ in range(200):
+            await pilot.pause()
+            if app._generating:
+                break
+            await asyncio.sleep(0.02)
+        assert app._generating
+
+        await pilot.press("ctrl+f")
+        await _wait_for_screen(pilot, app, FactBrowser)
+
+        assert app._generating
+        assert any(w.group == _GENERATION_GROUP for w in app.workers)

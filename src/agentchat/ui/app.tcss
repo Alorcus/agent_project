@@ -222,3 +222,51 @@ ConversationPicker, GroupChooser {
     text-align: right;
     color: $text-muted;
 }
+
+FactBrowser {
+    align: center middle;
+}
+
+#facts {
+    width: 90%;
+    height: 80%;
+    border: round $accent;
+    background: $panel;
+    padding: 1 2;
+}
+
+#facts-panes {
+    height: 1fr;
+}
+
+#facts-list {
+    width: 44;
+}
+
+#facts-evidence {
+    width: 1fr;
+    padding-left: 2;
+}
+
+.facts__item {
+    height: 1;
+}
+
+.facts__claim {
+    text-style: bold;
+    padding-bottom: 1;
+}
+
+.facts__source, .facts__orphan {
+    color: $text-muted;
+}
+
+.facts__excerpt {
+    height: auto;
+    padding-bottom: 1;
+}
+
+.facts__excerpt-header {
+    color: $text-muted;
+    text-style: bold;
+}

@@ -31,7 +31,7 @@ from agentchat.core.chat import ChatService
 from agentchat.core.errors import AgentChatError, ModelNotFoundError
 from agentchat.core.models import Conversation, Group, Message
 from agentchat.llm.base import GenerationOptions
-from agentchat.ui.screens import ConversationPicker, GroupChooser
+from agentchat.ui.screens import ConversationPicker, FactBrowser, GroupChooser
 from agentchat.ui.widgets import ContextMeter, ConversationHeader, MessageBubble
 
 _GENERATION_GROUP = "generation"
@@ -53,6 +53,7 @@ class ChatApp(App[None]):
         Binding("ctrl+n", "new_conversation", "New chat"),
         Binding("ctrl+g", "choose_group", "New chat in…"),
         Binding("ctrl+l", "open_conversations", "Chats"),
+        Binding("ctrl+f", "open_facts", "Facts"),
         Binding("ctrl+o", "cycle_model", "Model"),
         Binding("ctrl+t", "toggle_thinking", "Thinking"),
     ]
@@ -285,6 +286,21 @@ class ChatApp(App[None]):
             # The picker is already gone, so the chooser is pushed after it
             # rather than on top of it.
             self.action_choose_group()
+
+    @work
+    async def action_open_facts(self) -> None:
+        # Bare @work, like the picker: not the generation group and not
+        # exclusive, so opening the view cannot cancel a running turn or
+        # extraction.
+        facts, conversations = await self.chat.facts_with_sources(
+            self.conversation.group_id, live=self.conversation
+        )
+        group = self._groups.get(self.conversation.group_id)
+        chosen = await self.push_screen_wait(
+            FactBrowser(facts, conversations, group.name if group else "")
+        )
+        if chosen is not None and chosen != self.conversation.id:
+            await self._switch_to(chosen)
 
     async def on_conversation_picker_delete_requested(
         self, event: ConversationPicker.DeleteRequested
