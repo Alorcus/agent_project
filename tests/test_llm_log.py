@@ -12,13 +12,11 @@ import pytest
 
 from agentchat.config import Settings, build_registry
 from agentchat.core.chat import ChatService
-from agentchat.core.extraction import ExtractionService
 from agentchat.core.models import Message
 from agentchat.llm import transcript
 from agentchat.llm.base import ModelInfo
 from agentchat.llm.local import TransformersProvider
 from conftest import mock_settings
-from factories import make_conversation
 
 
 def _settings(tmp_path: Path, **overrides) -> Settings:
@@ -161,18 +159,6 @@ async def test_chat_turn_is_labeled_chat(tmp_path: Path, store):
     records = _records(path)
     assert records
     assert all(r["label"] == "chat" for r in records)
-
-
-async def test_extraction_calls_are_labeled_summary_then_keywords(tmp_path: Path):
-    settings = _settings(tmp_path, extract_summaries=True)
-    path = transcript.setup_llm_log(settings)
-    registry = build_registry(settings)
-    extractor = ExtractionService(registry)
-
-    await extractor.run(make_conversation())
-
-    requests = [r for r in _records(path) if r["type"] == "request"]
-    assert [r["label"] for r in requests] == ["extraction.summary", "extraction.keywords"]
 
 
 async def test_a_call_outside_any_label_is_recorded_as_unknown(tmp_path: Path):

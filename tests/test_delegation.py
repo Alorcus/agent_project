@@ -34,7 +34,7 @@ from agentchat.storage.sqlite import SqliteStore
 from agentchat.ui.app import ChatApp
 from agentchat.ui.widgets import ConsultationNote
 from conftest import mock_settings
-from factories import make_conversation, make_group, make_summary, scripted_provider
+from factories import make_conversation, make_group, scripted_provider
 
 # -- agents.py ----------------------------------------------------------------
 
@@ -588,30 +588,6 @@ async def test_on_progress_order_on_a_consulted_and_a_plain_turn(store):
         pass
 
     assert seen2 == ["routing…", "writing the reply…"]
-
-
-async def test_enrichment_and_consultation_do_not_combine_on_one_turn(store):
-    from agentchat.core.enrichment import MemoryEnricher
-
-    await store.save_group(make_group(id="g1"))
-    await store.save(make_conversation(id="other", group_id="g1"))
-    await store.save_summary(
-        make_summary(conversation_id="other", group_id="g1", keywords=("apr",), summary="APR notes.")
-    )
-    provider = scripted_provider("ask_bank", "Explain APR.", "an answer", "a reply")
-    registry = _chat_registry(provider)
-    chat = ChatService(
-        registry, store=store, delegator=DelegationService(registry), enricher=MemoryEnricher(store)
-    )
-    conversation = make_conversation(id="mine", group_id="g1", messages=[])
-
-    async for _ in chat.stream_reply(conversation, "what does APR mean?"):
-        pass
-
-    assert chat.last_turn.enrichment == ()
-    assert chat.last_turn.consultation is not None
-    sent = provider.calls[3].messages[-1].content
-    assert "APR notes." not in sent
 
 
 async def test_cancel_mid_stream_on_a_consulted_turn_frees_the_lock(store):

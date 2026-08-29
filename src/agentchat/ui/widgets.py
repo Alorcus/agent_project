@@ -17,7 +17,7 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Static
 
 from agentchat.core.delegation import Consultation
-from agentchat.core.models import ConversationSummary, Message
+from agentchat.core.models import Message
 from agentchat.core.usage import CallUsage
 
 _ROLE_LABEL = {"user": "You", "assistant": "Assistant", "system": "System"}
@@ -208,21 +208,50 @@ class CollapsibleNote(Static):
         raise NotImplementedError
 
 
-class EnrichmentNote(CollapsibleNote):
-    """One line under a user turn: how many memories were appended, and —
-    on click — which."""
+class RecallNote(CollapsibleNote):
+    """One line under a user turn: how its prompt was enhanced by the adaptive
+    retrieval loop, and — on click — the queries the loop ran, the judge's
+    final verdict, and the block that was appended to the message, verbatim.
 
-    def __init__(self, summaries: Sequence[ConversationSummary]) -> None:
-        self._summaries = tuple(summaries)
+    Built from the persisted `metadata["recall"]` dict (U7.4) rather than a
+    live `Recall`, so the live note and the note rebuilt after a restart are
+    the same object with the same fidelity.
+    """
+
+    _EXIT_TAIL = {
+        "sufficient": "sufficient",
+        "cap": "round cap — evidence may be incomplete",
+        "deadline": "timed out — evidence may be incomplete",
+    }
+
+    def __init__(self, recall: dict[str, Any]) -> None:
+        self._recall = recall
         super().__init__()
 
     def _header_text(self) -> str:
-        count = len(self._summaries)
-        noun = "memory" if count == 1 else "memories"
-        return f"enriched by {count} {noun}"
+        recall = self._recall
+        count = len(recall.get("facts", []))
+        rounds = recall.get("rounds", 0)
+        return (
+            f"recalled {count} {'fact' if count == 1 else 'facts'} · "
+            f"{rounds} {'round' if rounds == 1 else 'rounds'} · "
+            f"{self._EXIT_TAIL.get(recall.get('exit', ''), recall.get('exit', ''))}"
+        )
 
     def _detail_lines(self) -> Sequence[str]:
-        return [summary.summary for summary in self._summaries]
+        recall = self._recall
+        lines: list[str] = []
+        queries = recall.get("queries", [])
+        if queries:
+            lines.append("Queries: " + " · ".join(queries))
+        if recall.get("gap"):
+            lines.append("Judge's last gap: " + recall["gap"])
+        lines.append("")
+        lines.append("Appended to your message:")
+        # Split on the source newlines, one detail line per line, so the
+        # digest's structure survives the base's whitespace collapse.
+        lines.extend(recall.get("block", "").split("\n"))
+        return lines
 
 
 class ConsultationNote(CollapsibleNote):
@@ -264,7 +293,7 @@ class MessageBubble(Vertical):
         self._model_name = model_name
         self._buffer = message.content
         self._status: str | None = None
-        self._note: EnrichmentNote | None = None
+        self._recall_note: RecallNote | None = None
         self._consultation_note: ConsultationNote | None = None
         # Built eagerly and held by reference: streaming updates can arrive
         # before compose() finishes. markup=False so model output containing
@@ -315,13 +344,15 @@ class MessageBubble(Vertical):
         self._status = None
         self._refresh_header()
 
-    def show_enrichment(self, summaries: Sequence[ConversationSummary]) -> None:
-        """Mount the note under the body, once. Empty input and a second call
-        are both no-ops."""
-        if self._note is not None or not summaries:
+    def show_recall(self, recall: dict[str, Any] | None) -> None:
+        """Mount the recall note under the body, once, from a persisted
+        `Message.metadata["recall"]` dict. `None` (recall off, self-contained
+        turn, or rolled back by trimming) and a second call are both no-ops.
+        Same dict live and on restore, so the two notes cannot drift."""
+        if self._recall_note is not None or not recall:
             return
-        self._note = EnrichmentNote(summaries)
-        self.mount(self._note)
+        self._recall_note = RecallNote(recall)
+        self.mount(self._recall_note)
 
     def show_consultation(self, consultation: Consultation | None) -> None:
         """Mount the note between the header and the body, once. `None` and a

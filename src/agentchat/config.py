@@ -15,11 +15,17 @@ from pathlib import Path
 from dotenv import find_dotenv, load_dotenv
 
 from agentchat.core.delegation import DelegationService
-from agentchat.core.enrichment import MemoryEnricher
 from agentchat.core.errors import AgentChatError
-from agentchat.core.extraction import ExtractionService
 from agentchat.core.facts import FactExtractor
+from agentchat.core.retrieval import AdaptiveRetriever, FactIndex
 from agentchat.llm.base import ModelInfo
+from agentchat.llm.embedding import (
+    DEFAULT_EMBED_MODEL_ID,
+    Embedder,
+    EmbedderInfo,
+    HashingEmbedder,
+    LocalEmbedder,
+)
 from agentchat.llm.local import DEFAULT_MODEL_ROOT, TransformersProvider
 from agentchat.llm.local import default_models as local_models
 from agentchat.llm.mock import MockProvider
@@ -127,32 +133,20 @@ class Settings:
     mock_load_delay: float | None = field(
         default_factory=lambda: _env_float("MOCK_LOAD_DELAY")
     )
-    #: On by default — a feature that has to be switched on is not
-    #: demonstrable. Off switches extraction entirely, with no flag threaded
-    #: through call sites (`ChatService.summarise` just checks for `None`).
-    extract_summaries: bool = field(
-        default_factory=lambda: _env_flag("EXTRACT_SUMMARIES", True)
-    )
-    #: Seconds `action_quit` waits for extraction before exiting anyway.
+    #: Seconds `action_quit` waits for the fact flush before exiting anyway.
     extraction_timeout: float = field(
         default_factory=lambda: (
             30.0 if (v := _env_float("EXTRACTION_TIMEOUT")) is None else v
         )
     )
-    #: On by default, same reasoning as `extract_summaries`. Off switches
-    #: enrichment entirely, with no flag threaded through call sites
-    #: (`ChatService.stream_reply` just checks for `None`).
-    enrich_messages: bool = field(
-        default_factory=lambda: _env_flag("ENRICH_MESSAGES", True)
-    )
-    #: On by default, same reasoning as `extract_summaries`. Off switches
-    #: fact extraction entirely, with no flag threaded through call sites
-    #: (`ChatService.extract_facts` just checks for `None`) — and off means
-    #: no LLM calls at all (R14).
+    #: On by default — a feature that has to be switched on is not
+    #: demonstrable. Off switches fact extraction entirely, with no flag
+    #: threaded through call sites (`ChatService.extract_facts` just checks
+    #: for `None`) — and off means no LLM calls at all.
     extract_facts: bool = field(default_factory=lambda: _env_flag("EXTRACT_FACTS", True))
-    #: On by default, same reasoning as `extract_summaries`. Off switches
-    #: sub-agent consultation entirely, with no flag threaded through call
-    #: sites (`ChatService.stream_reply` just checks for `None`).
+    #: On by default, same reasoning. Off switches sub-agent consultation
+    #: entirely, with no flag threaded through call sites
+    #: (`ChatService.stream_reply` just checks for `None`).
     subagents: bool = field(default_factory=lambda: _env_flag("SUBAGENTS", True))
     #: Seconds each consultation phase (routing+task, then the specialist's
     #: answer) is allowed. Materially larger than `extraction_timeout`'s 30 —
@@ -160,6 +154,46 @@ class Settings:
     subagent_timeout: float = field(
         default_factory=lambda: (
             60.0 if (v := _env_float("SUBAGENT_TIMEOUT")) is None else v
+        )
+    )
+    #: On by default, same reasoning as `extract_facts`. Off switches adaptive
+    #: recall entirely — no embedder load, no LLM calls, no store reads (R16).
+    recall_facts: bool = field(default_factory=lambda: _env_flag("RECALL_FACTS", True))
+    #: The embedder id a stored vector is tagged with; a vector from another id
+    #: is re-embedded, not searched (R4).
+    embed_model: str = field(
+        default_factory=lambda: _env("EMBED_MODEL", DEFAULT_EMBED_MODEL_ID)
+        or DEFAULT_EMBED_MODEL_ID
+    )
+    #: Where the embedding checkpoint lives. `None` → under `model_root`.
+    embed_model_path: Path | None = field(
+        default_factory=lambda: _p(_env("EMBED_MODEL_PATH"))
+    )
+    recall_rounds: int = field(
+        default_factory=lambda: 3 if (v := _env_int("RECALL_ROUNDS")) is None else v
+    )
+    recall_rewrites: int = field(
+        default_factory=lambda: 3 if (v := _env_int("RECALL_REWRITES")) is None else v
+    )
+    recall_hits: int = field(
+        default_factory=lambda: 10 if (v := _env_int("RECALL_HITS")) is None else v
+    )
+    recall_seeds: int = field(
+        default_factory=lambda: 2 if (v := _env_int("RECALL_SEEDS")) is None else v
+    )
+    recall_min_score: float = field(
+        default_factory=lambda: (
+            0.25 if (v := _env_float("RECALL_MIN_SCORE")) is None else v
+        )
+    )
+    recall_digest_facts: int = field(
+        default_factory=lambda: (
+            12 if (v := _env_int("RECALL_DIGEST_FACTS")) is None else v
+        )
+    )
+    recall_timeout: float = field(
+        default_factory=lambda: (
+            120.0 if (v := _env_float("RECALL_TIMEOUT")) is None else v
         )
     )
     #: On by default: an instrument that has to be switched on is an
@@ -176,6 +210,12 @@ class Settings:
     @property
     def resolved_log_dir(self) -> Path:
         return self.log_dir or self.data_dir / "logs"
+
+    @property
+    def resolved_embed_model_path(self) -> Path:
+        return self.embed_model_path or (
+            self.model_root / "sentence-transformers" / self.embed_model
+        )
 
 
 def _require_choice(var_name: str, value: str, choices: tuple[str, ...]) -> None:
@@ -207,26 +247,6 @@ def build_store(settings: Settings) -> ConversationStore:
     return SqliteStore(settings.data_dir / "agentchat.db")
 
 
-def build_extractor(
-    settings: Settings, registry: ModelRegistry
-) -> ExtractionService | None:
-    """Assemble the extraction service. The only place extraction is switched
-    on; `None` when `extract_summaries` is off."""
-    if not settings.extract_summaries:
-        return None
-    return ExtractionService(registry)
-
-
-def build_enricher(settings: Settings, store: ConversationStore) -> MemoryEnricher | None:
-    """Assemble the enrichment service. The only place enrichment is switched
-    on; `None` when `enrich_messages` is off. Takes `store` rather than
-    building its own, so the caller can hand it the same instance `ChatService`
-    uses."""
-    if not settings.enrich_messages:
-        return None
-    return MemoryEnricher(store)
-
-
 def build_fact_extractor(
     settings: Settings, registry: ModelRegistry
 ) -> FactExtractor | None:
@@ -235,6 +255,44 @@ def build_fact_extractor(
     if not settings.extract_facts:
         return None
     return FactExtractor(registry)
+
+
+def build_embedder(settings: Settings) -> Embedder | None:
+    """`None` when recall is off. `HashingEmbedder` under the mock backend —
+    the same switch `build_registry` makes, for the same reason: no test and
+    no laptop should need embedding weights on disk."""
+    if not settings.recall_facts:
+        return None
+    if settings.backend == "mock":
+        return HashingEmbedder()
+    return LocalEmbedder(
+        EmbedderInfo(id=settings.embed_model, name=settings.embed_model),
+        path=settings.resolved_embed_model_path,
+    )
+
+
+def build_retriever(
+    settings: Settings,
+    registry: ModelRegistry,
+    store: ConversationStore,
+    embedder: Embedder | None,
+) -> AdaptiveRetriever | None:
+    """Assemble the adaptive retriever. `None` when recall is off or no
+    embedder was built. `recall_seeds` is clamped to `MAX_SEEDS` inside
+    `AdaptiveRetriever`, not trusted from the environment."""
+    if not settings.recall_facts or embedder is None:
+        return None
+    return AdaptiveRetriever(
+        registry,
+        FactIndex(store, embedder),
+        rounds=settings.recall_rounds,
+        rewrites=settings.recall_rewrites,
+        hits=settings.recall_hits,
+        seeds=settings.recall_seeds,
+        min_score=settings.recall_min_score,
+        digest_facts=settings.recall_digest_facts,
+        timeout=settings.recall_timeout,
+    )
 
 
 def build_delegator(

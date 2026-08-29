@@ -15,13 +15,15 @@ from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
+
 from agentchat.core.errors import StorageError
 from agentchat.core.models import (
     DEFAULT_GROUP_ID,
     Author,
     Conversation,
-    ConversationSummary,
     Fact,
+    FactEmbedding,
     Group,
     Message,
     Phrase,
@@ -69,15 +71,6 @@ class SqliteStore:
     async def delete(self, conversation_id: str) -> None:
         await asyncio.to_thread(self._delete, conversation_id)
 
-    async def save_summary(self, summary: ConversationSummary) -> None:
-        await asyncio.to_thread(self._save_summary, summary)
-
-    async def summary(self, conversation_id: str) -> ConversationSummary | None:
-        return await asyncio.to_thread(self._summary, conversation_id)
-
-    async def list_summaries(self, group_id: str) -> list[ConversationSummary]:
-        return await asyncio.to_thread(self._list_summaries, group_id)
-
     async def save_facts(self, facts: Sequence[Fact]) -> None:
         if not facts:
             return
@@ -91,6 +84,23 @@ class SqliteStore:
 
     async def set_fact_watermark(self, conversation_id: str, covered: int) -> None:
         await asyncio.to_thread(self._set_fact_watermark, conversation_id, covered)
+
+    async def save_fact_embeddings(self, rows: Sequence[FactEmbedding]) -> None:
+        if not rows:
+            return
+        await asyncio.to_thread(self._save_fact_embeddings, rows)
+
+    async def fact_embeddings(
+        self, group_id: str, *, model_id: str
+    ) -> list[FactEmbedding]:
+        return await asyncio.to_thread(self._fact_embeddings, group_id, model_id)
+
+    async def facts_without_embeddings(
+        self, group_id: str, *, model_id: str
+    ) -> list[Fact]:
+        return await asyncio.to_thread(
+            self._facts_without_embeddings, group_id, model_id
+        )
 
     def _list_conversations(self, group_id: str | None) -> list[Conversation]:
         try:
@@ -239,64 +249,6 @@ class SqliteStore:
         except sqlite3.Error as exc:
             raise StorageError(f"failed to delete conversation {conversation_id}") from exc
 
-    def _save_summary(self, summary: ConversationSummary) -> None:
-        try:
-            with closing(self._connect()) as conn, conn:
-                conn.execute(
-                    "INSERT INTO conversation_summaries "
-                    "(conversation_id, group_id, summary, keywords, "
-                    "covered_messages, model_id, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(conversation_id) DO UPDATE SET "
-                    "summary = excluded.summary, keywords = excluded.keywords, "
-                    "covered_messages = excluded.covered_messages, "
-                    "model_id = excluded.model_id, updated_at = excluded.updated_at",
-                    (
-                        summary.conversation_id,
-                        summary.group_id,
-                        summary.summary,
-                        summary.keywords_text,
-                        summary.covered_messages,
-                        summary.model_id,
-                        summary.created_at.isoformat(),
-                        summary.updated_at.isoformat(),
-                    ),
-                )
-        except sqlite3.Error as exc:
-            raise StorageError(
-                f"failed to save summary for conversation {summary.conversation_id}"
-            ) from exc
-
-    def _summary(self, conversation_id: str) -> ConversationSummary | None:
-        try:
-            with closing(self._connect()) as conn, conn:
-                row = conn.execute(
-                    "SELECT conversation_id, group_id, summary, keywords, "
-                    "covered_messages, model_id, created_at, updated_at "
-                    "FROM conversation_summaries WHERE conversation_id = ?",
-                    (conversation_id,),
-                ).fetchone()
-        except sqlite3.Error as exc:
-            raise StorageError(
-                f"failed to load summary for conversation {conversation_id}"
-            ) from exc
-        return None if row is None else _summary_from_row(row)
-
-    def _list_summaries(self, group_id: str) -> list[ConversationSummary]:
-        try:
-            with closing(self._connect()) as conn, conn:
-                rows = conn.execute(
-                    "SELECT conversation_id, group_id, summary, keywords, "
-                    "covered_messages, model_id, created_at, updated_at "
-                    "FROM conversation_summaries WHERE group_id = ?",
-                    (group_id,),
-                ).fetchall()
-        except sqlite3.Error as exc:
-            raise StorageError(f"failed to list summaries for group {group_id}") from exc
-        summaries = [_summary_from_row(row) for row in rows]
-        summaries.sort(key=lambda s: s.updated_at, reverse=True)
-        return summaries
-
     def _save_facts(self, facts: Sequence[Fact]) -> None:
         try:
             with closing(self._connect()) as conn, conn:
@@ -320,7 +272,8 @@ class SqliteStore:
                     conn.executemany(
                         "INSERT INTO fact_phrases "
                         '(fact_id, ordinal, message_id, start, "end", '
-                        "author_kind, author_label) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        "author_kind, author_label, quote) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         [
                             (
                                 fact.id,
@@ -330,6 +283,7 @@ class SqliteStore:
                                 phrase.end,
                                 phrase.author.kind,
                                 phrase.author.label,
+                                phrase.quote,
                             )
                             for ordinal, phrase in enumerate(fact.phrases)
                         ],
@@ -348,7 +302,7 @@ class SqliteStore:
                 ).fetchall()
                 phrase_rows = conn.execute(
                     "SELECT fact_id, ordinal, message_id, start, \"end\", "
-                    "author_kind, author_label FROM fact_phrases "
+                    "author_kind, author_label, quote FROM fact_phrases "
                     "WHERE fact_id IN (SELECT id FROM facts WHERE group_id = ?) "
                     "ORDER BY fact_id, ordinal",
                     (group_id,),
@@ -357,13 +311,23 @@ class SqliteStore:
             raise StorageError(f"failed to list facts for group {group_id}") from exc
 
         phrases_by_fact: dict[str, list[Phrase]] = {}
-        for fact_id, _ordinal, message_id, start, end, author_kind, author_label in phrase_rows:
+        for (
+            fact_id,
+            _ordinal,
+            message_id,
+            start,
+            end,
+            author_kind,
+            author_label,
+            quote,
+        ) in phrase_rows:
             phrases_by_fact.setdefault(fact_id, []).append(
                 Phrase(
                     message_id=message_id,
                     start=start,
                     end=end,
                     author=Author(kind=author_kind, label=author_label),
+                    quote=quote,
                 )
             )
         return [_fact_from_row(row, phrases_by_fact.get(row[0], [])) for row in fact_rows]
@@ -399,28 +363,114 @@ class SqliteStore:
                 f"failed to save fact watermark for conversation {conversation_id}"
             ) from exc
 
+    def _save_fact_embeddings(self, rows: Sequence[FactEmbedding]) -> None:
+        now = _now().isoformat()
+        try:
+            with closing(self._connect()) as conn, conn:
+                conn.executemany(
+                    "INSERT INTO fact_embeddings "
+                    "(fact_id, view, model_id, dim, vector, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(fact_id, view, model_id) DO UPDATE SET "
+                    "dim = excluded.dim, vector = excluded.vector, "
+                    "created_at = excluded.created_at",
+                    [
+                        (
+                            row.fact_id,
+                            row.view,
+                            row.model_id,
+                            len(row.vector),
+                            _pack_vector(row.vector),
+                            now,
+                        )
+                        for row in rows
+                    ],
+                )
+        except sqlite3.Error as exc:
+            raise StorageError("failed to save fact embeddings") from exc
 
-def _summary_from_row(row: tuple) -> ConversationSummary:
-    (
-        conversation_id,
-        group_id,
-        summary_text,
-        keywords,
-        covered_messages,
-        model_id,
-        created_at,
-        updated_at,
-    ) = row
-    return ConversationSummary(
-        conversation_id=conversation_id,
-        group_id=group_id,
-        summary=summary_text,
-        keywords=ConversationSummary.split_keywords(keywords),
-        covered_messages=covered_messages,
-        model_id=model_id,
-        created_at=datetime.fromisoformat(created_at),
-        updated_at=datetime.fromisoformat(updated_at),
-    )
+    def _fact_embeddings(self, group_id: str, model_id: str) -> list[FactEmbedding]:
+        try:
+            with closing(self._connect()) as conn, conn:
+                rows = conn.execute(
+                    "SELECT fact_id, view, model_id, vector FROM fact_embeddings "
+                    "WHERE model_id = ? AND fact_id IN "
+                    "(SELECT id FROM facts WHERE group_id = ?)",
+                    (model_id, group_id),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError(
+                f"failed to list fact embeddings for group {group_id}"
+            ) from exc
+        return [
+            FactEmbedding(
+                fact_id=fact_id,
+                view=view,
+                model_id=row_model_id,
+                vector=_unpack_vector(blob),
+            )
+            for fact_id, view, row_model_id, blob in rows
+        ]
+
+    def _facts_without_embeddings(self, group_id: str, model_id: str) -> list[Fact]:
+        try:
+            with closing(self._connect()) as conn, conn:
+                fact_rows = conn.execute(
+                    "SELECT f.id, f.conversation_id, f.group_id, f.text, "
+                    "f.window_start, f.window_end, f.model_id, f.created_at "
+                    "FROM facts f LEFT JOIN fact_embeddings e "
+                    "ON e.fact_id = f.id AND e.model_id = ? "
+                    "WHERE f.group_id = ? AND e.fact_id IS NULL",
+                    (model_id, group_id),
+                ).fetchall()
+                if not fact_rows:
+                    return []
+                ids = {row[0] for row in fact_rows}
+                phrase_rows = conn.execute(
+                    "SELECT fact_id, ordinal, message_id, start, \"end\", "
+                    "author_kind, author_label, quote FROM fact_phrases "
+                    "WHERE fact_id IN (SELECT id FROM facts WHERE group_id = ?) "
+                    "ORDER BY fact_id, ordinal",
+                    (group_id,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError(
+                f"failed to list unembedded facts for group {group_id}"
+            ) from exc
+
+        phrases_by_fact: dict[str, list[Phrase]] = {}
+        for (
+            fact_id,
+            _ordinal,
+            message_id,
+            start,
+            end,
+            author_kind,
+            author_label,
+            quote,
+        ) in phrase_rows:
+            if fact_id not in ids:
+                continue
+            phrases_by_fact.setdefault(fact_id, []).append(
+                Phrase(
+                    message_id=message_id,
+                    start=start,
+                    end=end,
+                    author=Author(kind=author_kind, label=author_label),
+                    quote=quote,
+                )
+            )
+        return [_fact_from_row(row, phrases_by_fact.get(row[0], [])) for row in fact_rows]
+
+
+def _pack_vector(vector: Sequence[float]) -> bytes:
+    # The explicit `<` is what keeps a database written on one machine
+    # readable on another; `dtype="f4"` is native-endian and silently is not.
+    return np.asarray(vector, dtype="<f4").tobytes()
+
+
+def _unpack_vector(blob: bytes) -> tuple[float, ...]:
+    return tuple(float(x) for x in np.frombuffer(blob, dtype="<f4"))
 
 
 def _fact_from_row(row: tuple, phrases: list[Phrase]) -> Fact:

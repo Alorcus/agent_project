@@ -51,17 +51,6 @@ async def _wait_for_rows(pilot, app, count: int) -> None:
     raise AssertionError(f"picker never settled on {count} rows")
 
 
-async def _wait_for_summary(pilot, app, conversation_id: str, attempts: int = 120):
-    # Two real LLM calls (mock or not) can run well past a couple of seconds
-    # under realistic timing; callers using `_REALISTIC_TIMING` pass a higher
-    # `attempts` budget.
-    for _ in range(attempts):
-        await pilot.pause()
-        summary = await app.chat.store.summary(conversation_id)
-        if summary is not None:
-            return summary
-        await asyncio.sleep(0.02)
-    raise AssertionError(f"no summary ever appeared for conversation {conversation_id!r}")
 
 
 async def _wait_for_screen(pilot, app, screen_type) -> None:
@@ -1196,65 +1185,8 @@ async def test_delete_group_storage_error_notifies_and_keeps_running():
         await pilot.pause()
 
 
-# -- conversation summaries (extraction on switch) -------------------------
-
-
-async def test_switching_away_summarises_the_outgoing_conversation():
-    app = ChatApp(mock_settings(extract_summaries=True))
-    async with app.run_test() as pilot:
-        await _submit(pilot, "hello")
-        await _wait_until_done(pilot, app)
-        outgoing_id = app.conversation.id
-
-        await pilot.press("ctrl+n")
-        await pilot.pause()
-
-        summary = await _wait_for_summary(pilot, app, outgoing_id)
-        assert summary.summary
-
-
-async def test_switching_away_shows_a_summarising_status_while_extraction_runs():
-    app = ChatApp(mock_settings(extract_summaries=True, **_REALISTIC_TIMING))
-    async with app.run_test() as pilot:
-        await _submit(pilot, "hello")
-        await _wait_until_done(pilot, app)
-        outgoing_id = app.conversation.id
-        statusbar = app.query_one("#statusbar", Static)
-
-        await pilot.press("ctrl+n")
-        await pilot.pause()
-
-        for _ in range(100):
-            await pilot.pause()
-            if "summarising…" in app.status_text:
-                break
-            await asyncio.sleep(0.02)
-        else:
-            raise AssertionError("status bar never showed the summarising indicator")
-        assert statusbar.has_class("-busy")
-
-        await _wait_for_summary(pilot, app, outgoing_id, attempts=600)
-        await pilot.pause()
-
-        assert "summarising…" not in app.status_text
-        assert not statusbar.has_class("-busy")
-
-
-async def test_switching_away_from_an_empty_conversation_writes_nothing():
-    app = ChatApp(mock_settings(extract_summaries=True))
-    async with app.run_test() as pilot:
-        empty_id = app.conversation.id
-
-        await pilot.press("ctrl+n")
-        await pilot.pause()
-        await asyncio.sleep(0.1)
-        await pilot.pause()
-
-        assert await app.chat.store.summary(empty_id) is None
-
-
 async def test_switching_while_generating_lets_the_generation_finish():
-    app = ChatApp(mock_settings(extract_summaries=True, **_REALISTIC_TIMING))
+    app = ChatApp(mock_settings(**_REALISTIC_TIMING))
     async with app.run_test() as pilot:
         await _submit(pilot, "a long enough prompt to stream")
         await asyncio.sleep(0.3)
@@ -1271,89 +1203,17 @@ async def test_switching_while_generating_lets_the_generation_finish():
         assert outgoing.messages[-1].content.strip() != ""
 
 
-async def test_typing_while_extraction_in_flight_leaves_the_abandoned_chat_unsummarised():
-    app = ChatApp(mock_settings(extract_summaries=True, **_REALISTIC_TIMING))
+async def test_fact_extraction_disabled_switching_starts_no_worker():
+    app = ChatApp(mock_settings())  # extract_facts defaults to False
     async with app.run_test() as pilot:
         await _submit(pilot, "first")
         await _wait_until_done(pilot, app)
-        abandoned_id = app.conversation.id
-
-        await pilot.press("ctrl+n")
-        await pilot.pause()
-        await asyncio.sleep(0.1)  # let the extraction worker get into flight
-
-        await _submit(pilot, "second")
-        await _wait_until_done(pilot, app)
-
-        reply = list(app.query(MessageBubble))[-1]
-        assert reply.message.role == "assistant"
-        assert reply.message.content.strip()
-        assert await app.chat.store.summary(abandoned_id) is None
-
-
-async def test_deleting_the_active_conversation_writes_no_summary_row():
-    app = ChatApp(mock_settings(extract_summaries=True))
-    async with app.run_test() as pilot:
-        await _submit(pilot, "first")
-        await _wait_until_done(pilot, app)
-        doomed_id = app.conversation.id
-
-        await pilot.press("ctrl+l")
-        await _wait_for_screen(pilot, app, ConversationPicker)
-        await pilot.press("ctrl+x")
-        await pilot.pause()
-        await pilot.press("y")
-        await pilot.pause()
-        await asyncio.sleep(0.2)
-        await pilot.pause()
-
-        assert await app.chat.store.summary(doomed_id) is None
-
-        await pilot.press("escape")
-        await pilot.pause()
-
-
-async def test_extractor_provider_error_surfaces_as_a_warning_and_app_keeps_running():
-    app = ChatApp(mock_settings(extract_summaries=True))
-    async with app.run_test() as pilot:
-        await _submit(pilot, "hello")
-        await _wait_until_done(pilot, app)
-
-        async def boom(conversation: Conversation) -> None:
-            raise ProviderError("boom")
-
-        app.chat.summarise = boom
-
-        notified_severities: list[str | None] = []
-        app.notify = lambda message, **kwargs: notified_severities.append(
-            kwargs.get("severity")
-        )
-
-        await pilot.press("ctrl+n")
-        await pilot.pause()
-        for _ in range(60):
-            await pilot.pause()
-            if notified_severities:
-                break
-            await asyncio.sleep(0.05)
-
-        assert notified_severities == ["warning"]
-        assert app.is_running
-
-
-async def test_extraction_disabled_switching_writes_nothing_and_starts_no_worker():
-    app = ChatApp(mock_settings())  # extract_summaries defaults to False
-    async with app.run_test() as pilot:
-        await _submit(pilot, "first")
-        await _wait_until_done(pilot, app)
-        outgoing_id = app.conversation.id
 
         await pilot.press("ctrl+n")
         await pilot.pause()
         await asyncio.sleep(0.1)
         await pilot.pause()
 
-        assert await app.chat.store.summary(outgoing_id) is None
         assert not any(worker.group == _EXTRACTION_GROUP for worker in app.workers)
 
 
@@ -1382,7 +1242,7 @@ class _FakeFactExtractor:
 
 
 async def test_facts_extract_after_three_exchanges_without_leaving_r6():
-    app = ChatApp(mock_settings(extract_facts=True, extract_summaries=False))
+    app = ChatApp(mock_settings(extract_facts=True))
     app.chat.fact_extractor = _FakeFactExtractor()
     async with app.run_test() as pilot:
         for i in range(3):
@@ -1401,7 +1261,7 @@ async def test_facts_extract_after_three_exchanges_without_leaving_r6():
 
 
 async def test_leaving_the_conversation_produces_the_partial_window_flush_r7():
-    app = ChatApp(mock_settings(extract_facts=True, extract_summaries=False))
+    app = ChatApp(mock_settings(extract_facts=True))
     app.chat.fact_extractor = _FakeFactExtractor()
     async with app.run_test() as pilot:
         await _submit(pilot, "only one exchange")
@@ -1422,7 +1282,7 @@ async def test_leaving_the_conversation_produces_the_partial_window_flush_r7():
 
 
 async def test_indicator_shows_nothing_on_a_turn_that_fills_no_window():
-    app = ChatApp(mock_settings(extract_facts=True, extract_summaries=False))
+    app = ChatApp(mock_settings(extract_facts=True))
     fake = _FakeFactExtractor()
     app.chat.fact_extractor = fake
     async with app.run_test() as pilot:
@@ -1430,7 +1290,7 @@ async def test_indicator_shows_nothing_on_a_turn_that_fills_no_window():
         await _wait_until_done(pilot, app)
         await pilot.pause()
 
-        assert "summarising…" not in app.status_text
+        assert "extracting facts…" not in app.status_text
         assert fake.calls == 0
 
 
@@ -1459,62 +1319,60 @@ async def test_ctrl_d_triggers_quit_not_delete_right_while_the_prompt_has_focus(
         assert prompt.value == "hello"
 
 
-async def test_action_quit_stores_a_summary_for_the_active_conversation():
-    app = ChatApp(mock_settings(extract_summaries=True))
+async def test_action_quit_flushes_the_partial_fact_window():
+    app = ChatApp(mock_settings(extract_facts=True))
+    app.chat.fact_extractor = _FakeFactExtractor()
     async with app.run_test() as pilot:
         await _submit(pilot, "hello")
         await _wait_until_done(pilot, app)
         conversation_id = app.conversation.id
+        group_id = app.conversation.group_id
 
         await app.action_quit()
 
-        summary = await app.chat.store.summary(conversation_id)
-        assert summary is not None
+        facts = await app.chat.store.list_facts(group_id)
+        assert any(f.conversation_id == conversation_id for f in facts)
 
 
 async def test_action_quit_on_an_empty_launch_never_calls_the_extractor():
-    app = ChatApp(mock_settings(extract_summaries=True))
+    app = ChatApp(mock_settings(extract_facts=True))
+    fake = _FakeFactExtractor()
+    app.chat.fact_extractor = fake
     async with app.run_test():
-        called = False
-
-        async def spy(conversation: Conversation):
-            nonlocal called
-            called = True
-
-        app.chat.summarise = spy
-
         await app.action_quit()
 
-        assert called is False
+        assert fake.calls == 0
 
 
 async def test_action_quit_times_out_and_exits_anyway_leaving_no_row():
-    app = ChatApp(mock_settings(extract_summaries=True, extraction_timeout=0.05))
+    app = ChatApp(mock_settings(extract_facts=True, extraction_timeout=0.05))
     async with app.run_test() as pilot:
         await _submit(pilot, "hello")
         await _wait_until_done(pilot, app)
         conversation_id = app.conversation.id
+        group_id = app.conversation.group_id
 
-        async def hang(conversation: Conversation):
+        async def hang(conversation, *, flush: bool = False):
             await asyncio.sleep(10)
+            return ()
 
-        app.chat.summarise = hang
+        app.chat.extract_facts = hang
 
         await asyncio.wait_for(app.action_quit(), timeout=2.0)
 
-        assert await app.chat.store.summary(conversation_id) is None
+        assert await app.chat.store.list_facts(group_id) == []
 
 
 async def test_action_quit_with_a_provider_error_still_exits():
-    app = ChatApp(mock_settings(extract_summaries=True))
+    app = ChatApp(mock_settings(extract_facts=True))
     async with app.run_test() as pilot:
         await _submit(pilot, "hello")
         await _wait_until_done(pilot, app)
 
-        async def boom(conversation: Conversation):
+        async def boom(conversation, *, flush: bool = False):
             raise ProviderError("boom")
 
-        app.chat.summarise = boom
+        app.chat.extract_facts = boom
 
         await asyncio.wait_for(app.action_quit(), timeout=2.0)  # must not hang or raise
 
@@ -1529,15 +1387,92 @@ async def test_a_running_generation_is_cancelled_by_quit():
         await asyncio.wait_for(app.action_quit(), timeout=2.0)
 
 
-async def test_ctrl_q_also_goes_through_action_quit_and_summarises():
-    app = ChatApp(mock_settings(extract_summaries=True))
+async def test_ctrl_q_also_goes_through_action_quit_and_flushes_facts():
+    app = ChatApp(mock_settings(extract_facts=True))
+    app.chat.fact_extractor = _FakeFactExtractor()
     async with app.run_test() as pilot:
         await _submit(pilot, "hello")
         await _wait_until_done(pilot, app)
         conversation_id = app.conversation.id
+        group_id = app.conversation.group_id
 
         await pilot.press("ctrl+q")
         await pilot.pause()
 
-        summary = await _wait_for_summary(pilot, app, conversation_id)
-        assert summary is not None
+        for _ in range(100):
+            await pilot.pause()
+            facts = await app.chat.store.list_facts(group_id)
+            if any(f.conversation_id == conversation_id for f in facts):
+                break
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError("ctrl+q never flushed the partial window")
+
+
+# -- the recall note (U8) ---------------------------------------------
+
+from agentchat.llm.embedding import HashingEmbedder  # noqa: E402
+from agentchat.ui.widgets import RecallNote  # noqa: E402
+from factories import make_indexed_group  # noqa: E402
+
+
+async def _seed_recall_group(app):
+    group = await make_indexed_group(app.chat.store, HashingEmbedder())
+    app.conversation = await app.chat.new_conversation(group.id)
+    return group
+
+
+async def test_a_recalled_turn_renders_a_note_whose_block_matches_what_the_model_saw():
+    app = ChatApp(mock_settings(recall_facts=True, recall_rounds=1, recall_rewrites=1))
+    async with app.run_test() as pilot:
+        await _seed_recall_group(app)
+
+        await _submit(pilot, "what Postgres version did we choose for billing?")
+        await _wait_until_done(pilot, app)
+
+        notes = list(app.query(RecallNote))
+        assert len(notes) == 1
+        note = notes[0]
+        assert "recalled" in str(note.content)
+
+        block = app.chat.last_turn.message.metadata["recall"]["block"]
+        # R20: the note replays exactly the text the model received.
+        sent = app.chat.last_turn.context.messages[-1].content
+        assert block in sent
+
+        note.scroll_visible(animate=False)
+        await pilot.pause()
+        await pilot.click(RecallNote)
+        detail = str(note.content)
+        assert "Appended to your message:" in detail
+        # every non-blank line of the block survives into the detail
+        for line in block.split("\n"):
+            if line.strip():
+                assert " ".join(line.split()) in " ".join(detail.split())
+
+
+async def test_reopening_the_conversation_rebuilds_the_recall_note_from_metadata():
+    app = ChatApp(mock_settings(recall_facts=True, recall_rounds=1, recall_rewrites=1))
+    async with app.run_test() as pilot:
+        group = await _seed_recall_group(app)
+        await _submit(pilot, "which database for billing?")
+        await _wait_until_done(pilot, app)
+        conv_id = app.conversation.id
+        header_before = str(app.query_one(RecallNote).content)
+
+        await app.action_new_conversation()
+        await pilot.pause()
+        await app._switch_to(conv_id)
+        await pilot.pause()
+
+        notes = list(app.query(RecallNote))
+        assert len(notes) == 1
+        assert str(notes[0].content) == header_before
+
+
+async def test_recall_off_renders_no_note():
+    app = ChatApp(mock_settings())  # recall_facts defaults to False
+    async with app.run_test() as pilot:
+        await _submit(pilot, "what did we pick for the database?")
+        await _wait_until_done(pilot, app)
+        assert list(app.query(RecallNote)) == []

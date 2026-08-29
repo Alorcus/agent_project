@@ -58,15 +58,13 @@ src/agentchat/
   config.py        settings + the single wiring point for backends and stores
   core/            domain model, chat orchestration, context strategy, errors
     prompts.py     the assistant's own system prompt (DEFAULT_SYSTEM) plus the
-                    extraction, enrichment, consultation and fact/quote prompt
-                    text, and nothing else — edit this file to tune how the
-                    assistant answers, summary/keyword quality, routing
-                    quality, fact/quote quality, or the wording of the
-                    injected memory/consultation block, not chat.py,
-                    extraction.py, enrichment.py, delegation.py, or facts.py
-    extraction.py  ExtractionService: two LLM calls, summary then keywords
-    enrichment.py  MemoryEnricher: keyword-matches a user message against the
-                    group's other summaries and tracks what's been used
+                    fact/quote, gate/rewrite/judge/reseed and consultation
+                    prompt text, and nothing else — edit this file to tune how
+                    the assistant answers, routing quality, fact/quote
+                    quality, retrieval quality, or the wording of the injected
+                    recall/consultation block, not chat.py, retrieval.py,
+                    delegation.py, or facts.py. The gate, rewrite, judge and
+                    reseed prompts live here like every other prompt
     agents.py      SubAgent, the shipped roster, and @mention parsing
     delegation.py  DelegationService: route → task → specialist, one
                     Consultation or None, one entry point for every failure
@@ -79,6 +77,12 @@ src/agentchat/
                     per full window. The window arithmetic is derived from the
                     stored watermark (fact_extraction_state) on every call,
                     never held in memory between them
+    retrieval.py   Hit, Recall, FactIndex, AdaptiveRetriever: the bounded RAG
+                    loop over a group's facts — gate, then rewrite → retrieve →
+                    assemble (deterministic, no LLM call) → judge, the judge's
+                    gap seeding the next round. The ONLY module that may read
+                    fact_embeddings. recall() is the single entry point and
+                    the single place failure becomes None (answer normally)
     usage.py       CallUsage/TurnUsage, the context meter's figures: a call's
                     prompt plus what it generated, recorded in two steps
                     because the halves are known at different times. Recorded
@@ -88,6 +92,12 @@ src/agentchat/
                     unless a collector is installed, which only
                     ChatService.stream_reply does
   llm/             LLMProvider protocol, mock + local (transformers) backends, registry
+    embedding.py   Embedder protocol, LocalEmbedder (a CPU sentence encoder
+                    loaded by path, never downloaded — mirrors local.py's lazy
+                    load) and HashingEmbedder (weightless, process-stable —
+                    what the retrieval suite searches against). An encoder is
+                    not a generator: no GenerationOptions, no transcript, no
+                    usage — do not wire it into core.usage
     transcript.py  verbatim request/response log, recorded *inside* local.py
                     and mock.py on purpose — it sits below the streamer's
                     cleanup and the app's message trimming, which a wrapper
@@ -100,6 +110,10 @@ src/agentchat/
 
 Dependency direction is one-way: `ui → core → llm/storage`. The UI never
 imports a concrete backend.
+
+`prompts.render_transcript` (and `ASSISTANT_CHAR_CAP` / `ELISION`) look like
+summary machinery but are not — `delegation.py` builds `TASK_PROMPT` with them.
+`render_window` stays for `facts.py`. Don't remove either.
 
 ## Working in this repo
 

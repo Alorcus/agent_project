@@ -33,16 +33,6 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_conversation
   ON messages(conversation_id, ordinal);
 
-CREATE TABLE IF NOT EXISTS conversation_summaries (
-  conversation_id TEXT PRIMARY KEY
-    REFERENCES conversations(id) ON DELETE CASCADE,
-  group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-  summary TEXT NOT NULL, keywords TEXT NOT NULL,
-  covered_messages INTEGER NOT NULL, model_id TEXT,
-  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS idx_summaries_group
-  ON conversation_summaries(group_id);
-
 CREATE TABLE IF NOT EXISTS facts (
   id TEXT PRIMARY KEY,
   conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -63,11 +53,25 @@ CREATE TABLE IF NOT EXISTS fact_phrases (
   message_id TEXT NOT NULL,
   start INTEGER NOT NULL, "end" INTEGER NOT NULL,
   author_kind TEXT NOT NULL, author_label TEXT NOT NULL,
+  quote TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (fact_id, ordinal));
 
+-- One row per (fact, view, embedder). `model_id` is part of the key, not a
+-- plain column: switching embedders and back must not have thrown the first
+-- embedder's vectors away. R17 rides on the `facts` cascade, exactly as
+-- `fact_phrases` does — no other FK.
+CREATE TABLE IF NOT EXISTS fact_embeddings (
+  fact_id TEXT NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
+  view TEXT NOT NULL,
+  model_id TEXT NOT NULL,
+  dim INTEGER NOT NULL,
+  vector BLOB NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (fact_id, view, model_id));
+CREATE INDEX IF NOT EXISTS idx_fact_embeddings_fact ON fact_embeddings(fact_id);
+
 -- `covered_messages` here counts *countable* messages (core.facts.countable),
--- not rows in `messages` — not comparable with
--- `conversation_summaries.covered_messages` despite the shared name.
+-- not rows in `messages`.
 CREATE TABLE IF NOT EXISTS fact_extraction_state (
   conversation_id TEXT PRIMARY KEY
     REFERENCES conversations(id) ON DELETE CASCADE,
@@ -92,9 +96,21 @@ def ensure_schema(path: Path) -> None:
         with closing(connect(path)) as conn, conn:
             _refuse_pre_groups_database(conn, path)
             conn.executescript(SCHEMA)
+            _add_fact_phrases_quote(conn)
             _seed_default_group(conn)
     except sqlite3.Error as exc:
         raise StorageError(f"could not open database at {path}") from exc
+
+
+def _add_fact_phrases_quote(conn: sqlite3.Connection) -> None:
+    """The one migration this schema carries: `fact_phrases.quote`, added for
+    the evidence view. Works only because of the `DEFAULT ''`. Runs after
+    `executescript(SCHEMA)` so a fresh database takes the column from `SCHEMA`
+    itself and this is a no-op. Facts written before it keep an empty quote
+    and are re-indexed under the claim view alone."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(fact_phrases)")}
+    if "quote" not in columns:
+        conn.execute("ALTER TABLE fact_phrases ADD COLUMN quote TEXT NOT NULL DEFAULT ''")
 
 
 def _refuse_pre_groups_database(conn: sqlite3.Connection, path: Path) -> None:

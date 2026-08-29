@@ -8,7 +8,7 @@ import time
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 
-from agentchat.core.models import Author, Conversation, ConversationSummary, Fact, Group, Message, Phrase
+from agentchat.core.models import Author, Conversation, Fact, Group, Message, Phrase
 from agentchat.core import usage
 from agentchat.llm import transcript
 from agentchat.llm.base import GenerationOptions, ModelInfo
@@ -154,14 +154,76 @@ def make_fact(**overrides) -> Fact:
     return Fact(**defaults)
 
 
-def make_summary(**overrides) -> ConversationSummary:
-    defaults = dict(
-        conversation_id="c1",
-        group_id="default",
-        summary="A discussion about trip planning in Kyoto.",
-        keywords=("kyoto", "travel"),
-        covered_messages=2,
-        model_id="mock-small",
-    )
-    defaults.update(overrides)
-    return ConversationSummary(**defaults)
+# -- retrieval fixtures --------------------------------------------------
+
+#: Twelve facts over four topics, three each, filed across three conversations.
+#: Two are deliberate near-duplicates (overlapping windows) so read-time dedup
+#: has something to remove; one is quoteless so the empty-evidence-view path is
+#: covered.
+GOLDEN_FACTS: tuple[dict, ...] = (
+    # database choice
+    dict(text="The team chose Postgres 14 for the billing service.",
+         quote="we're going with Postgres 14 for billing", author=("user", "user")),
+    dict(text="The team chose Postgres 14 for billing.",  # near-duplicate
+         quote="Postgres 14 for billing it is", author=("user", "user")),
+    dict(text="The billing database runs on a single primary with one replica.",
+         quote="one primary, one replica for the billing db", author=("user", "user")),
+    # deployment window
+    dict(text="Production deploys happen on Tuesday mornings only.",
+         quote="we only deploy on Tuesday mornings", author=("user", "user")),
+    dict(text="The team froze deploys for the last week of December.",
+         quote="no deploys the last week of December", author=("user", "user")),
+    dict(text="A deploy needs sign-off from two reviewers.",
+         quote="two reviewers have to sign off on a deploy", author=("model", "qwen3-14b")),
+    # a person's dietary constraint
+    dict(text="Priya is vegetarian and does not eat eggs.",
+         quote="Priya's vegetarian, no eggs either", author=("user", "user")),
+    dict(text="Priya is allergic to peanuts.",
+         quote="Priya has a peanut allergy", author=("user", "user")),
+    dict(text="The team lunch is usually catered by the place on 5th.",
+         quote="", author=("user", "user")),  # quoteless
+    # travel plan
+    dict(text="The offsite is booked for Lisbon in October.",
+         quote="offsite is Lisbon, October", author=("user", "user")),
+    dict(text="Flights to Lisbon are booked out of Berlin.",
+         quote="flying to Lisbon from Berlin", author=("user", "user")),
+    dict(text="The offsite hotel is walking distance from the venue.",
+         quote="hotel's a short walk from the venue", author=("model", "qwen3-14b")),
+)
+
+
+async def make_indexed_group(store, embedder, *, name="Retrieval", facts=GOLDEN_FACTS) -> Group:
+    """A project group holding `facts` across three conversations, with
+    phrases, quotes and vectors already written — the state every retrieval
+    test starts from."""
+    from agentchat.core.retrieval import FactIndex
+
+    group = make_group(name=name)
+    await store.save_group(group)
+    conversations = []
+    for i in range(3):
+        conv = make_conversation(id=f"{group.id}-c{i}", group_id=group.id, messages=[
+            Message(id=f"{group.id}-c{i}-m0", role="user", content="context line"),
+        ])
+        await store.save(conv)
+        conversations.append(conv)
+
+    built: list[Fact] = []
+    for n, spec in enumerate(facts):
+        conv = conversations[n % 3]
+        kind, label = spec["author"]
+        phrases = ()
+        if spec["quote"]:
+            phrases = (Phrase(
+                message_id=conv.messages[0].id, start=0, end=1,
+                author=Author(kind=kind, label=label), quote=spec["quote"],
+            ),)
+        fact = Fact(
+            conversation_id=conv.id, group_id=group.id, text=spec["text"],
+            phrases=phrases, window_start=0, window_end=6, model_id="mock",
+        )
+        built.append(fact)
+    await store.save_facts(built)
+    await FactIndex(store, embedder).index(built)
+    group.facts = built  # convenience handle for tests
+    return group

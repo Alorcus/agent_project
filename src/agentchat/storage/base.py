@@ -7,7 +7,7 @@ from typing import Protocol
 from collections.abc import Sequence
 
 from agentchat.core.errors import StorageError
-from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, ConversationSummary, Fact, Group
+from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, Fact, FactEmbedding, Group
 
 
 def by_recency(conversations: list[Conversation]) -> list[Conversation]:
@@ -64,25 +64,10 @@ class ConversationStore(Protocol):
         """Must also remove any derived state (memory index, caches)."""
         ...
 
-    # -- derived state: conversation summaries ----------------------------
-    #
-    # No consumer yet: this is the read half of NFR-S-02 (summaries scoped to
-    # a group), shipped so a later group overview can be additive.
-
-    async def save_summary(self, summary: ConversationSummary) -> None:
-        """Upsert on `conversation_id`, preserving the original `created_at`."""
-        ...
-
-    async def summary(self, conversation_id: str) -> ConversationSummary | None: ...
-
-    async def list_summaries(self, group_id: str) -> list[ConversationSummary]:
-        """Most-recently-updated first."""
-        ...
-
     # -- derived state: facts ----------------------------------------------
     #
-    # No consumer yet: retrieval on facts is plan 010. Append-only — a
-    # window's fact, once saved, is never rewritten.
+    # Append-only — a window's fact, once saved, is never rewritten. Its
+    # vectors (see `save_fact_embeddings`) are written alongside it.
 
     async def save_facts(self, facts: Sequence[Fact]) -> None:
         """Append `facts`. A no-op for `()`."""
@@ -96,3 +81,24 @@ class ConversationStore(Protocol):
         ...
 
     async def set_fact_watermark(self, conversation_id: str, covered: int) -> None: ...
+
+    # -- derived state: fact embeddings -----------------------------------
+    #
+    # `retrieval.py` is the only module that reads these back.
+
+    async def save_fact_embeddings(self, rows: Sequence[FactEmbedding]) -> None:
+        """Upsert on `(fact_id, view, model_id)`. A no-op for `()`."""
+        ...
+
+    async def fact_embeddings(
+        self, group_id: str, *, model_id: str
+    ) -> list[FactEmbedding]:
+        """Every vector for the group's facts produced by `model_id`."""
+        ...
+
+    async def facts_without_embeddings(
+        self, group_id: str, *, model_id: str
+    ) -> list[Fact]:
+        """The group's facts with no `fact_embeddings` row for `model_id` —
+        one `LEFT JOIN`, not a Python set difference over every fact."""
+        ...

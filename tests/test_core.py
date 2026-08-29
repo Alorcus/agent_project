@@ -7,16 +7,12 @@ import pytest
 from agentchat.config import (
     ConfigurationError,
     Settings,
-    build_enricher,
-    build_extractor,
     build_fact_extractor,
     build_store,
 )
-from agentchat.core.enrichment import MemoryEnricher
 from agentchat.core.chat import ChatService
 from agentchat.core.context import RecencyWindowStrategy
 from agentchat.core.errors import ModelNotFoundError, ProviderError
-from agentchat.core.extraction import ExtractionService
 from agentchat.core.facts import FactExtractor
 from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, Message
 from agentchat.core.prompts import DEFAULT_SYSTEM
@@ -219,29 +215,6 @@ def test_build_store_unknown_raises_configuration_error():
         build_store(Settings(backend="mock", store="nope"))
 
 
-def test_build_extractor_is_switched_by_extract_summaries():
-    registry = fast_registry()
-    assert build_extractor(mock_settings(extract_summaries=False), registry) is None
-    extractor = build_extractor(mock_settings(extract_summaries=True), registry)
-    assert isinstance(extractor, ExtractionService)
-
-
-def test_agentchat_extract_summaries_env_flag_is_honoured(monkeypatch):
-    monkeypatch.setenv("AGENTCHAT_EXTRACT_SUMMARIES", "0")
-    assert Settings().extract_summaries is False
-
-
-def test_build_enricher_is_switched_by_enrich_messages(store):
-    assert build_enricher(mock_settings(enrich_messages=False), store) is None
-    enricher = build_enricher(mock_settings(enrich_messages=True), store)
-    assert isinstance(enricher, MemoryEnricher)
-
-
-def test_agentchat_enrich_messages_env_flag_is_honoured(monkeypatch):
-    monkeypatch.setenv("AGENTCHAT_ENRICH_MESSAGES", "0")
-    assert Settings().enrich_messages is False
-
-
 def test_agentchat_extraction_timeout_bad_value_raises_configuration_error(monkeypatch):
     monkeypatch.setenv("AGENTCHAT_EXTRACTION_TIMEOUT", "abc")
     with pytest.raises(ConfigurationError):
@@ -258,3 +231,36 @@ def test_build_fact_extractor_is_switched_by_extract_facts():
 def test_agentchat_extract_facts_env_flag_is_honoured(monkeypatch):
     monkeypatch.setenv("AGENTCHAT_EXTRACT_FACTS", "0")
     assert Settings().extract_facts is False
+
+
+def test_build_embedder_and_retriever_are_switched_by_recall_facts(store):
+    from agentchat.config import build_embedder, build_retriever
+    from agentchat.core.retrieval import AdaptiveRetriever
+    from agentchat.llm.embedding import HashingEmbedder
+
+    registry = fast_registry()
+    assert build_embedder(mock_settings(recall_facts=False)) is None
+    assert build_retriever(mock_settings(recall_facts=False), registry, store, None) is None
+
+    embedder = build_embedder(mock_settings(recall_facts=True))
+    assert isinstance(embedder, HashingEmbedder)  # mock backend → hashing
+    retriever = build_retriever(
+        mock_settings(recall_facts=True), registry, store, embedder
+    )
+    assert isinstance(retriever, AdaptiveRetriever)
+
+
+def test_agentchat_recall_facts_env_flag_is_honoured(monkeypatch):
+    monkeypatch.setenv("AGENTCHAT_RECALL_FACTS", "0")
+    assert Settings().recall_facts is False
+
+
+def test_recall_seeds_is_clamped_to_max_seeds(store):
+    from agentchat.config import build_embedder, build_retriever
+    from agentchat.core.prompts import MAX_SEEDS
+
+    settings = mock_settings(recall_facts=True, recall_seeds=99)
+    retriever = build_retriever(
+        settings, fast_registry(), store, build_embedder(settings)
+    )
+    assert retriever._seeds == MAX_SEEDS

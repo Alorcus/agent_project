@@ -13,6 +13,9 @@ dependencies = [
     "transformers>=4.51,<5",
     "accelerate>=1.0",
     "python-dotenv>=1.0",
+    # Arrives with torch today, but retrieval.py and storage/sqlite.py import
+    # it directly — an undeclared import is one `uv sync` from being wrong.
+    "numpy>=1.26",
 ]
 
 [project.scripts]

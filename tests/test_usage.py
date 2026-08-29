@@ -13,7 +13,6 @@ from agentchat.core import usage
 from agentchat.core.chat import ChatService
 from agentchat.core.context import estimate_tokens
 from agentchat.core.delegation import DelegationService
-from agentchat.core.extraction import ExtractionService
 from agentchat.core.models import Message
 from agentchat.core.usage import CallUsage, TurnUsage
 from agentchat.llm.base import ModelInfo
@@ -289,25 +288,6 @@ async def test_each_turn_is_measured_on_its_own(store):
         pass
 
     assert chat.last_turn.usage.peak.tokens < after_the_long_turn
-
-
-async def test_summarising_between_turns_does_not_land_in_the_turns_figure(store):
-    # The summariser's own prompt carries a worked example the chat prompt
-    # here does not, so it would be the larger of the two if it were counted.
-    provider = scripted_provider("hi", "A short summary.", "apr, rates")
-    registry = _registry_with(provider)
-    chat = ChatService(
-        registry, store=store, extractor=ExtractionService(registry)
-    )
-    conversation = await chat.new_conversation()
-
-    async for _ in chat.stream_reply(conversation, "hello"):
-        pass
-    peak = chat.last_turn.usage.peak
-
-    await chat.summarise(conversation)
-
-    assert chat.last_turn.usage.peak is peak
 
 
 # -- the meter ----------------------------------------------------------------

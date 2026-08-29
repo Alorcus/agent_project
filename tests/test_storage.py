@@ -12,7 +12,7 @@ from agentchat.core.models import DEFAULT_GROUP_ID, Author, Fact, Message, Phras
 from agentchat.storage.schema import connect
 from agentchat.storage.sqlite import SqliteStore
 
-from factories import make_conversation, make_fact, make_group, make_phrase, make_summary
+from factories import make_conversation, make_fact, make_group, make_phrase
 
 
 async def test_round_trip_title_group_messages_and_model_id(tmp_path: Path):
@@ -275,156 +275,6 @@ async def test_a_pre_groups_database_is_refused_not_rewritten(tmp_path: Path):
         assert conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 1
 
 
-# -- conversation summaries -------------------------------------------------
-
-
-async def test_summary_round_trips_across_a_fresh_store_instance(tmp_path: Path):
-    path = tmp_path / "chat.db"
-    conversation = make_conversation()
-    await SqliteStore(path).save(conversation)
-    summary = make_summary(conversation_id=conversation.id, keywords=("a", "b"))
-    await SqliteStore(path).save_summary(summary)
-
-    loaded = await SqliteStore(path).summary(conversation.id)
-
-    assert loaded is not None
-    assert loaded.summary == summary.summary
-    assert loaded.keywords == summary.keywords
-    assert loaded.covered_messages == summary.covered_messages
-    assert loaded.model_id == summary.model_id
-    assert loaded.created_at.tzinfo is not None
-    assert loaded.updated_at.tzinfo is not None
-    assert loaded.created_at == summary.created_at
-    assert loaded.updated_at == summary.updated_at
-
-
-async def test_summary_keywords_with_comma_and_non_ascii_survive(tmp_path: Path):
-    path = tmp_path / "chat.db"
-    conversation = make_conversation()
-    store = SqliteStore(path)
-    await store.save(conversation)
-    summary = make_summary(
-        conversation_id=conversation.id, keywords=("café, München", "日本語")
-    )
-    await store.save_summary(summary)
-
-    loaded = await store.summary(conversation.id)
-
-    assert loaded is not None
-    assert loaded.keywords == ("café, München", "日本語")
-
-
-async def test_summary_with_no_keywords_round_trips_as_empty_tuple(tmp_path: Path):
-    path = tmp_path / "chat.db"
-    conversation = make_conversation()
-    store = SqliteStore(path)
-    await store.save(conversation)
-    await store.save_summary(make_summary(conversation_id=conversation.id, keywords=()))
-
-    loaded = await store.summary(conversation.id)
-
-    assert loaded is not None
-    assert loaded.keywords == ()
-
-
-async def test_saving_a_summary_twice_leaves_one_row_and_keeps_the_first_created_at(
-    tmp_path: Path,
-):
-    path = tmp_path / "chat.db"
-    conversation = make_conversation()
-    store = SqliteStore(path)
-    await store.save(conversation)
-    first = make_summary(conversation_id=conversation.id, summary="first pass")
-    await store.save_summary(first)
-    second = make_summary(conversation_id=conversation.id, summary="second pass")
-    await store.save_summary(second)
-
-    loaded = await store.summary(conversation.id)
-    assert loaded is not None
-    assert loaded.summary == "second pass"
-    assert loaded.created_at == first.created_at
-
-    with sqlite3.connect(path) as conn:
-        count = conn.execute(
-            "SELECT COUNT(*) FROM conversation_summaries WHERE conversation_id = ?",
-            (conversation.id,),
-        ).fetchone()[0]
-    assert count == 1
-
-
-async def test_summary_of_unknown_conversation_returns_none(tmp_path: Path):
-    store = SqliteStore(tmp_path / "chat.db")
-    assert await store.summary("does-not-exist") is None
-
-
-async def test_deleting_the_conversation_removes_its_summary_row(tmp_path: Path):
-    path = tmp_path / "chat.db"
-    store = SqliteStore(path)
-    conversation = make_conversation()
-    await store.save(conversation)
-    await store.save_summary(make_summary(conversation_id=conversation.id))
-
-    await store.delete(conversation.id)
-
-    with sqlite3.connect(path) as conn:
-        count = conn.execute(
-            "SELECT COUNT(*) FROM conversation_summaries WHERE conversation_id = ?",
-            (conversation.id,),
-        ).fetchone()[0]
-    assert count == 0
-
-
-async def test_deleting_the_group_takes_summaries_with_it_two_hop(tmp_path: Path):
-    path = tmp_path / "chat.db"
-    store = SqliteStore(path)
-    project = make_group()
-    await store.save_group(project)
-    conversation = make_conversation(group_id=project.id)
-    await store.save(conversation)
-    await store.save_summary(
-        make_summary(conversation_id=conversation.id, group_id=project.id)
-    )
-
-    await store.delete_group(project.id)
-
-    with sqlite3.connect(path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM conversation_summaries").fetchone()[0] == 0
-
-
-async def test_list_summaries_scopes_to_group_most_recently_updated_first(tmp_path: Path):
-    path = tmp_path / "chat.db"
-    store = SqliteStore(path)
-    other_group = make_group(name="other")
-    await store.save_group(other_group)
-    c1 = make_conversation()
-    c2 = make_conversation()
-    c_other = make_conversation(group_id=other_group.id)
-    await store.save(c1)
-    await store.save(c2)
-    await store.save(c_other)
-
-    now = datetime.now(timezone.utc)
-    await store.save_summary(
-        make_summary(conversation_id=c1.id, summary="older", updated_at=now - timedelta(hours=1))
-    )
-    await store.save_summary(
-        make_summary(conversation_id=c2.id, summary="newer", updated_at=now)
-    )
-    await store.save_summary(
-        make_summary(conversation_id=c_other.id, group_id=other_group.id)
-    )
-
-    summaries = await store.list_summaries(DEFAULT_GROUP_ID)
-
-    assert [s.summary for s in summaries] == ["newer", "older"]
-
-
-async def test_saving_a_summary_for_a_missing_conversation_raises(tmp_path: Path):
-    store = SqliteStore(tmp_path / "chat.db")
-    with pytest.raises(StorageError):
-        await store.save_summary(make_summary(conversation_id="no-such-conversation"))
-
-
 # -- facts ------------------------------------------------------------------
 
 
@@ -573,3 +423,138 @@ async def test_fact_watermark_is_zero_when_unknown_and_round_trips(tmp_path: Pat
 
     await store.set_fact_watermark(conversation.id, 10)
     assert await store.fact_watermark(conversation.id) == 10
+
+
+# -- fact embeddings ------------------------------------------------------
+
+
+from agentchat.core.models import FactEmbedding  # noqa: E402
+
+
+def _emb(fact_id: str, view: str = "claim", model_id: str = "hashing-64", vector=(0.1, 0.2, 0.3)):
+    return FactEmbedding(fact_id=fact_id, view=view, model_id=model_id, vector=tuple(vector))
+
+
+async def test_fact_embedding_round_trips_the_same_floats(tmp_path: Path):
+    store = SqliteStore(tmp_path / "chat.db")
+    conversation = make_conversation()
+    await store.save(conversation)
+    fact = make_fact(conversation_id=conversation.id)
+    await store.save_facts([fact])
+
+    await store.save_fact_embeddings([_emb(fact.id, vector=(0.5, -0.25, 0.125, 0.0))])
+
+    rows = await store.fact_embeddings(conversation.group_id, model_id="hashing-64")
+    assert len(rows) == 1
+    assert rows[0].vector == pytest.approx((0.5, -0.25, 0.125, 0.0), abs=1e-6)
+    assert rows[0].view == "claim"
+
+
+async def test_saving_the_same_view_and_model_upserts(tmp_path: Path):
+    store = SqliteStore(tmp_path / "chat.db")
+    conversation = make_conversation()
+    await store.save(conversation)
+    fact = make_fact(conversation_id=conversation.id)
+    await store.save_facts([fact])
+
+    await store.save_fact_embeddings([_emb(fact.id, vector=(1.0, 0.0))])
+    await store.save_fact_embeddings([_emb(fact.id, vector=(0.0, 1.0))])
+
+    rows = await store.fact_embeddings(conversation.group_id, model_id="hashing-64")
+    assert len(rows) == 1
+    assert rows[0].vector == pytest.approx((0.0, 1.0), abs=1e-6)
+
+
+async def test_facts_without_embeddings_tracks_the_backlog_and_the_embedder_id(tmp_path: Path):
+    store = SqliteStore(tmp_path / "chat.db")
+    conversation = make_conversation()
+    await store.save(conversation)
+    f1 = make_fact(conversation_id=conversation.id, text="one")
+    f2 = make_fact(conversation_id=conversation.id, text="two")
+    await store.save_facts([f1, f2])
+
+    pending = await store.facts_without_embeddings(conversation.group_id, model_id="m1")
+    assert {f.text for f in pending} == {"one", "two"}
+
+    await store.save_fact_embeddings([_emb(f1.id, model_id="m1"), _emb(f2.id, model_id="m1")])
+    assert await store.facts_without_embeddings(conversation.group_id, model_id="m1") == []
+
+    # A different embedder id sees every fact again (R4).
+    other = await store.facts_without_embeddings(conversation.group_id, model_id="m2")
+    assert {f.text for f in other} == {"one", "two"}
+
+
+async def test_deleting_the_conversation_removes_its_vectors(tmp_path: Path):
+    path = tmp_path / "chat.db"
+    store = SqliteStore(path)
+    conversation = make_conversation()
+    await store.save(conversation)
+    fact = make_fact(conversation_id=conversation.id)
+    await store.save_facts([fact])
+    await store.save_fact_embeddings([_emb(fact.id)])
+
+    await store.delete(conversation.id)
+
+    with closing(connect(path)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM fact_embeddings").fetchone()[0] == 0
+
+
+async def test_deleting_the_group_removes_its_vectors(tmp_path: Path):
+    path = tmp_path / "chat.db"
+    store = SqliteStore(path)
+    project = make_group()
+    await store.save_group(project)
+    conversation = make_conversation(group_id=project.id)
+    await store.save(conversation)
+    fact = make_fact(conversation_id=conversation.id, group_id=project.id)
+    await store.save_facts([fact])
+    await store.save_fact_embeddings([_emb(fact.id)])
+
+    await store.delete_group(project.id)
+
+    with closing(connect(path)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM fact_embeddings").fetchone()[0] == 0
+
+
+async def test_resaving_the_conversation_leaves_vectors_intact(tmp_path: Path):
+    store = SqliteStore(tmp_path / "chat.db")
+    conversation = make_conversation()
+    await store.save(conversation)
+    fact = make_fact(conversation_id=conversation.id)
+    await store.save_facts([fact])
+    await store.save_fact_embeddings([_emb(fact.id)])
+
+    conversation.add(Message(role="user", content="one more turn"))
+    await store.save(conversation)
+
+    rows = await store.fact_embeddings(conversation.group_id, model_id="hashing-64")
+    assert len(rows) == 1
+
+
+async def test_phrase_quote_round_trips_and_matches_the_source_message(tmp_path: Path):
+    from agentchat.core.facts import FactExtractor
+    from agentchat.llm.registry import ModelRegistry
+    from factories import scripted_provider
+
+    store = SqliteStore(tmp_path / "chat.db")
+    messages = [
+        Message(id="u1", role="user", content="We're moving staging to GKE next month."),
+    ]
+    conversation = make_conversation(messages=messages)
+    await store.save(conversation)
+
+    provider = scripted_provider(
+        "The team is moving staging to GKE next month.",
+        "moving staging to GKE next month",
+    )
+    registry = ModelRegistry()
+    registry.register(provider.info, lambda: provider)
+    fact = await FactExtractor(registry).extract(messages)
+    fact.conversation_id = conversation.id
+    fact.group_id = conversation.group_id
+    await store.save_facts([fact])
+
+    loaded = (await store.list_facts(conversation.group_id))[0]
+    phrase = loaded.phrases[0]
+    assert phrase.quote == "moving staging to GKE next month"
+    assert phrase.quote == phrase.text(messages[0])

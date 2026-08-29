@@ -49,8 +49,8 @@ _EXTRACTION_OPTIONS_BASE = dict(temperature=0.0, thinking=False)
 
 
 def countable(messages: Sequence[Message]) -> list[Message]:
-    """The turns the window and the summary are built from: the user's and
-    the assistant's, in order, dropping `system` and empty ones.
+    """The turns the window is built from: the user's and the assistant's, in
+    order, dropping `system` and empty ones.
 
     A specialist's answer is never a `Message` of its own — it lives in the
     default reply's `metadata["subagent"]` — so nothing here has to filter it
@@ -133,7 +133,13 @@ class FactExtractor:
                 continue
             message, (start, end) = located
             phrases.append(
-                Phrase(message_id=message.id, start=start, end=end, author=Author.of(message))
+                Phrase(
+                    message_id=message.id,
+                    start=start,
+                    end=end,
+                    author=Author.of(message),
+                    quote=message.content[start:end],
+                )
             )
             anchored_quotes.append(quote)
 

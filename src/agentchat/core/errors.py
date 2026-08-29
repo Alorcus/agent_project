@@ -24,13 +24,15 @@ class StorageError(AgentChatError):
     """Persisting or loading conversation state failed."""
 
 
-class ExtractionError(AgentChatError):
-    """Summarising a conversation produced nothing worth storing."""
-
-
 class FactExtractionError(AgentChatError):
     """Extracting a fact from one window failed — a wrapped provider error,
     not a window that simply held no fact (that is `None`, not this)."""
+
+
+class RetrievalError(AgentChatError):
+    """A step of the adaptive retrieval loop failed — a wrapped provider,
+    storage or embedder error. Handled at `AdaptiveRetriever.recall`'s single
+    boundary and degraded to a normal reply, never surfaced to the user."""
 
 
 class DelegationError(AgentChatError):

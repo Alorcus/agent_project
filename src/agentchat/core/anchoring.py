@@ -1,6 +1,6 @@
 """Locating a quoted phrase inside a real stored message, by code — no model
 is ever asked where text is. Pure functions only: no I/O, no provider, no
-store, and it must stay that way (`facts.py` and `enrichment.py` are the
+store, and it must stay that way (`facts.py` and `retrieval.py` are the
 callers that know what a match is *for*)."""
 
 from __future__ import annotations

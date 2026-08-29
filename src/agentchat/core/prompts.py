@@ -1,21 +1,22 @@
-"""The assistant's own system prompt, the extraction, enrichment and
+"""The assistant's own system prompt, the fact-extraction, retrieval and
 consultation prompts, and the pure functions that prepare their input and
 parse their output. No I/O, no provider, no store — this is the file a
-non-programmer edits to tune reply, summary, keyword, routing or consultation
-quality.
+non-programmer edits to tune reply, fact/quote, retrieval, routing or
+consultation quality.
 """
 
 from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 from agentchat.core.agents import DEFAULT_AGENT_ID, SubAgent
 from agentchat.core.context import estimate_tokens
-from agentchat.core.models import ConversationSummary, Message
+from agentchat.core.models import Message
 
-MAX_KEYWORDS = 5
-KEYWORD_SEPARATOR = "; "
+if TYPE_CHECKING:
+    from agentchat.core.retrieval import Hit, Recall
 
 #: The system prompt for the assistant the user actually talks to — the
 #: `default` entry in the router's roster, which names no `SubAgent` and so
@@ -40,73 +41,6 @@ ASSISTANT_CHAR_CAP = 800
 #: Marks the point where older turns were dropped to fit the budget, so the
 #: model is not told the transcript is complete when it is not.
 ELISION = "[… earlier turns omitted …]"
-
-SUMMARY_SYSTEM = """\
-You summarise chat transcripts for later recall. Write a dense, factual \
-summary of what the conversation is about. Weight the user's turns above the \
-assistant's — the user's turns are what the conversation is *for*, the \
-assistant's are only evidence of what was asked. Target \
-3-5 sentences. Write in the third person about the topics covered.
-
-Example:
-
-Transcript:
-
-User: We store about 40M sensor readings a month in one Postgres table and \
-queries over the last week have gotten slow. Is partitioning worth it?
-
-Assistant: Range partitioning on the reading timestamp is the usual fit for \
-this shape of table. Declarative partitioning lets the planner prune …
-
-User: Monthly partitions, and we only keep 18 months. Does that make dropping \
-old data cheaper?
-
-Assistant: Considerably. DROP TABLE on an expired partition is close to \
-instant, where a bulk DELETE has to rewrite …
-
-User: What breaks if I partition a table that already holds 700M rows?
-
-Summary:
-
-Partitioning a 700M-row Postgres table of sensor readings, growing by roughly \
-40M rows a month, after queries over recent data slowed down. Monthly range \
-partitions on the reading timestamp are the shape under consideration, with \
-an 18-month retention window enforced by dropping expired partitions instead \
-of issuing bulk DELETEs. The open question is how to migrate the existing \
-unpartitioned table in place, and what it costs while the migration runs.\n """
-
-SUMMARY_PROMPT = """\
-Transcript:
-
-{transcript}
-
-Summarise the conversation above."""
-
-KEYWORDS_SYSTEM = """\
-You extract keywords from a conversation summary. Emit at most 5 keywords, \
-separated by "; ", on a single line, and nothing else — no numbering, no \
-label, no trailing period. Prefer nouns and named entities.
-
-Example:
-
-Summary:
-
-The conversation covers debugging a Flask application that returns 500 \
-errors on POST requests to the /upload endpoint. The failure is traced to \
-a missing Content-Type check and a SQLAlchemy session that isn't rolled \
-back after a failed commit. The discussion then turns to replacing local \
-disk storage with S3 uploads via boto3.
-
-Keywords:
-
-Flask; SQLAlchemy; /upload endpoint; boto3; S3"""
-
-KEYWORDS_PROMPT = """\
-Summary:
-
-{summary}
-
-Keywords:"""
 
 #: R5 — the most quotes a single fact call can be given supporting evidence
 #: from.
@@ -229,11 +163,10 @@ QUOTES_PROMPT = "Text:\n\n{text}\n\nFact: {fact}\n\nQuotes:"
 def parse_quotes(text: str, *, limit: int = MAX_QUOTES) -> tuple[str, ...]:
     """Defensively parse a quotes reply: one quote per non-empty line,
     bullets/numbering stripped, surrounding quotation marks stripped, empties
-    and duplicates dropped, capped at `limit`. Mirrors `parse_keywords`'s
-    contract — returns `()` when nothing survives, the caller decides what
-    that means. Unlike `parse_keywords`, never strips a trailing period: a
-    quote's own punctuation is part of what must anchor in the source
-    message."""
+    and duplicates dropped, capped at `limit`. Returns `()` when nothing
+    survives, the caller decides what that means. Never strips a trailing
+    period: a quote's own punctuation is part of what must anchor in the
+    source message."""
     text = text.strip()
     if text.lower().startswith("quotes:"):
         text = text[len("quotes:") :].strip()
@@ -291,26 +224,244 @@ def render_window(messages: Sequence[Message], *, budget: int) -> str:
     return rendered
 
 
-ENRICHMENT_HEADER = """\
+# -- adaptive fact retrieval -------------------------------------------------
+
+GATE_KNOWN = "KNOWN"
+GATE_SEARCH = "SEARCH"
+VERDICT_ENOUGH = "ENOUGH"
+VERDICT_MISSING = "MISSING"
+#: Hard ceiling on seeds per round; `s` is configured below it and enforced
+#: in `parse_seeds`, not merely requested in the prompt — the cap is the
+#: dominant term in the loop's cost multiplication.
+MAX_SEEDS = 4
+
+GATE_SYSTEM = f"""\
+Classify the message below. Do not answer it. Reply with exactly one word: \
+`{GATE_SEARCH}` if answering it well needs facts from the user's earlier \
+conversations, or `{GATE_KNOWN}` if a general assistant can answer it from \
+common knowledge alone.
+
+The two errors are not equal. A needless search costs a few seconds. A \
+skipped one produces a fluent, confident, wrong answer. So choose \
+`{GATE_SEARCH}` for possessive or relational phrasing ("our", "the team", \
+"we decided", "my"), status questions about anyone not globally famous, \
+ambiguous named entities, private projects or artefacts, anything that \
+depends on this user's own situation — and whenever you are unsure.
+
+Example:
+
+Message:
+
+what did we land on for the staging database?
+
+Verdict:
+
+{GATE_SEARCH}
+
+Example:
+
+Message:
+
+write me a haiku about autumn
+
+Verdict:
+
+{GATE_KNOWN}"""
+
+GATE_PROMPT = "Message:\n\n{message}\n\nVerdict:"
+
+
+def parse_gate(text: str) -> bool:
+    """`True` (retrieve) unless the reply's first word is, case-insensitively,
+    `KNOWN`. An unparseable verdict is not a third outcome — it means
+    retrieve (R6)."""
+    first = _undecorate(text.strip().splitlines()[0]) if text.strip() else ""
+    first = first.split()[0] if first.split() else ""
+    return first.lower() != GATE_KNOWN.lower()
+
+
+REWRITE_SYSTEM = """\
+Write one search query for a store of short factual statements taken from the \
+user's past conversations. You are given the user's message, one seed phrase \
+to work from, and the queries already tried this search. Write a query that \
+covers a facet those miss.
+
+Phrase it in the words the conversation would have used, not the words the \
+question uses: the user asks "what did we pick for the DB", the stored fact \
+reads "the team chose Postgres 14 for the billing service". One line, no \
+preamble, no quotation marks, no leading label.
+
+Example:
+
+Message: what version did we settle on?
+Seed: what version did we settle on?
+Already tried: (none)
+
+Query:
+
+database version chosen for the billing service"""
+
+REWRITE_PROMPT = (
+    "Message: {message}\nSeed: {seed}\nAlready tried:\n{tried}\n\nQuery:"
+)
+
+
+def parse_query(text: str) -> str:
+    """One cleaned line from a rewrite reply — label dropped, quotes and
+    bullets stripped. `""` when nothing survives."""
+    for line in text.strip().splitlines():
+        cleaned = _undecorate(line)
+        if cleaned.lower().startswith("query:"):
+            cleaned = _undecorate(cleaned[len("query:") :])
+        if cleaned:
+            return cleaned
+    return ""
+
+
+JUDGE_SYSTEM = f"""\
+You are given the user's original message and a list of retrieved facts. \
+Decide whether the facts are enough to answer the message well. Never answer \
+the question yourself.
+
+Reply `{VERDICT_ENOUGH}` if they are. Otherwise reply `{VERDICT_MISSING}: ` \
+followed by one sentence naming precisely what is absent — the wrong entity, \
+the wrong time frame, the right topic at the wrong level of detail, or too \
+vague to use.
+
+Example:
+
+Message: what Postgres version are we on in production?
+Facts:
+- The team runs Postgres for the billing service.
+
+Verdict:
+
+{VERDICT_MISSING}: no version number anywhere, only that Postgres is used.
+
+Example:
+
+Message: what Postgres version are we on in production?
+Facts:
+- The team upgraded production to Postgres 15 in March.
+
+Verdict:
+
+{VERDICT_ENOUGH}"""
+
+JUDGE_PROMPT = "Message: {message}\nFacts:\n{facts}\n\nVerdict:"
+#: The judge and the reseed prompt are shown the ORIGINAL user message, never
+#: a rewritten query: rewrites are lossy interpretations of intent, and a
+#: loop that judges against its own last guess drifts away from what was
+#: asked, one round at a time.
+
+
+def parse_verdict(text: str) -> tuple[bool, str]:
+    """`(True, "")` when the reply's first word is `ENOUGH`; otherwise
+    `(False, the gap sentence)` — everything after the first colon, or the
+    whole reply with a leading `MISSING` stripped. Parses leniently, then
+    decides."""
+    stripped = text.strip()
+    first = stripped.split()[0].strip(":").lower() if stripped.split() else ""
+    if first == VERDICT_ENOUGH.lower():
+        return True, ""
+    if ":" in stripped:
+        return False, stripped.split(":", 1)[1].strip()
+    body = stripped
+    if body.lower().startswith(VERDICT_MISSING.lower()):
+        body = body[len(VERDICT_MISSING) :].strip()
+    return False, body.strip()
+
+
+RESEED_SYSTEM = """\
+You are given the user's original message, a one-sentence description of what \
+the retrieved evidence is still missing, and every query already tried. Write \
+new search queries aimed at closing that gap — one per line, at most as many \
+as asked for, none repeating a tried query, no numbering or bullets."""
+
+RESEED_PROMPT = (
+    "Message: {message}\nGap: {gap}\nAlready tried:\n{tried}\n\n"
+    "Write at most {limit} queries:"
+)
+
+
+def parse_seeds(text: str, *, limit: int = MAX_SEEDS) -> tuple[str, ...]:
+    """One seed per non-empty line, bullets and numbering stripped,
+    deduplicated case-insensitively, capped at `min(limit, MAX_SEEDS)`.
+    Mirrors `parse_quotes`."""
+    cap = max(0, min(limit, MAX_SEEDS))
+    seeds: list[str] = []
+    seen: set[str] = set()
+    for line in text.strip().splitlines():
+        cleaned = _undecorate(line)
+        if not cleaned or cleaned.lower() in seen:
+            continue
+        seen.add(cleaned.lower())
+        seeds.append(cleaned)
+        if len(seeds) >= cap:
+            break
+    return tuple(seeds)
+
+
+RECALL_HEADER = """\
 ---
-The following notes were extracted from the user's earlier conversations in \
-this project. They are background that may or may not be relevant — the \
-user did not write them and cannot see them. Use them only where they help \
-answer the message above; do not mention them otherwise."""
+The notes below were retrieved from the user's earlier conversations in this \
+project. The user did not write them and cannot see them. Use them where they \
+help answer the message above; where they are silent, fall back on your own \
+knowledge. Never mention that a retrieval step happened."""
 
-ENRICHMENT_BULLET = "- "
+RECALL_HEDGE = (
+    " A check judged this evidence incomplete for the question — treat it as "
+    "partial and say plainly where you are unsure."
+)
+
+RECALL_FOOTER = "The user's message, again: {user_text}"
 
 
-def enriched_text(user_text: str, summaries: Sequence[ConversationSummary]) -> str:
-    """`user_text` with `summaries` appended behind `ENRICHMENT_HEADER`, one
-    bulleted line per summary. Returns `user_text` unchanged when `summaries`
-    is empty."""
-    if not summaries:
-        return user_text
-    bullets = "\n".join(
-        f"{ENRICHMENT_BULLET}{' '.join(summary.summary.split())}" for summary in summaries
-    )
-    return f"{user_text}\n\n{ENRICHMENT_HEADER}\n\n{bullets}"
+def render_facts(hits: Sequence["Hit"], *, budget: int) -> str:
+    """The retrieved facts, grouped by view: a `Facts:` block of claim-view
+    hits and a `Said:` block of evidence-view hits as `author: "quote"`.
+    Drops whole hits, lowest-scored first, to fit `budget` tokens."""
+    ordered = sorted(hits, key=lambda h: h.score, reverse=True)
+
+    def render(kept: Sequence["Hit"]) -> str:
+        claims = [h for h in kept if h.view == "claim"]
+        said = [h for h in kept if h.view == "evidence"]
+        blocks: list[str] = []
+        if claims:
+            blocks.append(
+                "Facts:\n" + "\n".join(f"- {h.fact.text}" for h in claims)
+            )
+        if said:
+            lines: list[str] = []
+            for hit in said:
+                for phrase in hit.fact.phrases:
+                    if phrase.quote:
+                        lines.append(f'- {phrase.author.label}: "{phrase.quote}"')
+            if lines:
+                blocks.append("Said:\n" + "\n".join(lines))
+        return "\n\n".join(blocks)
+
+    kept = list(ordered)
+    while kept and estimate_tokens(render(kept)) > budget:
+        kept.pop()
+    return render(kept)
+
+
+def recall_block(recall: "Recall") -> str:
+    """The block appended to a user turn: header (plus the hedge on a
+    `cap`/`deadline` exit), the rendered digest, then the footer restating the
+    user's message. `_prompt_messages` and `RecallNote` both render through
+    this so what the model saw and what the note shows cannot drift."""
+    header = RECALL_HEADER
+    if recall.exit == "cap":
+        header += RECALL_HEDGE
+    footer = RECALL_FOOTER.format(user_text=recall.user_text)
+    body = recall.digest or "(no matching facts)"
+    return f"{header}\n\n{body}\n\n{footer}"
+
+
+def recalled_text(user_text: str, recall: "Recall") -> str:
+    return f"{user_text}\n\n{recall_block(recall)}"
 
 
 #: What the router is told `default` covers — `default` names no `SubAgent`
@@ -420,7 +571,7 @@ def parse_agent_id(text: str, *, agent_ids: Sequence[str]) -> str | None:
     line = lines[0]
     if line.lower().startswith("name:"):
         line = line[len("name:") :].strip()
-    line = _clean_keyword(line)
+    line = _undecorate(line)
     candidate = line.lower()
 
     lower_ids = {agent_id.lower(): agent_id for agent_id in agent_ids}
@@ -525,42 +676,10 @@ def _oldest_droppable(turns: list[tuple[str, str]]) -> int | None:
     return None
 
 
-def parse_keywords(text: str, *, limit: int = MAX_KEYWORDS) -> tuple[str, ...]:
-    """Defensively parse a keyword reply. Small models decorate their output —
-    labels, bullets, prose — so this tolerates all of that and returns `()`
-    when nothing survives; the caller decides what an empty result means."""
-    text = text.strip().strip("`").strip()
-    text = text.strip("'\"").strip()
-
-    lower = text.lower()
-    if lower.startswith("keywords:"):
-        text = text[len("keywords:") :].strip()
-
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    line = next((candidate for candidate in lines if ";" in candidate), None)
-    if line is None:
-        line = lines[0] if lines else ""
-
-    pieces = line.split(";")
-    keywords: list[str] = []
-    seen: set[str] = set()
-    for piece in pieces:
-        cleaned = _clean_keyword(piece)
-        if not cleaned:
-            continue
-        key = cleaned.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        keywords.append(cleaned)
-        if len(keywords) >= limit:
-            break
-    return tuple(keywords)
-
-
-def _clean_keyword(piece: str) -> str:
+def _undecorate(piece: str) -> str:
+    """Strip a model's list decoration from one line: surrounding quotes, a
+    leading `-`/`*` bullet, `1.`/`2)` numbering, and a trailing period."""
     cleaned = piece.strip().strip("'\"").strip()
-    # Drop a leading bullet: "-", "*", or "1." / "2)" style numbering.
     while cleaned[:1] in ("-", "*"):
         cleaned = cleaned[1:].strip()
     stripped = cleaned.lstrip("0123456789")

@@ -94,87 +94,120 @@ Environment variables, all prefixed `AGENTCHAT_`:
 | `AGENTCHAT_MAX_CONTEXT` | unset | Cap every model's context window, for a smaller GPU |
 | `AGENTCHAT_STORE` | `sqlite` | `sqlite` is the only store |
 | `AGENTCHAT_DATA_DIR` | `./data` | Where `agentchat.db` lives (the `sqlite` store) |
-| `AGENTCHAT_CORPUS_DIR` | `./corpus` | RAG ingestion source (not yet used) |
+| `AGENTCHAT_CORPUS_DIR` | `./corpus` | Document-ingestion source (not yet used) |
 | `AGENTCHAT_SIMULATE_FAILURE` | `0` | Make the second model fail on load, to exercise error handling |
-| `AGENTCHAT_EXTRACT_SUMMARIES` | `1` | Derive a summary and keywords for a conversation when it is left |
-| `AGENTCHAT_EXTRACTION_TIMEOUT` | `30.0` | Seconds `Ctrl+D`/`Ctrl+Q` wait for extraction before exiting anyway |
-| `AGENTCHAT_ENRICH_MESSAGES` | `1` | Append matching summaries from the group to a user message before it reaches the model |
+| `AGENTCHAT_EXTRACTION_TIMEOUT` | `30.0` | Seconds `Ctrl+D`/`Ctrl+Q` wait for the closing fact flush before exiting anyway |
 | `AGENTCHAT_SUBAGENTS` | `1` | Route a user message to a specialist, when one clearly fits, before answering |
 | `AGENTCHAT_SUBAGENT_TIMEOUT` | `60.0` | Seconds each consultation phase (routing+task, then the specialist's answer) is allowed |
 | `AGENTCHAT_EXTRACT_FACTS` | `1` | Extract one grounded fact per six-message window as a conversation goes on |
+| `AGENTCHAT_RECALL_FACTS` | `1` | Run the adaptive retrieval loop over the group's facts before answering |
+| `AGENTCHAT_EMBED_MODEL` | `all-MiniLM-L6-v2` | Embedder id a stored vector is tagged with; a vector from another id is re-embedded |
+| `AGENTCHAT_EMBED_MODEL_PATH` | `<model_root>/sentence-transformers/all-MiniLM-L6-v2` | Where the embedding checkpoint is loaded from (never downloaded) |
+| `AGENTCHAT_RECALL_ROUNDS` | `3` | Hard cap on retrieval rounds before the digest is released as it stands |
+| `AGENTCHAT_RECALL_REWRITES` | `3` | Query rewrites generated per seed, each shown the queries already tried |
+| `AGENTCHAT_RECALL_HITS` | `10` | Top-k kept per query per view before the union by fact id |
+| `AGENTCHAT_RECALL_SEEDS` | `2` | Reseed queries per round, aimed at the judge's gap (capped at 4) |
+| `AGENTCHAT_RECALL_MIN_SCORE` | `0.25` | Cosine floor a hit must clear to enter the pool |
+| `AGENTCHAT_RECALL_DIGEST_FACTS` | `12` | Facts the digest is capped at, deduplicated and ranked |
+| `AGENTCHAT_RECALL_TIMEOUT` | `120.0` | Wall-clock deadline on the whole loop; whatever it has is released |
 | `AGENTCHAT_LOG_LLM_IO` | `1` | Write a verbatim request/response transcript of every model call to `llm.jsonl` |
 | `AGENTCHAT_LOG_DIR` | `<data_dir>/logs` | Where `agentchat.log` and `llm.jsonl` are written |
+
+The cost of a recalled turn is the **product** of the knobs, not their sum:
+worst case at the defaults is `1 + n + (s·n + 1)·(rounds−1)` calls before the
+reply. Tune `AGENTCHAT_RECALL_REWRITES` and `AGENTCHAT_RECALL_ROUNDS` down if a
+recalled turn runs long, and `AGENTCHAT_RECALL_TIMEOUT` bounds it regardless.
 
 Variables can also go in a `.env` file at the project root (copy
 `.env.example`) instead of being exported in the shell. Real environment
 variables take precedence over `.env`.
 
-**No migrations.** `agentchat.db`'s schema only ever grows by hand-written
-`CREATE TABLE IF NOT EXISTS` statements; there is no upgrade path from an
-older schema. A database written before conversation groups landed is refused,
+**No migrations.** `agentchat.db`'s schema grows by hand-written
+`CREATE TABLE IF NOT EXISTS` statements, plus one guarded `ALTER TABLE` (the
+`fact_phrases.quote` column); there is no general upgrade path from an older
+schema. A database written before conversation groups landed is refused,
 not silently rewritten — the app raises naming the file. Delete it and restart
 to get a fresh one: `rm data/agentchat.db` (or whatever `AGENTCHAT_DATA_DIR`
 points at).
 
-## Conversation summaries
-
-Every conversation gets a dense summary and up to five keywords, produced by
-two LLM calls on the active model (summary first, keywords from the summary)
-and stored in `conversation_summaries`, keyed by conversation and carrying the
-group id. Extraction fires when a conversation is left — switching away
-(`Ctrl+N`/`Ctrl+G`/`Ctrl+L`) runs it in the background and the status bar
-shows `summarising…` for as long as it's in flight, without blocking the next
-turn; quitting (`Ctrl+D`/`Ctrl+Q`) shows the same status line but waits for
-it, bounded by `AGENTCHAT_EXTRACTION_TIMEOUT`. A conversation with no new
-messages since its last summary is not re-summarised.
-`AGENTCHAT_EXTRACT_SUMMARIES=0` switches the feature off.
-
 ## What gets remembered
 
-Alongside the conversation summary, the conversation is read through a
-sliding window of six messages stepping four, and each full window is sent
-through two LLM calls — one for a fact, one for the quotes that support it —
-as the conversation goes on, not only when it's left. Each quote is located
-in a real stored message by code, not by the model; a quote that can't be
-found is not evidence, and a fact with no located quotes is discarded. A
+The conversation is read through a sliding window of six messages stepping
+four, and each full window is sent through two LLM calls — one for a fact, one
+for the quotes that support it — as the conversation goes on, and once more on
+leaving it (the partial trailing window is flushed then). Each quote is
+located in a real stored message by code, not by the model; a quote that can't
+be found is not evidence, and a fact with no located quotes is discarded. A
 located quote becomes a `Phrase`, carrying which message and which author (the
-user, or a specific model id) it came from — so a fact is always traceable
-back to the words that grounded it.
+user, or a specific model id) it came from, plus the verbatim substring — so a
+fact is always traceable back to the words that grounded it.
 
 A specialist's advice, consulted mid-turn, is never part of this: it lives
-only in `Message.metadata`, never in a message's own text, so it is counted
-in no window and quoted in no fact. Facts have no consumer yet — nothing
-reads them back into a conversation — they are stored and ready for the recall
-mechanism that will read from them later. Summary extraction runs beside this
-unchanged; the two features don't interact.
+only in `Message.metadata`, never in a message's own text, so it is counted in
+no window and quoted in no fact. Each fact is embedded under two views — its
+claim and its evidence — as it is written, so the common path never embeds at
+read time.
 
 `AGENTCHAT_EXTRACT_FACTS=0` switches the feature off.
 
 ## Recalling earlier conversations
 
-In a **project** group, sending a message checks the group's other
-conversations' summaries for a keyword hit against what you typed — a
-whole-phrase, case-insensitive match, not a substring. Up to three matching
-summaries are appended to the copy of your message the model sees, behind a
-short note explaining they're background from earlier chats. Under your
-message a muted line appears — `▸ enriched by 2 memories` — that expands on
-click to show what was sent.
+In a **project** group, every message crosses a gate: a one-word classifier
+call decides whether answering it well needs facts from the group's earlier
+conversations. Self-contained messages ("write me a haiku") are answered as
+they are. The rest enter a bounded loop over the group's facts — scoped to
+that group and nothing else:
 
-Each summary is used at most once per visit to a conversation; switching away
-and back makes it available again. Nothing about the enrichment reaches the
-database: `conversation.messages` keeps exactly what you typed, and reopening
-the conversation later shows no trace of it. It never runs in the default
-group, and never at the cost of your own message — if the appended summaries
-would push a reply over the model's context window, the turn is resent
-without them rather than dropped.
+1. **rewrite** — the seed (your message, then the judge's gap in later rounds)
+   is rewritten into `n` distinct search queries, generated one at a time,
+   each shown the queries already tried, and phrased in the vocabulary the
+   conversation would have used rather than the vocabulary of a question.
+2. **retrieve** — every query is embedded by a small CPU model and scored by
+   cosine against the group's fact vectors under both views; each query keeps
+   its own top `k`, and the results are unioned by fact id keeping the best
+   score.
+3. **assemble** — the pool is deduplicated (a fact whose significant tokens
+   are a subset of a higher-scored one's is dropped), ranked, and capped into
+   a digest. No LLM call: a fact is already a one-sentence summary.
+4. **adjudicate** — a judge call scores the digest against your **original**
+   message (never a rewrite) and either accepts it or names, in one sentence,
+   what is still missing. That sentence is what the next round's queries are
+   written from.
 
-**Known limitation:** an enriched reply is itself summarised when that
-conversation is later left, so injected material can be folded into *that*
-conversation's own summary and recalled a second time from a third
-conversation. Accepted as a limitation of a keyword-only recall mechanism
-rather than engineered around.
+The loop terminates on a sufficient verdict, a hard round cap, or a wall-clock
+deadline — whichever comes first releases the digest as it stands. The digest
+is appended to the copy of your message the model sees, behind a note
+explaining it is background from earlier chats and telling the model to fall
+back on its own knowledge where the evidence is silent. When the loop hit the
+round cap, the note also says the evidence was judged incomplete.
 
-`AGENTCHAT_ENRICH_MESSAGES=0` switches the feature off.
+Under your message a muted line appears — `▸ recalled 4 facts · 2 rounds ·
+sufficient` — that expands to show the queries the loop ran, the judge's last
+gap, and the block that was appended, character for character. Recall
+provenance **is** persisted on the assistant reply (`Message.metadata["recall"]`),
+so reopening the conversation rebuilds the same note. Nothing about the
+injected block reaches `conversation.messages`, and if it would push the reply
+over the model's context window the turn is resent without it.
+
+A consultation and recall never happen on the same turn — a consulted turn
+does not spend the gate call. Retrieval failure (provider, storage, embedder,
+timeout) degrades to a normal reply, never an error or a hang.
+
+`AGENTCHAT_RECALL_FACTS=0` switches the feature off entirely — no embedder
+load, no gate call, no `fact_embeddings` reads.
+
+### Setup: the embedding weights
+
+The retrieval loop needs a small sentence encoder on disk (real backend only —
+`AGENTCHAT_BACKEND=mock` uses a weightless hashing embedder and needs nothing):
+
+```bash
+uv run hf download sentence-transformers/all-MiniLM-L6-v2 \
+  --local-dir /sc/projects/sci-lippert/intelligent-agents/model_checkpoints/sentence-transformers/all-MiniLM-L6-v2
+```
+
+Or point `AGENTCHAT_EMBED_MODEL_PATH` at wherever the checkpoint already
+lives.
 
 ## Consulting a specialist
 
@@ -250,9 +283,10 @@ Every call into a model backend writes two JSON lines to
 holding exactly the string handed to the tokenizer (the mock backend has no
 tokenizer, so its `prompt_text` is `null`), and a **response** record holding
 exactly what the model returned — special tokens included, un-stripped. The
-two share a `call_id`; a `label` (`chat`, `extraction.summary`,
-`extraction.keywords`) says which call site produced them. Nothing is
-truncated, redacted, or summarised, at any size — the file is an instrument,
+two share a `call_id`; a `label` (`chat`, `facts.fact`, `facts.quotes`,
+`recall.gate`, `recall.rewrite`, `recall.judge`, `recall.reseed`, `route`,
+`subagent.task`, `subagent.<id>`) says which call site produced them. Nothing
+is truncated, redacted, or summarised, at any size — the file is an instrument,
 not a second opinion, and it **contains full conversation text in
 cleartext**, the same exposure `agentchat.db` already has.
 
@@ -273,29 +307,29 @@ built. `AGENTCHAT_LOG_DIR` moves both this and the application log
 ```
 src/agentchat/
   log.py           file-handler plumbing shared by the app log and the LLM transcript
-  config.py        settings + the single wiring point for backends
+  config.py        settings + the single wiring point for backends, embedder and retriever
   core/
-    models.py      Message, Conversation, ConversationSummary, Author, Phrase, Fact
+    models.py      Message, Conversation, Author, Phrase, Fact, FactEmbedding
     chat.py        turn orchestration — the only thing that knows how a reply is made
     context.py     ContextStrategy seam (context-management elective)
-    prompts.py     the assistant's system prompt, extraction, enrichment, consultation and fact/quote prompt text, transcript rendering, keyword/agent-id/quote parsing
-    extraction.py  ExtractionService — two LLM calls, summary then keywords
-    enrichment.py  MemoryEnricher — keyword matching and the once-per-visit session ledger
+    prompts.py     the assistant's system prompt, the fact/quote, gate/rewrite/judge/reseed and consultation prompt text, transcript rendering, agent-id/quote/verdict/seed parsing, the injected recall block
     agents.py      SubAgent, the shipped roster, and @mention parsing
     delegation.py  DelegationService — route → task → specialist, one Consultation or None
     anchoring.py   pure functions that locate a quote in a real message: normalise, anchor, anchor_in, significant, coverage
     facts.py       FactExtractor and the sliding-window arithmetic — one fact per full window, derived from the stored watermark
+    retrieval.py   Hit, Recall, FactIndex (the only reader of fact_embeddings), and AdaptiveRetriever — the bounded RAG loop
     errors.py      every failure the UI is expected to render
   llm/
     base.py        LLMProvider protocol — the app/backend boundary
+    embedding.py   Embedder protocol, LocalEmbedder (CPU sentence encoder), HashingEmbedder (weightless, for tests)
     registry.py    model catalogue, residency, runtime switching
     local.py       real backend (transformers)
     mock.py        the stub backend
     transcript.py  verbatim request/response log of every `generate()` call — see "Logs"
   storage/
     base.py        ConversationStore protocol + shared ordering/guard helpers
-    schema.py      the DDL, the default-group seed, and the old-database guard
-    sqlite.py      durable implementation — three tables, one save per turn
+    schema.py      the DDL, the default-group seed, the one hand-written migration, and the old-database guard
+    sqlite.py      durable implementation — one save per turn
   ui/
     app.py         Textual application
     widgets.py     message bubbles and the group/title header
@@ -336,13 +370,12 @@ imports a concrete backend.
   conversation in it** — they are not re-homed, because a conversation's group
   cannot change — so the confirmation names how many chats are about to go.
   The default group is not deletable.
-- Conversation summaries — a dense summary and up to five keywords, derived
-  on leaving a conversation and stored per group. See "Conversation
-  summaries" above.
-- Message enrichment — a user message in a project group is checked against
-  the group's other conversations' summaries, and up to three keyword matches
-  are appended before the model sees it. See "Recalling earlier
-  conversations" above.
+- Grounded fact extraction — one fact per six-message window, each quote
+  located in a real message by code. See "What gets remembered" above.
+- Adaptive fact retrieval — a gated, bounded RAG loop over the group's facts
+  (rewrite → retrieve → assemble → judge), scoped to the group, with the
+  injected block inspectable per turn. See "Recalling earlier conversations"
+  above.
 - LLM I/O transcript — every model call writes a verbatim request/response
   pair to `llm.jsonl`, recorded from inside the backend so it reflects what
   the model actually saw and said. See "Logs" above.
@@ -359,7 +392,10 @@ imports a concrete backend.
 Deliberately stubbed, with the seam in place:
 
 - The two required fine-tunes.
-- Adaptive RAG, intelligent context management (electives).
+- Ingesting user documents (text and PDF) into the retrieval corpus —
+  `AGENTCHAT_CORPUS_DIR` is the seam; recall indexes conversation facts only
+  for now.
+- Intelligent context management (elective).
 - Specialists on their own weights (LoRA adapters over the shared resident
   base) — the roster is prompt-differentiated for now; `SubAgent` has no
   `model_id`.
