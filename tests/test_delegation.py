@@ -23,7 +23,7 @@ from agentchat.core.prompts import (
     ROUTER_SYSTEM,
     TASK_PROMPT,
     TASK_SYSTEM,
-    consulted_text,
+    injected_text,
     parse_agent_id,
     parse_task,
     roster_text,
@@ -119,9 +119,12 @@ def test_consultation_header_states_isolation_and_permission_to_correct():
     assert "correct it" in CONSULTATION_HEADER
 
 
-def test_consulted_text_carries_user_text_task_and_answer_in_order():
+def test_injected_text_carries_user_text_task_and_answer_in_order():
     agent = SubAgent(id="ask_bank", name="Banking", purpose="p", system_prompt="s")
-    text = consulted_text("what now?", agent, "the task", "the answer")
+    consultation = Consultation(
+        agent=agent, task="the task", answer="the answer", trigger="router"
+    )
+    text = injected_text("what now?", consultation, None)
 
     assert text.startswith("what now?")
     header_at = text.index(CONSULTATION_HEADER)
@@ -289,6 +292,47 @@ async def test_call_three_is_isolated_to_the_agents_system_prompt_and_task():
             assert agent.id not in call.messages[1].content
     assert "30-year loan" not in call.messages[0].content
     assert "30-year loan" not in call.messages[1].content
+
+
+def _recall(digest: str) -> "Recall":
+    from agentchat.core.retrieval import Recall
+
+    return Recall(
+        hits=(), digest=digest, queries=("q",), rounds=1,
+        exit="sufficient", user_text="what does APR mean, given my 30-year loan?",
+    )
+
+
+async def test_call_three_carries_the_recall_digest_after_the_task():
+    from agentchat.core.prompts import SPECIALIST_EVIDENCE_HEADER
+
+    provider = scripted_provider("ask_bank", "Explain APR.", "an answer")
+    service = DelegationService(_registry_with(provider))
+
+    result = await service.consult(
+        "what does APR mean, given my 30-year loan?",
+        recall=_recall("Facts:\n- The user has a 30-year fixed mortgage."),
+    )
+
+    call = provider.calls[2]
+    assert len(call.messages) == 2
+    user = call.messages[1].content
+    assert user.index("Explain APR.") < user.index(SPECIALIST_EVIDENCE_HEADER)
+    assert user.index(SPECIALIST_EVIDENCE_HEADER) < user.index("30-year fixed mortgage")
+    # The footer restating the user's message is deliberately absent.
+    assert "The user's message, again" not in user
+    # The digest never leaks into the persisted task.
+    assert "30-year fixed mortgage" not in result.task
+
+
+async def test_call_three_with_no_recall_is_just_the_task():
+    provider = scripted_provider("ask_bank", "Explain APR.", "an answer")
+
+    await DelegationService(_registry_with(provider)).consult(
+        "what does APR mean?", recall=None
+    )
+
+    assert provider.calls[2].messages[1].content == "Explain APR."
 
 
 async def test_router_replying_default_returns_none_after_one_call():
@@ -715,6 +759,37 @@ async def test_subagents_disabled_mounts_no_note_and_makes_one_generation():
         await _wait_until_done(pilot, app)
 
         assert list(app.query(ConsultationNote)) == []
+
+
+async def test_a_turn_that_recalled_and_consulted_shows_both_notes():
+    from agentchat.core.retrieval import AdaptiveRetriever, FactIndex
+    from agentchat.llm.embedding import HashingEmbedder
+    from agentchat.ui.widgets import RecallNote
+    from factories import make_indexed_group
+
+    app, provider = _scripted_app(
+        # recall first: gate, rewrite, judge — then route, task, specialist, reply
+        "SEARCH", "a query", "ENOUGH",
+        "ask_bank", "Explain APR.", "an answer", "a reply",
+        recall_facts=True,
+    )
+    embedder = HashingEmbedder()
+    app.chat.retriever = AdaptiveRetriever(
+        app.chat.registry, FactIndex(app.chat.store, embedder),
+        rewrites=1, min_score=0.0,
+    )
+    async with app.run_test() as pilot:
+        group = await make_indexed_group(app.chat.store, embedder)
+        app.conversation = await app.chat.new_conversation(group.id)
+
+        await _submit(pilot, "what does APR mean for our billing?")
+        await _wait_until_done(pilot, app)
+
+        assert len(list(app.query(ConsultationNote))) == 1
+        assert len(list(app.query(RecallNote))) == 1
+        meta = app.chat.last_turn.message.metadata
+        assert meta.get("subagent") is not None
+        assert meta.get("recall") is not None
 
 
 async def test_switching_away_and_back_still_shows_the_note():

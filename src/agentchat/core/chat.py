@@ -26,7 +26,7 @@ from agentchat.core.models import (
     Message,
     Snippet,
 )
-from agentchat.core.prompts import DEFAULT_SYSTEM, consulted_text, recall_block, recalled_text
+from agentchat.core.prompts import DEFAULT_SYSTEM, injected_text, recall_block
 from agentchat.core.retrieval import AdaptiveRetriever, Recall
 from agentchat.core.usage import TurnUsage
 from agentchat.llm import transcript
@@ -45,8 +45,8 @@ class TurnResult:
     #: or when the consultation didn't survive trimming.
     consultation: Consultation | None = None
     #: What the adaptive retrieval loop produced for this turn, if anything —
-    #: `None` on a self-contained turn, when recall is off, when a
-    #: consultation suppressed it, or when it didn't survive trimming.
+    #: `None` on a self-contained turn, when recall is off, or when it didn't
+    #: survive trimming.
     recall: Recall | None = None
     #: What each of the turn's calls left resident, as the backend counted it.
     #: Still filling in while the reply streams: this object exists before the
@@ -174,6 +174,15 @@ class ChatService:
             with usage.collecting() as turn_usage:
                 provider = await self.registry.active_provider()
 
+                # Recall runs first and unconditionally: its digest is handed
+                # to the specialist alongside the task, so it has to exist
+                # before delegation runs. Every turn now spends the gate call.
+                recall: Recall | None = None
+                if self.retriever is not None:
+                    recall = await self.retriever.recall(
+                        conversation, user_text, on_progress
+                    )
+
                 consultation: Consultation | None = None
                 if self.delegator is not None:
                     if on_progress is not None:
@@ -181,16 +190,12 @@ class ChatService:
                     # `conversation.messages` already ends with this turn's user
                     # message, so the task is written from the exchange it belongs
                     # to rather than from one message with its referents missing.
+                    # The digest travels beside the task, never inside it.
                     consultation = await self.delegator.consult(
-                        user_text, on_progress, history=conversation.messages
-                    )
-
-                # No recall alongside a consultation (R19) — and the gate call
-                # is not spent either, because `recall` is not entered.
-                recall: Recall | None = None
-                if consultation is None and self.retriever is not None:
-                    recall = await self.retriever.recall(
-                        conversation, user_text, on_progress
+                        user_text,
+                        on_progress,
+                        history=conversation.messages,
+                        recall=recall,
                     )
 
                 prompt_messages = self._prompt_messages(
@@ -199,18 +204,28 @@ class ChatService:
                 decision = self.context_strategy.build(
                     prompt_messages, context_window=provider.info.context_window
                 )
-                if (consultation is not None or recall is not None) and any(
+                # Staged rollback: the recall block is given up first, the
+                # consultation block second, the user's own question never.
+                # Each stage compares against the freshly rebuilt last message,
+                # and clearing the variable before the metadata writes below
+                # keeps them from claiming a block the reply never saw.
+                if recall is not None and any(
                     m is prompt_messages[-1] for m in decision.dropped
                 ):
-                    # The injected turn didn't survive trimming whole — rebuild
-                    # without it rather than cost the user their own question.
-                    # Clearing the injected state here also keeps it from being
-                    # recorded below: nothing was actually sent.
-                    consultation = None
                     recall = None
+                    prompt_messages = self._prompt_messages(
+                        conversation, consultation, None
+                    )
                     decision = self.context_strategy.build(
-                        self._prompt_messages(conversation, None, None),
-                        context_window=provider.info.context_window,
+                        prompt_messages, context_window=provider.info.context_window
+                    )
+                if consultation is not None and any(
+                    m is prompt_messages[-1] for m in decision.dropped
+                ):
+                    consultation = None
+                    prompt_messages = self._prompt_messages(conversation, None, None)
+                    decision = self.context_strategy.build(
+                        prompt_messages, context_window=provider.info.context_window
                     )
 
                 reply = conversation.add(
@@ -302,23 +317,20 @@ class ChatService:
         recall: Recall | None = None,
     ) -> list[Message]:
         """The assistant's system prompt followed by `conversation.messages`,
-        the last of which — the user turn just added — carries the
-        consultation's or the recall's material appended to its content when
-        there is anything to inject. The two are mutually exclusive (R19).
-        Nothing in `conversation.messages` is touched, which is what keeps both
-        the system prompt and the injection out of the database without needing
-        a rule anyone has to remember."""
+        the last of which — the user turn just added — carries the consultation
+        block and/or the recall block appended to its content. Both may be
+        present; consultation comes first so the recall footer's restated
+        question is the last thing the model reads. Nothing in
+        `conversation.messages` is touched, which is what keeps both the system
+        prompt and the injection out of the database without needing a rule
+        anyone has to remember."""
         system = Message(role="system", content=DEFAULT_SYSTEM)
-        last = conversation.messages[-1]
-        if consultation is not None:
-            content = consulted_text(
-                last.content, consultation.agent, consultation.task, consultation.answer
-            )
-        elif recall is not None:
-            content = recalled_text(last.content, recall)
-        else:
+        if consultation is None and recall is None:
             return [system, *conversation.messages]
-        copy = replace(last, content=content)
+        last = conversation.messages[-1]
+        copy = replace(
+            last, content=injected_text(last.content, consultation, recall)
+        )
         return [system, *conversation.messages[:-1], copy]
 
     # -- documents ---------------------------------------------------------

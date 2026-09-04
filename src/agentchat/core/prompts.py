@@ -16,6 +16,7 @@ from agentchat.core.context import estimate_tokens
 from agentchat.core.models import Message
 
 if TYPE_CHECKING:
+    from agentchat.core.delegation import Consultation
     from agentchat.core.retrieval import Hit, Recall, SnippetHit
 
 #: The system prompt for the assistant the user actually talks to — the
@@ -504,8 +505,23 @@ def recall_block(recall: "Recall") -> str:
     return f"{header}\n\n{body}\n\n{footer}"
 
 
-def recalled_text(user_text: str, recall: "Recall") -> str:
-    return f"{user_text}\n\n{recall_block(recall)}"
+SPECIALIST_EVIDENCE_HEADER = """\
+---
+The notes below were retrieved for you: facts from the user's earlier \
+conversations in this project, and passages from documents the user provided. \
+The person you are answering did not write them and cannot see them. Use them \
+where they help and fall back on your own knowledge where they are silent. \
+Never mention that a retrieval step happened."""
+
+
+def specialist_text(task: str, recall: "Recall | None") -> str:
+    """The specialist's user message: the task alone, or the task followed by
+    `SPECIALIST_EVIDENCE_HEADER` and the turn's recalled digest. The digest
+    itself, not `recall_block` — `RECALL_FOOTER` restates the user's message,
+    which the specialist was deliberately not given."""
+    if recall is None or not recall.digest:
+        return task
+    return f"{task}\n\n{SPECIALIST_EVIDENCE_HEADER}\n\n{recall.digest}"
 
 
 #: What the router is told `default` covers — `default` names no `SubAgent`
@@ -593,14 +609,35 @@ def roster_text(agents: Sequence[SubAgent]) -> str:
     return "\n".join(lines)
 
 
-def consulted_text(user_text: str, agent: SubAgent, task: str, answer: str) -> str:
-    """`user_text` with the specialist's task and answer appended behind
-    `CONSULTATION_HEADER`."""
+def consultation_block(agent: SubAgent, task: str, answer: str) -> str:
+    """The consultation body — `CONSULTATION_HEADER`, the task the specialist
+    was given, and its answer — without the user text it gets appended to."""
     return (
-        f"{user_text}\n\n{CONSULTATION_HEADER}\n\n"
+        f"{CONSULTATION_HEADER}\n\n"
         f"Task given to {agent.name}:\n{task}\n\n"
         f"{agent.name}'s answer:\n{answer}"
     )
+
+
+def injected_text(
+    user_text: str,
+    consultation: "Consultation | None",
+    recall: "Recall | None",
+) -> str:
+    """`user_text` with whichever injected blocks the turn produced appended:
+    the consultation block first, then the recall block, so the recall
+    footer's restated question is the last thing before the model answers.
+    Returns `user_text` unchanged when both are `None`."""
+    blocks = [user_text]
+    if consultation is not None:
+        blocks.append(
+            consultation_block(
+                consultation.agent, consultation.task, consultation.answer
+            )
+        )
+    if recall is not None:
+        blocks.append(recall_block(recall))
+    return "\n\n".join(blocks)
 
 
 def parse_agent_id(text: str, *, agent_ids: Sequence[str]) -> str | None:

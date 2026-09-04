@@ -61,13 +61,19 @@ src/agentchat/
                     fact/quote, gate/rewrite/judge/reseed and consultation
                     prompt text, and nothing else — edit this file to tune how
                     the assistant answers, routing quality, fact/quote
-                    quality, retrieval quality, or the wording of the injected
-                    recall/consultation block, not chat.py, retrieval.py,
+                    quality, retrieval quality, or the wording of the blocks
+                    injected into a turn — the recall block, the consultation
+                    block, and the specialist's own evidence header, composed
+                    by injected_text and specialist_text here — not chat.py,
+                    retrieval.py,
                     delegation.py, or facts.py. The gate, rewrite, judge and
                     reseed prompts live here like every other prompt
     agents.py      SubAgent, the shipped roster, and @mention parsing
     delegation.py  DelegationService: route → task → specialist, one
-                    Consultation or None, one entry point for every failure
+                    Consultation or None, one entry point for every failure.
+                    The specialist is handed the turn's recalled digest as a
+                    second block beneath its task; the authored task never
+                    carries it
     anchoring.py   pure functions that locate a quote in a real message by
                     code, never by asking the model: normalise, anchor,
                     anchor_in, significant, coverage. No I/O, no provider, no

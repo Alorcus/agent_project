@@ -2,7 +2,8 @@
 handled.
 
 Depth is enforced structurally, not by a counter: `_agent_messages` builds
-exactly two messages — the specialist's own system prompt and its task — and
+exactly two messages — the specialist's own system prompt and one user message
+carrying its task and, when the turn recalled anything, that evidence — and
 nothing reachable from them is another `DelegationService`, so a sub-agent has
 nothing to delegate *with*.
 """
@@ -13,7 +14,7 @@ import asyncio
 import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from agentchat.core.agents import DEFAULT_AGENT_ID, SubAgent, default_agents, find_mention
 from agentchat.core.errors import AgentChatError, DelegationError
@@ -27,10 +28,14 @@ from agentchat.core.prompts import (
     parse_task,
     render_transcript,
     roster_text,
+    specialist_text,
 )
 from agentchat.llm import transcript
 from agentchat.llm.base import GenerationOptions, complete
 from agentchat.llm.registry import ModelRegistry
+
+if TYPE_CHECKING:
+    from agentchat.core.retrieval import Recall
 
 _log = logging.getLogger(__name__)
 
@@ -89,6 +94,7 @@ class DelegationService:
         on_progress: Callable[[str], None] | None = None,
         *,
         history: Sequence[Message] = (),
+        recall: "Recall | None" = None,
     ) -> Consultation | None:
         """Route `user_text`, write the task, and run the specialist. `None`
         means answer normally — including whenever anything went wrong.
@@ -97,6 +103,10 @@ class DelegationService:
         included and last; call T reads it so a follow-up question can be
         restated whole for a specialist who will never see what it refers
         back to. Empty means `user_text` stands alone.
+
+        `recall`, when the turn recalled anything, is handed to the specialist
+        as a second block in its user message — the authored task never carries
+        it.
 
         The two phases get `_timeout` each, not one budget between them:
         routing and task-authoring are short calls, the specialist's answer
@@ -112,7 +122,9 @@ class DelegationService:
             return None
 
         try:
-            return await asyncio.wait_for(self._run(pending, on_progress), self._timeout)
+            return await asyncio.wait_for(
+                self._run(pending, on_progress, recall), self._timeout
+            )
         except (AgentChatError, TimeoutError) as error:
             _log.warning("sub-agent %s failed: %s", pending.agent.id, error)
             return None
@@ -140,11 +152,14 @@ class DelegationService:
         return Pending(agent=agent, task=task, trigger=trigger)
 
     async def _run(
-        self, pending: Pending, on_progress: Callable[[str], None] | None
+        self,
+        pending: Pending,
+        on_progress: Callable[[str], None] | None,
+        recall: "Recall | None" = None,
     ) -> Consultation:
         if on_progress is not None:
             on_progress(f"consulting {pending.agent.name}…")
-        answer = await self._run_agent(pending.agent, pending.task)
+        answer = await self._run_agent(pending.agent, pending.task, recall)
         return Consultation(
             agent=pending.agent, task=pending.task, answer=answer, trigger=pending.trigger
         )
@@ -198,12 +213,14 @@ class DelegationService:
             )
         return parse_task(reply, fallback=user_text)
 
-    async def _run_agent(self, agent: SubAgent, task: str) -> str:
+    async def _run_agent(
+        self, agent: SubAgent, task: str, recall: "Recall | None" = None
+    ) -> str:
         provider = await self._registry.active_provider()
         with transcript.label(f"subagent.{agent.id}"):
             reply = await complete(
                 provider,
-                self._agent_messages(agent, task),
+                self._agent_messages(agent, task, recall),
                 GenerationOptions(max_tokens=ANSWER_MAX_TOKENS, **_CONSULTATION_OPTIONS_BASE),
             )
         answer = reply.strip()
@@ -211,11 +228,15 @@ class DelegationService:
             raise DelegationError(f"{agent.id} returned an empty answer")
         return answer
 
-    def _agent_messages(self, agent: SubAgent, task: str) -> list[Message]:
-        """Two messages, no roster, no history — this method *is* R4 and R7.
-        Private: nothing outside this class has a reason to build a
-        specialist's context."""
+    def _agent_messages(
+        self, agent: SubAgent, task: str, recall: "Recall | None" = None
+    ) -> list[Message]:
+        """Two messages, no roster, no history — the structural depth limit.
+        The user message is the task, or the task followed by the turn's
+        recalled digest; nothing here runs through `parse_task`, so
+        `TASK_CHAR_CAP` never cuts the digest. Private: nothing outside this
+        class has a reason to build a specialist's context."""
         return [
             Message(role="system", content=agent.system_prompt),
-            Message(role="user", content=task),
+            Message(role="user", content=specialist_text(task, recall)),
         ]

@@ -221,8 +221,12 @@ so reopening the conversation rebuilds the same note. Nothing about the
 injected block reaches `conversation.messages`, and if it would push the reply
 over the model's context window the turn is resent without it.
 
-A consultation and recall never happen on the same turn — a consulted turn
-does not spend the gate call. Retrieval failure (provider, storage, embedder,
+Recall and consultation can both happen on the same turn. Recall runs first
+and unconditionally, so every turn now spends the gate call; when a specialist
+is then consulted, the retrieved digest is handed to it alongside its task, so
+it answers with the project's own facts and documents in front of it. Each
+pipeline keeps its own failure funnel — a failed recall still leaves a
+consultation and vice versa. Retrieval failure (provider, storage, embedder,
 timeout) degrades to a normal reply, never an error or a hang.
 
 `AGENTCHAT_RECALL_FACTS=0` switches the feature off entirely — no embedder
@@ -318,11 +322,15 @@ A turn that routes to a specialist is four LLM calls, in sequence, on the one
 resident model: **route** (which specialist, or none), **task** (what exactly
 to ask it — the specialist never sees the conversation, only this restated
 task), **specialist** (its answer), and **reply** (the assistant folds that
-answer into the response it actually writes). The specialist advises the
-assistant and never speaks to the user directly — its answer is appended to a
-throwaway copy of your message, and the reply you see is written by the model
-you're talking to, in its own voice, free to correct what the specialist got
-wrong.
+answer into the response it actually writes) — plus the recall loop's calls
+before all of them whenever the gate opens (see "Recalling earlier conversations"
+above). When the turn recalled anything, the specialist is given that digest
+as a second block beneath its task, so it answers with the project's own facts
+in front of it; the restated task itself never carries the digest. The
+specialist advises the assistant and never speaks to the user directly — its
+answer is appended to a throwaway copy of your message, and the reply you see
+is written by the model you're talking to, in its own voice, free to correct
+what the specialist got wrong.
 
 Under a reply written with a specialist's help, a muted line appears —
 `▸ answered with help from Banking` — that expands on click to show the task
@@ -337,7 +345,8 @@ to normal routing.
 
 Grep `llm.jsonl` (see "Logs" below) for `"label":"route"`,
 `"label":"subagent.task"`, `"label":"subagent.<id>"`, and `"label":"chat"` to
-see each of the four calls in a consulted turn.
+see the four calls of a consulted turn — preceded by the `recall.*` calls
+whenever the gate opened.
 
 `AGENTCHAT_SUBAGENTS=0` switches the feature off.
 
@@ -356,8 +365,9 @@ what the KV cache is sized by. Both halves are the tokenizer's own counts. A
 turn that drops older messages to fit is shown at its trimmed size, since that
 is what was sent.
 
-A turn is often several calls — a consulted turn is four — and the meter shows
-the **largest** of them, since that is the one the window had to accommodate.
+A turn is often several calls — a consulted turn is four, more when recall ran
+first — and the meter shows the **largest** of them, since that is the one the
+window had to accommodate.
 Hover it for the breakdown and which call it came from (`route`,
 `subagent.task`, `subagent.<id>`, `chat`):
 
@@ -408,7 +418,7 @@ src/agentchat/
     context.py     ContextStrategy seam (context-management elective)
     prompts.py     the assistant's system prompt, the fact/quote, gate/rewrite/judge/reseed and consultation prompt text, transcript rendering, agent-id/quote/verdict/seed parsing, the injected recall block
     agents.py      SubAgent, the shipped roster, and @mention parsing
-    delegation.py  DelegationService — route → task → specialist, one Consultation or None
+    delegation.py  DelegationService — route → task → specialist (given the turn's recalled digest alongside its task), one Consultation or None
     anchoring.py   pure functions that locate a quote in a real message: normalise, anchor, anchor_in, significant, coverage
     facts.py       FactExtractor and the sliding-window arithmetic — one fact per full window, derived from the stored watermark
     retrieval.py   Hit, Recall, FactIndex (the only reader of fact_embeddings), and AdaptiveRetriever — the bounded RAG loop

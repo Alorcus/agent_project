@@ -13,8 +13,8 @@ from agentchat.core.prompts import (
     parse_query,
     parse_seeds,
     parse_verdict,
+    injected_text,
     recall_block,
-    recalled_text,
     render_digest,
     render_documents,
     render_facts,
@@ -137,12 +137,12 @@ def test_render_facts_drops_whole_hits_under_a_tight_budget():
     assert "Fact number 5" not in out  # lowest score dropped
 
 
-def test_recalled_text_carries_the_message_twice_and_hedges_only_on_cap():
+def test_injected_text_carries_the_message_twice_and_hedges_only_on_cap():
     recall = Recall(
         hits=(_hit("Fact A"),), digest="Facts:\n- Fact A", queries=("q",),
         rounds=1, exit="sufficient", user_text="what db did we pick?",
     )
-    text = recalled_text("what db did we pick?", recall)
+    text = injected_text("what db did we pick?", None, recall)
     assert text.count("what db did we pick?") == 2
     assert RECALL_HEDGE not in text
 
@@ -503,27 +503,38 @@ async def test_a_recalled_turn_persists_the_matched_fact_and_its_source_conversa
     assert matched["conversation_id"].startswith(group.id)
 
 
-async def test_a_consulted_turn_makes_no_gate_call(store):
+async def test_a_consulted_turn_also_recalls(store):
     from agentchat.core.delegation import DelegationService
 
     embedder = HashingEmbedder()
     group = await make_indexed_group(store, embedder)
     provider = scripted_provider(
-        "ask_bank", "Explain APR.", "an answer", "a reply"
+        # recall first: gate, one rewrite, judge
+        "SEARCH", "postgres billing version chosen", "ENOUGH",
+        # then delegation: route, task, specialist
+        "ask_bank", "Explain APR.", "an answer",
+        # then the reply
+        "a reply",
     )
     registry = _registry_with(provider)
-    retriever = AdaptiveRetriever(registry, FactIndex(store, embedder))
+    retriever = AdaptiveRetriever(
+        registry, FactIndex(store, embedder), rewrites=1, min_score=0.0
+    )
     chat = ChatService(
         registry, store=store, delegator=DelegationService(registry), retriever=retriever
     )
     conv = Conversation(group_id=group.id)
 
-    async for _ in chat.stream_reply(conv, "what does APR mean?"):
+    async for _ in chat.stream_reply(conv, "what does APR mean for our billing?"):
         pass
 
     assert chat.last_turn.consultation is not None
-    assert chat.last_turn.recall is None
-    assert len(provider.calls) == 4  # route, task, specialist, chat — no gate
+    assert chat.last_turn.recall is not None
+    # gate → rewrite → judge → route → task → specialist → chat
+    assert len(provider.calls) == 7
+    reply = chat.last_turn.message
+    assert reply.metadata.get("subagent") is not None
+    assert reply.metadata.get("recall") is not None
 
 
 async def test_extract_facts_writes_both_the_fact_and_its_vectors_in_one_pass(store):
