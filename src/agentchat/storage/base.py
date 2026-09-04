@@ -7,7 +7,16 @@ from typing import Protocol
 from collections.abc import Sequence
 
 from agentchat.core.errors import StorageError
-from agentchat.core.models import DEFAULT_GROUP_ID, Conversation, Fact, FactEmbedding, Group
+from agentchat.core.models import (
+    DEFAULT_GROUP_ID,
+    Conversation,
+    Document,
+    Fact,
+    FactEmbedding,
+    Group,
+    Snippet,
+    SnippetEmbedding,
+)
 
 
 def by_recency(conversations: list[Conversation]) -> list[Conversation]:
@@ -101,4 +110,59 @@ class ConversationStore(Protocol):
     ) -> list[Fact]:
         """The group's facts with no `fact_embeddings` row for `model_id` —
         one `LEFT JOIN`, not a Python set difference over every fact."""
+        ...
+
+    # -- derived state: documents ------------------------------------------
+    #
+    # Global, not group-scoped: a document ingested from any chat is
+    # searchable from every chat.
+
+    async def save_document(self, document: Document, snippets: Sequence[Snippet]) -> None:
+        """Write the document and its snippets in one transaction.
+
+        Raises `StorageError` when `document.content_hash` is already stored —
+        the caller checks `document_by_hash` first.
+        """
+        ...
+
+    async def document(self, document_id: str) -> Document | None:
+        """With `text` filled in — the only loader that fills it."""
+        ...
+
+    async def document_by_hash(self, content_hash: str) -> Document | None: ...
+
+    async def document_by_path(self, path: str) -> Document | None: ...
+
+    async def list_documents(self) -> list[Document]:
+        """Most-recently-ingested first, each with `text` left empty."""
+        ...
+
+    async def list_snippets(self, document_id: str) -> list[Snippet]:
+        """In `ordinal` order."""
+        ...
+
+    async def snippets_by_ids(self, ids: Sequence[str]) -> list[Snippet]:
+        """The named snippets, in no particular order. `[]` for `()`."""
+        ...
+
+    async def delete_document(self, document_id: str) -> None:
+        """Takes the document's snippets and their vectors with it."""
+        ...
+
+    # -- derived state: snippet embeddings ---------------------------------
+    #
+    # `retrieval.SnippetIndex` is the only reader.
+
+    async def save_snippet_embeddings(self, rows: Sequence[SnippetEmbedding]) -> None:
+        """Upsert on `(snippet_id, model_id)`. A no-op for `()`."""
+        ...
+
+    async def snippet_vectors(self, *, model_id: str) -> list[SnippetEmbedding]:
+        """Every snippet vector produced by `model_id` — ids and vectors, no
+        text: search ranks over these and hydrates only the winners."""
+        ...
+
+    async def snippets_without_embeddings(self, *, model_id: str) -> list[Snippet]:
+        """Snippets with no `snippet_embeddings` row for `model_id` — one
+        `LEFT JOIN`, not a Python set difference over every snippet."""
         ...

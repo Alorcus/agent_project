@@ -1,5 +1,6 @@
-"""Adaptive fact retrieval: the gate/rewrite/judge/reseed prompts and parsers,
-the index and its group scoping, and the bounded loop with its three exits."""
+"""Adaptive retrieval: the gate/rewrite/judge/reseed prompts and parsers, the
+two indexes — group-scoped facts and the global document corpus — and the
+bounded loop with its three exits."""
 
 from __future__ import annotations
 
@@ -14,6 +15,8 @@ from agentchat.core.prompts import (
     parse_verdict,
     recall_block,
     recalled_text,
+    render_digest,
+    render_documents,
     render_facts,
 )
 from agentchat.core.retrieval import (
@@ -21,12 +24,26 @@ from agentchat.core.retrieval import (
     FactIndex,
     Hit,
     Recall,
+    SnippetHit,
+    SnippetIndex,
     assemble,
+    cap_per_document,
+    snippet_text,
     view_text,
 )
 from agentchat.llm.embedding import HashingEmbedder
 from agentchat.llm.registry import ModelRegistry
-from factories import GOLDEN_FACTS, make_conversation, make_group, make_indexed_group, scripted_provider
+from factories import (
+    GOLDEN_DOCUMENTS,
+    GOLDEN_FACTS,
+    make_conversation,
+    make_document,
+    make_group,
+    make_indexed_corpus,
+    make_indexed_group,
+    make_snippet,
+    scripted_provider,
+)
 
 
 def _registry_with(provider) -> ModelRegistry:
@@ -42,6 +59,15 @@ def _hit(text: str, view: str = "claim", score: float = 0.9, quote: str = "q") -
         else ()
     )
     return Hit(fact=Fact(text=text, phrases=phrases), view=view, score=score)
+
+
+def _snippet_hit(text: str, *, title: str = "handbook.pdf", page=None, score=0.9,
+                 document_id: str = "doc") -> SnippetHit:
+    return SnippetHit(
+        snippet=make_snippet(document_id=document_id, text=text, page=page),
+        document=make_document(title=title),
+        score=score,
+    )
 
 
 # -- prompts / parsers --------------------------------------------------
@@ -525,3 +551,320 @@ async def test_extract_facts_writes_both_the_fact_and_its_vectors_in_one_pass(st
     assert len(facts) == 1
     rows = await store.fact_embeddings(conv.group_id, model_id=embedder.info.id)
     assert rows  # vectors written in the same pass
+
+
+# -- the document corpus ------------------------------------------------
+
+
+def test_render_digest_names_every_snippets_source():
+    text = render_digest(
+        [_hit("The team chose Postgres 14.")],
+        [
+            _snippet_hit("Expenses over two hundred euro need approval.", page=4),
+            _snippet_hit("New joiners get a laptop.", title="onboarding.md"),
+        ],
+        budget=4000,
+    )
+
+    assert "Facts:\n- The team chose Postgres 14." in text
+    assert '- [handbook.pdf p.4] "Expenses over two hundred euro need approval."' in text
+    assert '- [onboarding.md] "New joiners get a laptop."' in text
+
+
+def test_render_digest_gives_documents_the_whole_budget_when_there_are_no_facts():
+    hits = [_snippet_hit("a " * 200, score=0.9), _snippet_hit("b " * 200, score=0.8)]
+
+    with_facts = render_digest([_hit("f " * 200)], hits, budget=200)
+    alone = render_digest([], hits, budget=200)
+
+    assert alone.count("- [") > with_facts.count("- [")
+
+
+def test_render_documents_drops_whole_hits_lowest_scored_first():
+    hits = [
+        _snippet_hit("the best match here", score=0.9),
+        _snippet_hit("a weaker match here", score=0.4),
+    ]
+
+    text = render_documents(hits, budget=12)
+
+    assert "the best match here" in text
+    assert "a weaker match here" not in text
+
+
+def test_a_snippet_that_is_all_whitespace_and_newlines_renders_on_one_line():
+    text = render_documents([_snippet_hit("first line\n\nsecond line")], budget=400)
+    assert '- [handbook.pdf] "first line second line"' in text
+
+
+def test_cap_per_document_keeps_each_documents_best():
+    hits = [
+        _snippet_hit(f"snippet {n}", document_id="a", score=0.9 - n / 10)
+        for n in range(5)
+    ] + [_snippet_hit("from b", document_id="b", score=0.5)]
+
+    kept = cap_per_document(hits, per_document=2)
+
+    assert [h.snippet.text for h in kept if h.snippet.document_id == "a"] == [
+        "snippet 0",
+        "snippet 1",
+    ]
+    assert any(h.snippet.document_id == "b" for h in kept)
+    assert cap_per_document(hits, per_document=0) == tuple(hits)
+
+
+def test_assemble_dedupes_snippets_by_their_own_text():
+    long_hit = _snippet_hit("expenses over two hundred euro need approval", score=0.9)
+    subset = _snippet_hit("expenses approval", score=0.8)
+
+    kept = assemble([long_hit, subset], limit=5, text=snippet_text)
+
+    assert [h.snippet.text for h in kept] == [long_hit.snippet.text]
+
+
+async def test_snippet_index_writes_one_vector_per_snippet(store):
+    embedder = HashingEmbedder()
+    await make_indexed_corpus(store, embedder)
+
+    rows = await store.snippet_vectors(model_id=embedder.info.id)
+    expected = sum(len(spec["snippets"]) for spec in GOLDEN_DOCUMENTS)
+    assert len(rows) == expected
+
+
+async def test_snippet_ensure_indexed_embeds_the_backlog_then_returns_zero(store):
+    document, snippets = make_document(), None
+    snippets = [
+        make_snippet(document_id=document.id, ordinal=n, text=f"snippet {n} of text")
+        for n in range(3)
+    ]
+    await store.save_document(document, snippets)
+    index = SnippetIndex(store, HashingEmbedder())
+
+    assert await index.ensure_indexed() == 3
+    assert await index.ensure_indexed() == 0
+
+
+async def test_changing_the_embedder_id_reembeds_snippets_and_keeps_the_old_rows(store):
+    embedder = HashingEmbedder()
+    await make_indexed_corpus(store, embedder)
+    before = await store.snippet_vectors(model_id="hashing-64")
+
+    from agentchat.llm.embedding import EmbedderInfo
+
+    other = HashingEmbedder(EmbedderInfo(id="other-embedder", name="Other"))
+    embedded = await SnippetIndex(store, other).ensure_indexed()
+
+    assert embedded == len(before)
+    assert len(await store.snippet_vectors(model_id="hashing-64")) == len(before)
+    assert await store.snippet_vectors(model_id="other-embedder")
+
+
+async def test_snippet_search_is_global_and_finds_a_document_from_any_group(store):
+    """The counterpart of the fact suite's group-scoping test: documents are
+    deliberately *not* scoped, so a group with no facts of its own still
+    retrieves them."""
+    embedder = HashingEmbedder()
+    await make_indexed_corpus(store, embedder)
+    index = SnippetIndex(store, embedder)
+
+    vectors = await embedder.embed(["expenses approval finance partner"])
+    hits = await index.search(vectors, k=5, min_score=0.2)
+
+    assert hits
+    # `search` unions by snippet id and does not promise an order, exactly as
+    # `FactIndex.search` does not.
+    assert max(hits, key=lambda h: h.score).document.title == "handbook.pdf"
+    assert all(isinstance(h, SnippetHit) for h in hits)
+
+
+async def test_snippet_search_attributes_a_hit_to_its_document_and_page(store):
+    embedder = HashingEmbedder()
+    await make_indexed_corpus(store, embedder)
+
+    vectors = await embedder.embed(["reimbursed within thirty days claim filed"])
+    hits = await SnippetIndex(store, embedder).search(vectors, k=3, min_score=0.2)
+
+    best = max(hits, key=lambda h: h.score)
+    assert best.snippet.page == 2
+    assert best.source == "handbook.pdf p.2"
+
+
+async def test_snippet_search_on_an_empty_corpus_is_no_hits_not_an_error(store):
+    embedder = HashingEmbedder()
+    index = SnippetIndex(store, embedder)
+    vectors = await embedder.embed(["anything at all"])
+
+    assert await index.search(vectors, k=5, min_score=0.0) == []
+    assert await index.search([], k=5, min_score=0.0) == []
+
+
+async def test_deleting_a_document_removes_it_from_search(store):
+    embedder = HashingEmbedder()
+    documents = await make_indexed_corpus(store, embedder)
+    index = SnippetIndex(store, embedder)
+    vectors = await embedder.embed(["expenses approval finance partner"])
+    assert await index.search(vectors, k=5, min_score=0.2)
+
+    await store.delete_document(documents[0].id)
+
+    hits = await index.search(vectors, k=5, min_score=0.2)
+    assert all(h.document.id != documents[0].id for h in hits)
+
+
+# -- the loop over both corpora -----------------------------------------
+
+
+async def test_a_round_searches_both_corpora_with_the_same_queries(store):
+    embedder = HashingEmbedder()
+    group = await make_indexed_group(store, embedder)
+    await make_indexed_corpus(store, embedder)
+    provider = scripted_provider("SEARCH", "expenses approval finance", "ENOUGH")
+    retriever = AdaptiveRetriever(
+        _registry_with(provider),
+        FactIndex(store, embedder),
+        SnippetIndex(store, embedder),
+        rewrites=1,
+        min_score=0.0,
+        snippet_min_score=0.2,
+    )
+
+    result = await retriever.recall(
+        Conversation(group_id=group.id), "who approves an expense?"
+    )
+
+    assert result is not None
+    assert result.snippets
+    assert "Documents:" in result.digest
+    # No extra generation: gate, one rewrite, judge — the fact-only count.
+    assert len(provider.calls) == 3
+
+
+async def test_the_judge_is_shown_the_documents_as_well_as_the_facts(store):
+    embedder = HashingEmbedder()
+    group = await make_indexed_group(store, embedder)
+    await make_indexed_corpus(store, embedder)
+    provider = scripted_provider("SEARCH", "expenses approval finance", "ENOUGH")
+    retriever = AdaptiveRetriever(
+        _registry_with(provider),
+        FactIndex(store, embedder),
+        SnippetIndex(store, embedder),
+        rewrites=1,
+        min_score=0.0,
+        snippet_min_score=0.2,
+    )
+
+    await retriever.recall(Conversation(group_id=group.id), "who approves an expense?")
+
+    judge_prompt = provider.calls[-1].messages[-1].content
+    assert "Evidence:" in judge_prompt
+    assert "[handbook.pdf" in judge_prompt
+
+
+async def test_the_digest_holds_no_more_than_the_cap_per_document(store):
+    embedder = HashingEmbedder()
+    group = await make_indexed_group(store, embedder)
+    await make_indexed_corpus(store, embedder)
+    provider = scripted_provider("SEARCH", "expenses approval receipts euro", "ENOUGH")
+    retriever = AdaptiveRetriever(
+        _registry_with(provider),
+        FactIndex(store, embedder),
+        SnippetIndex(store, embedder),
+        rewrites=1,
+        min_score=0.0,
+        snippet_min_score=0.0,
+        snippets_per_document=1,
+    )
+
+    result = await retriever.recall(
+        Conversation(group_id=group.id), "what do I do about expenses?"
+    )
+
+    titles = [h.document.title for h in result.snippets]
+    assert len(titles) == len(set(titles))
+
+
+async def test_a_snippet_search_failure_still_answers_from_the_facts(store):
+    embedder = HashingEmbedder()
+    group = await make_indexed_group(store, embedder)
+    provider = scripted_provider("SEARCH", "postgres billing", "ENOUGH")
+
+    class _BrokenSnippetIndex(SnippetIndex):
+        async def search(self, *a, **kw):
+            raise RuntimeError("corpus is on fire")
+
+    retriever = AdaptiveRetriever(
+        _registry_with(provider),
+        FactIndex(store, embedder),
+        _BrokenSnippetIndex(store, embedder),
+        rewrites=1,
+        min_score=0.0,
+    )
+
+    result = await retriever.recall(
+        Conversation(group_id=group.id), "which database for billing?"
+    )
+
+    # The whole loop degrades to a normal reply — the same boundary a fact
+    # failure crosses.
+    assert result is None
+
+
+async def test_documents_off_reads_no_snippet_vectors(store):
+    embedder = HashingEmbedder()
+    group = await make_indexed_group(store, embedder)
+    await make_indexed_corpus(store, embedder)
+
+    reads = 0
+    inner = store.snippet_vectors
+
+    async def counted(*a, **kw):
+        nonlocal reads
+        reads += 1
+        return await inner(*a, **kw)
+
+    store.snippet_vectors = counted
+    provider = scripted_provider("SEARCH", "postgres billing", "ENOUGH")
+    retriever = AdaptiveRetriever(
+        _registry_with(provider), FactIndex(store, embedder), None,
+        rewrites=1, min_score=0.0,
+    )
+
+    result = await retriever.recall(
+        Conversation(group_id=group.id), "which database for billing?"
+    )
+
+    assert result is not None
+    assert result.snippets == ()
+    assert reads == 0
+
+
+async def test_a_recalled_turn_persists_the_document_it_used(store):
+    from agentchat.core.chat import ChatService
+
+    embedder = HashingEmbedder()
+    group = await make_indexed_group(store, embedder)
+    await make_indexed_corpus(store, embedder)
+    provider = scripted_provider(
+        "SEARCH", "expenses approval finance partner", "ENOUGH", "the reply"
+    )
+    registry = _registry_with(provider)
+    retriever = AdaptiveRetriever(
+        registry,
+        FactIndex(store, embedder),
+        SnippetIndex(store, embedder),
+        rewrites=1,
+        min_score=0.0,
+        snippet_min_score=0.2,
+    )
+    chat = ChatService(registry, store=store, retriever=retriever)
+
+    async for _ in chat.stream_reply(
+        Conversation(group_id=group.id), "who approves an expense?"
+    ):
+        pass
+
+    documents = chat.last_turn.message.metadata["recall"]["documents"]
+    assert documents
+    assert documents[0]["title"] == "handbook.pdf"
+    assert documents[0]["source"].startswith("handbook.pdf")
+    assert documents[0]["text"] in chat.last_turn.message.metadata["recall"]["block"]

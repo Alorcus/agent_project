@@ -9,18 +9,22 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 
 from agentchat.core import usage
 from agentchat.core.context import ContextDecision, ContextStrategy, RecencyWindowStrategy
 from agentchat.core.delegation import Consultation, DelegationService
-from agentchat.core.errors import StorageError
+from agentchat.core.errors import IngestError, StorageError
 from agentchat.core.facts import FactExtractor, countable, windows
+from agentchat.core.ingest import CorpusSync, DocumentIngestor, Ingested
 from agentchat.core.models import (
     DEFAULT_GROUP_ID,
     Conversation,
+    Document,
     Fact,
     Group,
     Message,
+    Snippet,
 )
 from agentchat.core.prompts import DEFAULT_SYSTEM, consulted_text, recall_block, recalled_text
 from agentchat.core.retrieval import AdaptiveRetriever, Recall
@@ -60,6 +64,7 @@ class ChatService:
         delegator: DelegationService | None = None,
         fact_extractor: FactExtractor | None = None,
         retriever: AdaptiveRetriever | None = None,
+        ingestor: DocumentIngestor | None = None,
     ) -> None:
         self.registry = registry
         self.store = store
@@ -72,6 +77,9 @@ class ChatService:
         #: `None` switches adaptive recall off — no embedder load, no LLM
         #: calls, no store reads (R16).
         self.retriever = retriever
+        #: `None` switches document ingestion off, the same way — a dropped
+        #: file is then declined rather than silently ignored.
+        self.ingestor = ingestor
         # Held by both `stream_reply` and `extract_facts`: `TransformersProvider`
         # kills one `generate()` call when a second starts on it (KTD7), so
         # only one of the two may run at a time.
@@ -151,6 +159,10 @@ class ChatService:
         # embedder load on the first turn after start (R5).
         if self.retriever is not None:
             await self.retriever.index.ensure_indexed(conversation.group_id)
+            if self.retriever.snippets is not None:
+                # No group: the document corpus is global, so this catch-up is
+                # the corpus's, not this conversation's.
+                await self.retriever.snippets.ensure_indexed()
 
         # Wraps the whole body, not just the `async for`: a consumer cancelled
         # mid-stream still has to reach the `finally` below and release the
@@ -244,6 +256,18 @@ class ChatService:
                             }
                             for h in recall.hits
                         ],
+                        "documents": [
+                            {
+                                "snippet_id": h.snippet.id,
+                                "document_id": h.snippet.document_id,
+                                "title": h.document.title,
+                                "page": h.snippet.page,
+                                "source": h.source,
+                                "score": round(h.score, 4),
+                                "text": h.snippet.text,
+                            }
+                            for h in recall.snippets
+                        ],
                         "block": recall_block(recall),
                     }
                 self.last_turn = TurnResult(
@@ -296,6 +320,35 @@ class ChatService:
             return [system, *conversation.messages]
         copy = replace(last, content=content)
         return [system, *conversation.messages[:-1], copy]
+
+    # -- documents ---------------------------------------------------------
+
+    async def ingest(self, path: Path) -> Ingested:
+        """Ingest one dropped file. Raises `IngestError` when ingestion is off
+        or the file cannot be read — the caller shows it."""
+        if self.ingestor is None:
+            raise IngestError(
+                "document ingestion is off (AGENTCHAT_INGEST_DOCUMENTS=0)"
+            )
+        return await self.ingestor.ingest(path)
+
+    async def sync_corpus(self, directory: Path) -> CorpusSync:
+        """Bring the store in line with the corpus directory: ingest what is
+        new or changed, drop what was deleted from it. Empty when ingestion is
+        off or the directory does not exist."""
+        if self.ingestor is None:
+            return CorpusSync()
+        return await self.ingestor.sync_dir(directory)
+
+    async def documents(self) -> list[Document]:
+        return await self.store.list_documents()
+
+    async def snippets_of(self, document_id: str) -> list[Snippet]:
+        return await self.store.list_snippets(document_id)
+
+    async def delete_document(self, document_id: str) -> None:
+        """Takes the document's snippets and their vectors with it."""
+        await self.store.delete_document(document_id)
 
     async def facts_with_sources(
         self, group_id: str, *, live: Conversation | None = None

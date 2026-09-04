@@ -243,6 +243,11 @@ FactBrowser {
     height: 1fr;
 }
 
+.documents__corpus {
+    color: $text-muted;
+    padding: 0 1 1 1;
+}
+
 #documents-list {
     width: 40%;
     border-right: solid $primary-darken-2;

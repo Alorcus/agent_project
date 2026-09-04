@@ -15,18 +15,51 @@ from rich.text import Text
 from textual import events
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Static
+from textual.message import Message as TextualMessage
+from textual.widgets import Input, Static
 
 from agentchat.core.delegation import Consultation
+from agentchat.core.ingest import dropped_paths
 from agentchat.core.evidence import Excerpt
 from agentchat.core.models import Message
 from agentchat.core.usage import CallUsage
+
+from pathlib import Path
 
 _ROLE_LABEL = {"user": "You", "assistant": "Assistant", "system": "System"}
 
 _SEPARATOR = "  ›  "
 
 _DETAIL_INDENT = "    "
+
+
+class PromptInput(Input):
+    """The message box, plus the one thing a terminal can tell us about a
+    dropped file: it arrives as a paste of its path.
+
+    Textual has no drop event, and `Input._on_paste` inserts the first line
+    and stops the event — so an app-level `on_paste` never runs while the
+    prompt has focus. Overriding the private handler is what puts the
+    decision before the insertion.
+    """
+
+    class FilesDropped(TextualMessage):
+        def __init__(self, paths: tuple[Path, ...]) -> None:
+            super().__init__()
+            self.paths = paths
+
+    def _on_paste(self, event: events.Paste) -> None:
+        paths = dropped_paths(event.text)
+        if not paths:
+            # No `super()` call: Textual dispatches `_on_paste` for every
+            # class in the MRO, so `Input`'s own handler runs after this one
+            # and types the text. Calling it here would type it twice.
+            return
+        # `prevent_default` is what stops that MRO walk — `stop()` alone only
+        # ends the bubbling, and the path would still be typed into the box.
+        event.prevent_default()
+        event.stop()
+        self.post_message(self.FilesDropped(paths))
 
 
 class ConversationHeader(Horizontal):
@@ -233,12 +266,21 @@ class RecallNote(CollapsibleNote):
     def _header_text(self) -> str:
         recall = self._recall
         count = len(recall.get("facts", []))
+        documents = recall.get("documents", [])
         rounds = recall.get("rounds", 0)
-        return (
-            f"recalled {count} {'fact' if count == 1 else 'facts'} · "
-            f"{rounds} {'round' if rounds == 1 else 'rounds'} · "
-            f"{self._EXIT_TAIL.get(recall.get('exit', ''), recall.get('exit', ''))}"
+        bits = [f"recalled {count} {'fact' if count == 1 else 'facts'}"]
+        if documents:
+            titles = {d.get("title", "") for d in documents}
+            bits.append(
+                f"{len(documents)} "
+                f"{'snippet' if len(documents) == 1 else 'snippets'} from "
+                f"{len(titles)} {'document' if len(titles) == 1 else 'documents'}"
+            )
+        bits.append(f"{rounds} {'round' if rounds == 1 else 'rounds'}")
+        bits.append(
+            self._EXIT_TAIL.get(recall.get("exit", ""), recall.get("exit", ""))
         )
+        return " · ".join(bits)
 
     def _detail_lines(self) -> Sequence[str]:
         recall = self._recall
@@ -248,6 +290,12 @@ class RecallNote(CollapsibleNote):
             lines.append("Queries: " + " · ".join(queries))
         if recall.get("gap"):
             lines.append("Judge's last gap: " + recall["gap"])
+        documents = recall.get("documents", [])
+        if documents:
+            lines.append(
+                "Documents: "
+                + " · ".join(d.get("source", d.get("title", "")) for d in documents)
+            )
         lines.append("")
         lines.append("Appended to your message:")
         # Split on the source newlines, one detail line per line, so the

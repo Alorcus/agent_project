@@ -72,7 +72,8 @@ checkpoint fails loudly instead.
 | `Ctrl+G` | New conversation, choosing the group — or making one |
 | `Ctrl+L` | Open the conversation overview |
 | `Ctrl+F` | Open the fact evidence view |
-| `Ctrl+X` | Delete the highlighted conversation (overview) or group (chooser) |
+| `Ctrl+B` | Open the document browser |
+| `Ctrl+X` | Delete the highlighted conversation (overview), group (chooser) or document (browser) |
 | `Ctrl+O` | Cycle model |
 | `Ctrl+T` | Toggle thinking mode |
 | `Ctrl+D` | Exit |
@@ -80,7 +81,9 @@ checkpoint fails loudly instead.
 
 `Ctrl+D` is a priority binding, so it exits even while the prompt has focus —
 which is where it usually is. The cost is `Input`'s own `Ctrl+D` binding
-(delete-forward); use `Delete` for that instead.
+(delete-forward); use `Delete` for that instead. The document browser is
+`Ctrl+B` rather than the more obvious `Ctrl+U`, which the prompt uses to clear
+the line to the left.
 
 `Ctrl+N` inherits rather than asking: working inside a project means starting
 several chats inside it, so the group you are in is a better guess than "no
@@ -101,7 +104,7 @@ Environment variables, all prefixed `AGENTCHAT_`:
 | `AGENTCHAT_MAX_CONTEXT` | unset | Cap every model's context window, for a smaller GPU |
 | `AGENTCHAT_STORE` | `sqlite` | `sqlite` is the only store |
 | `AGENTCHAT_DATA_DIR` | `./data` | Where `agentchat.db` lives (the `sqlite` store) |
-| `AGENTCHAT_CORPUS_DIR` | `./corpus` | Document-ingestion source (not yet used) |
+| `AGENTCHAT_CORPUS_DIR` | `./corpus` | The knowledge corpus: what is in this directory is what is retrievable |
 | `AGENTCHAT_SIMULATE_FAILURE` | `0` | Make the second model fail on load, to exercise error handling |
 | `AGENTCHAT_EXTRACTION_TIMEOUT` | `30.0` | Seconds `Ctrl+D`/`Ctrl+Q` wait for the closing fact flush before exiting anyway |
 | `AGENTCHAT_SUBAGENTS` | `1` | Route a user message to a specialist, when one clearly fits, before answering |
@@ -117,6 +120,17 @@ Environment variables, all prefixed `AGENTCHAT_`:
 | `AGENTCHAT_RECALL_MIN_SCORE` | `0.25` | Cosine floor a hit must clear to enter the pool |
 | `AGENTCHAT_RECALL_DIGEST_FACTS` | `12` | Facts the digest is capped at, deduplicated and ranked |
 | `AGENTCHAT_RECALL_TIMEOUT` | `120.0` | Wall-clock deadline on the whole loop; whatever it has is released |
+| `AGENTCHAT_INGEST_DOCUMENTS` | `1` | Accept dropped text and PDF files into the global document corpus |
+| `AGENTCHAT_CORPUS_SYNC` | `1` | Keep the store in line with `AGENTCHAT_CORPUS_DIR` while the app runs |
+| `AGENTCHAT_CORPUS_POLL_SECONDS` | `5.0` | Seconds between corpus scans; `0` scans once at startup |
+| `AGENTCHAT_SNIPPET_CHARS` | `1000` | Target snippet length; kept well under the embedder's 2000-character cap |
+| `AGENTCHAT_SNIPPET_OVERLAP` | `150` | Characters each snippet reaches back into its predecessor |
+| `AGENTCHAT_MAX_DOCUMENT_MB` | `10` | Largest file accepted, checked before anything is read |
+| `AGENTCHAT_RECALL_DOCUMENTS` | `1` | Search the document corpus alongside the group's facts |
+| `AGENTCHAT_RECALL_SNIPPET_HITS` | `8` | Top-k snippets kept per query before the union by snippet id |
+| `AGENTCHAT_RECALL_SNIPPET_MIN_SCORE` | `0.25` | Cosine floor a snippet must clear to enter the pool |
+| `AGENTCHAT_RECALL_DIGEST_SNIPPETS` | `5` | Snippets the digest is capped at |
+| `AGENTCHAT_RECALL_SNIPPETS_PER_DOCUMENT` | `2` | Snippets any one document may contribute to the digest |
 | `AGENTCHAT_LOG_LLM_IO` | `1` | Write a verbatim request/response transcript of every model call to `llm.jsonl` |
 | `AGENTCHAT_LOG_DIR` | `<data_dir>/logs` | Where `agentchat.log` and `llm.jsonl` are written |
 
@@ -177,12 +191,16 @@ that group and nothing else:
    each shown the queries already tried, and phrased in the vocabulary the
    conversation would have used rather than the vocabulary of a question.
 2. **retrieve** — every query is embedded by a small CPU model and scored by
-   cosine against the group's fact vectors under both views; each query keeps
-   its own top `k`, and the results are unioned by fact id keeping the best
+   cosine against two corpora: the group's fact vectors under both views, and
+   the snippet vectors of every ingested document. Each query keeps its own
+   top `k` per corpus, and the results are unioned by id keeping the best
    score.
-3. **assemble** — the pool is deduplicated (a fact whose significant tokens
+3. **assemble** — each pool is deduplicated (a hit whose significant tokens
    are a subset of a higher-scored one's is dropped), ranked, and capped into
-   a digest. No LLM call: a fact is already a one-sentence summary.
+   one digest: facts, the quotes behind them, and document snippets with the
+   document and page they came from. No document may contribute more than two
+   snippets, and facts take at most two thirds of the digest's token budget.
+   No LLM call: a fact is already a one-sentence summary.
 4. **adjudicate** — a judge call scores the digest against your **original**
    message (never a rewrite) and either accepts it or names, in one sentence,
    what is still missing. That sentence is what the next round's queries are
@@ -195,8 +213,8 @@ explaining it is background from earlier chats and telling the model to fall
 back on its own knowledge where the evidence is silent. When the loop hit the
 round cap, the note also says the evidence was judged incomplete.
 
-Under your message a muted line appears — `▸ recalled 4 facts · 2 rounds ·
-sufficient` — that expands to show the queries the loop ran, the judge's last
+Under your message a muted line appears — `▸ recalled 4 facts · 3 snippets
+from 2 documents · 2 rounds · sufficient` — that expands to show the queries the loop ran, the judge's last
 gap, and the block that was appended, character for character. Recall
 provenance **is** persisted on the assistant reply (`Message.metadata["recall"]`),
 so reopening the conversation rebuilds the same note. Nothing about the
@@ -208,7 +226,8 @@ does not spend the gate call. Retrieval failure (provider, storage, embedder,
 timeout) degrades to a normal reply, never an error or a hang.
 
 `AGENTCHAT_RECALL_FACTS=0` switches the feature off entirely — no embedder
-load, no gate call, no `fact_embeddings` reads.
+load, no gate call, no `fact_embeddings` reads. `AGENTCHAT_RECALL_DOCUMENTS=0`
+leaves recall running over the group's facts alone.
 
 ### Setup: the embedding weights
 
@@ -222,6 +241,67 @@ uv run hf download sentence-transformers/all-MiniLM-L6-v2 \
 
 Or point `AGENTCHAT_EMBED_MODEL_PATH` at wherever the checkpoint already
 lives.
+
+## Documents
+
+`./corpus` is the knowledge corpus: **what is in that directory is what is
+retrievable**. Copy a file in and it is read, cut into snippets, embedded and
+stored, within a few seconds and without restarting; delete it and its
+document goes with it. Everything ingested is **global**, unlike facts, which
+never leave the group they were extracted in. `Ctrl+B` lists what is indexed,
+shows a document's snippets, and deletes one with `Ctrl+X`.
+
+The corpus is gitignored — it is your documents, not the project's.
+
+### Getting a document in
+
+The app runs on the cluster, so the file has to be on the cluster. Any of
+these puts it there:
+
+```bash
+scp handbook.pdf <cluster>:~/agent_project/corpus/     # from your machine
+rsync -av ~/Documents/refs/ <cluster>:~/agent_project/corpus/   # a whole folder
+```
+
+VS Code Remote's file explorer (drag onto `corpus/`) and any SFTP client do the
+same thing. The app notices within `AGENTCHAT_CORPUS_POLL_SECONDS` and says
+what it indexed.
+
+**Dragging a file from your laptop onto the terminal does not work**, and
+cannot: the terminal pastes a path from *your* filesystem, which does not exist
+on the cluster, so the app sees text rather than a file. Dropping a file that
+already lives on the cluster does work — that is the same paste, resolving to a
+real path.
+
+A file still being copied is left alone until its size and timestamp have stood
+still, so a half-transferred PDF is never indexed as if it were the whole
+document. Scanning is a `stat` sweep on a timer rather than an inotify watch:
+the corpus sits on a network filesystem, where a file written by an `scp` from
+another host raises no event on this node.
+
+Accepted: `.txt`, `.md`, `.markdown`, `.rst`, `.text`, `.log`, `.csv`, `.json`
+and `.pdf`. A scanned PDF with no text layer is refused rather than ingested
+empty — it needs OCR first. Anything else is refused by name.
+
+**A document is its content, not its path.** Identity is the SHA-256 of the
+extracted text, so adding the same file twice ingests it once, and the same
+bytes under two names are one document. Editing a file replaces the stored
+document, its snippets and its vectors, so nothing stale stays searchable —
+which is also what makes rescanning the corpus every few seconds free.
+
+**Snippeting** packs whole paragraphs up to ~1000 characters, splitting a
+longer paragraph on sentence ends and hard-cutting a sentence longer still.
+Each snippet reaches 150 characters back into its predecessor, snapped forward
+so it never begins mid-word, and a short tail merges into the snippet before
+it. Snippet offsets index into the stored extracted text and nothing
+renormalises that text afterwards, so a snippet always slices back out of its
+document verbatim.
+
+A new document is not attached to the turn you added it on: it enters the
+corpus, and the next question retrieves from it like any other evidence.
+
+`AGENTCHAT_INGEST_DOCUMENTS=0` switches ingestion off entirely;
+`AGENTCHAT_CORPUS_SYNC=0` leaves it on but stops watching the directory.
 
 ## Consulting a specialist
 
@@ -400,15 +480,15 @@ imports a concrete backend.
 - Context meter — the status bar gauges the last turn's largest call, prompt
   and completion together, against the active model's window, counted by the
   backend's own tokenizer. See "The context meter" above.
+- Document ingestion — a dropped text file or PDF is snippeted, embedded and
+  stored, and searched globally by the same retrieval loop. See "Documents"
+  above.
 
 ## Not yet built
 
 Deliberately stubbed, with the seam in place:
 
 - The two required fine-tunes.
-- Ingesting user documents (text and PDF) into the retrieval corpus —
-  `AGENTCHAT_CORPUS_DIR` is the seam; recall indexes conversation facts only
-  for now.
 - Intelligent context management (elective).
 - Specialists on their own weights (LoRA adapters over the shared resident
   base) — the roster is prompt-differentiated for now; `SubAgent` has no

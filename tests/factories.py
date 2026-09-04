@@ -8,7 +8,16 @@ import time
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 
-from agentchat.core.models import Author, Conversation, Fact, Group, Message, Phrase
+from agentchat.core.models import (
+    Author,
+    Conversation,
+    Document,
+    Fact,
+    Group,
+    Message,
+    Phrase,
+    Snippet,
+)
 from agentchat.core import usage
 from agentchat.llm import transcript
 from agentchat.llm.base import GenerationOptions, ModelInfo
@@ -227,3 +236,179 @@ async def make_indexed_group(store, embedder, *, name="Retrieval", facts=GOLDEN_
     await FactIndex(store, embedder).index(built)
     group.facts = built  # convenience handle for tests
     return group
+
+
+# -- documents -------------------------------------------------------------
+
+
+def make_document(**overrides) -> Document:
+    defaults = dict(
+        title="handbook.txt",
+        path="/tmp/handbook.txt",
+        media_type="text",
+        content_hash="hash-handbook",
+        text="The deploy window is Tuesday.",
+        char_count=29,
+        snippet_count=1,
+    )
+    defaults.update(overrides)
+    return Document(**defaults)
+
+
+def make_snippet(**overrides) -> Snippet:
+    defaults = dict(
+        document_id="doc",
+        ordinal=0,
+        text="The deploy window is Tuesday.",
+        start=0,
+        end=29,
+        page=None,
+    )
+    defaults.update(overrides)
+    return Snippet(**defaults)
+
+
+def make_pdf_bytes(pages: Sequence[str]) -> bytes:
+    """A minimal PDF carrying `pages` as real text objects.
+
+    Written by hand rather than with a writer dependency: pypdf reads PDFs and
+    does not author them, and a checked-in binary fixture is a file nobody can
+    review. Offsets in the xref table are computed, not guessed — pypdf
+    tolerates a broken one by rebuilding it, which would silently make this
+    fixture stop testing what it claims to.
+    """
+    page_count = len(pages)
+    objects: list[bytes] = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [{}] /Count {} >>".format(
+            " ".join(f"{3 + i * 2} 0 R" for i in range(page_count)), page_count
+        ).encode("ascii"),
+    ]
+    font_number = 3 + page_count * 2
+    for index, page in enumerate(pages):
+        content = _content_stream(page)
+        objects.append(
+            (
+                f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                f"/Contents {4 + index * 2} 0 R "
+                f"/Resources << /Font << /F1 {font_number} 0 R >> >> >>"
+            ).encode("ascii")
+        )
+        objects.append(
+            b"<< /Length "
+            + str(len(content)).encode("ascii")
+            + b" >>\nstream\n"
+            + content
+            + b"\nendstream"
+        )
+    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets: list[int] = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{number} 0 obj\n".encode("ascii") + body + b"\nendobj\n"
+
+    xref_at = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n".encode("ascii")
+    out += b"0000000000 65535 f \n"
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode("ascii")
+    out += f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n".encode("ascii")
+    out += f"startxref\n{xref_at}\n%%EOF\n".encode("ascii")
+    return bytes(out)
+
+
+def _content_stream(page: str) -> bytes:
+    lines = [line for line in page.splitlines() if line.strip()]
+    body = ["BT", "/F1 12 Tf", "14 TL", "40 750 Td"]
+    for line in lines:
+        body.append(f"({_escaped(line)}) Tj")
+        body.append("T*")
+    body.append("ET")
+    return "\n".join(body).encode("latin-1")
+
+
+def _escaped(line: str) -> str:
+    for char in ("\\", "(", ")"):
+        line = line.replace(char, "\\" + char)
+    return line
+
+
+#: Three documents over distinct topics, one paginated, one long enough that
+#: the per-document cap has something to cap. Vocabulary deliberately apart
+#: from `GOLDEN_FACTS`: a document hit and a fact hit must be tellable apart.
+GOLDEN_DOCUMENTS: tuple[dict, ...] = (
+    dict(
+        title="handbook.pdf",
+        media_type="pdf",
+        snippets=(
+            ("Expenses over two hundred euro need written approval from a "
+             "finance partner before the purchase.", 1),
+            ("Approved expenses are reimbursed within thirty days of the "
+             "claim being filed with finance.", 2),
+            ("Travel booked through the agency is billed directly and needs "
+             "no expense claim at all.", 2),
+            ("Equipment purchases are capitalised and follow the asset "
+             "register process instead of expenses.", 3),
+            ("Receipts must be legible and name the vendor, the date and the "
+             "amount in euro.", 3),
+        ),
+    ),
+    dict(
+        title="onboarding.md",
+        media_type="text",
+        snippets=(
+            ("New joiners get a laptop on their first morning and a mentor "
+             "for their first month.", None),
+            ("Accounts are provisioned by the platform team the working day "
+             "before a joiner starts.", None),
+        ),
+    ),
+    dict(
+        title="incident-review.txt",
+        media_type="text",
+        snippets=(
+            ("Every incident gets a blameless review within five working "
+             "days of resolution.", None),
+        ),
+    ),
+)
+
+
+async def make_indexed_corpus(store, embedder, *, documents=GOLDEN_DOCUMENTS):
+    """The document corpus with snippets and vectors already written — the
+    global counterpart to `make_indexed_group`."""
+    from agentchat.core.retrieval import SnippetIndex
+
+    index = SnippetIndex(store, embedder)
+    built: list[Document] = []
+    for spec in documents:
+        text = "\n\n".join(snippet for snippet, _ in spec["snippets"])
+        document = Document(
+            title=spec["title"],
+            path=f"/corpus/{spec['title']}",
+            media_type=spec["media_type"],
+            content_hash=f"hash-{spec['title']}",
+            text=text,
+            char_count=len(text),
+            snippet_count=len(spec["snippets"]),
+        )
+        cursor = 0
+        snippets = []
+        for ordinal, (body, page) in enumerate(spec["snippets"]):
+            snippets.append(
+                Snippet(
+                    document_id=document.id,
+                    ordinal=ordinal,
+                    text=body,
+                    start=cursor,
+                    end=cursor + len(body),
+                    page=page,
+                )
+            )
+            cursor += len(body) + 2
+        await store.save_document(document, snippets)
+        await index.index(snippets)
+        built.append(document)
+    return tuple(built)

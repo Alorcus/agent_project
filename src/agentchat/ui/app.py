@@ -23,20 +23,53 @@ from agentchat.config import (
     build_delegator,
     build_embedder,
     build_fact_extractor,
+    build_ingestor,
     build_registry,
     build_retriever,
+    build_snippet_index,
     build_store,
 )
 from agentchat.core.chat import ChatService
 from agentchat.core.errors import AgentChatError, ModelNotFoundError
-from agentchat.core.models import Conversation, Group, Message
+from agentchat.core.ingest import CorpusSync, dropped_paths
+from agentchat.core.models import Conversation, Document, Group, Message, Snippet
 from agentchat.llm.base import GenerationOptions
-from agentchat.ui.screens import ConversationPicker, FactBrowser, GroupChooser
-from agentchat.ui.widgets import ContextMeter, ConversationHeader, MessageBubble
+from agentchat.ui.screens import (
+    ConversationPicker,
+    DocumentBrowser,
+    FactBrowser,
+    GroupChooser,
+)
+from agentchat.ui.widgets import (
+    ContextMeter,
+    ConversationHeader,
+    MessageBubble,
+    PromptInput,
+)
 
 _GENERATION_GROUP = "generation"
 _EXTRACTION_GROUP = "extraction"
+_INGEST_GROUP = "ingest"
+_CORPUS_GROUP = "corpus"
 _EXTRACTING_STATUS = "extracting facts…"
+
+
+def _corpus_summary(sync: CorpusSync) -> str:
+    """What one corpus pass changed, in one line."""
+    bits: list[str] = []
+    if sync.ingested:
+        titles = ", ".join(result.document.title for result in sync.ingested[:3])
+        more = "" if len(sync.ingested) <= 3 else f" +{len(sync.ingested) - 3} more"
+        snippets = sum(len(result.snippets) for result in sync.ingested)
+        bits.append(
+            f"Indexed {titles}{more} — {snippets} "
+            f"{'snippet' if snippets == 1 else 'snippets'}"
+        )
+    if sync.removed:
+        bits.append(
+            f"dropped {', '.join(document.title for document in sync.removed)}"
+        )
+    return " · ".join(bits)
 
 
 class ChatApp(App[None]):
@@ -54,6 +87,9 @@ class ChatApp(App[None]):
         Binding("ctrl+g", "choose_group", "New chat in…"),
         Binding("ctrl+l", "open_conversations", "Chats"),
         Binding("ctrl+f", "open_facts", "Facts"),
+        # Not ctrl+u: `Input` binds that to `delete_left_all`, and taking it
+        # with priority would cost the prompt its clear-the-line gesture.
+        Binding("ctrl+b", "open_documents", "Docs"),
         Binding("ctrl+o", "cycle_model", "Model"),
         Binding("ctrl+t", "toggle_thinking", "Thinking"),
     ]
@@ -63,13 +99,19 @@ class ChatApp(App[None]):
         self.settings = settings or Settings.from_env()
         self.registry = build_registry(self.settings)
         store = build_store(self.settings)
+        # One embedder, both indexes: a second `LocalEmbedder` would load the
+        # encoder a second time.
         embedder = build_embedder(self.settings)
+        snippet_index = build_snippet_index(self.settings, store, embedder)
         self.chat = ChatService(
             self.registry,
             store=store,
             delegator=build_delegator(self.settings, self.registry),
             fact_extractor=build_fact_extractor(self.settings, self.registry),
-            retriever=build_retriever(self.settings, self.registry, store, embedder),
+            retriever=build_retriever(
+                self.settings, self.registry, store, embedder, snippet_index
+            ),
+            ingestor=build_ingestor(self.settings, store, snippet_index),
         )
         self.conversation: Conversation = Conversation()
         self.options = GenerationOptions()
@@ -102,7 +144,7 @@ class ChatApp(App[None]):
             id="statusrow",
         )
         yield Container(
-            Input(placeholder="Message…", id="prompt"),
+            PromptInput(placeholder="Message…", id="prompt"),
             id="composer",
         )
         yield Footer()
@@ -115,6 +157,8 @@ class ChatApp(App[None]):
         self.conversation = await self.chat.new_conversation()
         self._chat_screen.query_one("#prompt", Input).focus()
         self._refresh_status()
+        if self.settings.corpus_sync:
+            self._sync_corpus()
 
     @property
     def _chat_screen(self) -> Screen:
@@ -127,10 +171,14 @@ class ChatApp(App[None]):
         info = self.registry.active_info
         model = info.name if info else "no model"
         if self.settings.backend == "mock":
-            return f"Mocked backend ({model}) — replies are stubs. Type below and press Enter."
+            return (
+                f"Mocked backend ({model}) — replies are stubs. Type below and "
+                "press Enter, or drop a text or PDF file onto the terminal."
+            )
         return (
             f"{model} — the first message loads the weights, which takes a moment. "
-            "Type below and press Enter."
+            "Type below and press Enter, or drop a text or PDF file onto the "
+            "terminal."
         )
 
     # -- events -----------------------------------------------------------
@@ -139,11 +187,86 @@ class ChatApp(App[None]):
         text = event.value.strip()
         if not text:
             return
+        # Some terminals type a dropped path as ordinary keystrokes instead of
+        # a bracketed paste, so a submitted line that is nothing but an
+        # existing file ingests rather than being asked about.
+        if self.chat.ingestor is not None and (paths := dropped_paths(text)):
+            event.input.value = ""
+            self._ingest(paths)
+            return
         if self._generating:
             self.notify("Still generating — press Escape to stop.", severity="warning")
             return
         event.input.value = ""
         self._turn(text)
+
+    async def on_prompt_input_files_dropped(
+        self, event: PromptInput.FilesDropped
+    ) -> None:
+        """A file dropped on the terminal reaches us as a paste the prompt
+        recognised. Ingest runs in its own worker group: it touches the store
+        and the CPU embedder, never the provider, so a drop mid-generation is
+        safe and Escape must not cancel it."""
+        if self.chat.ingestor is None:
+            self.notify(
+                "Document ingestion is off (AGENTCHAT_INGEST_DOCUMENTS=0).",
+                severity="warning",
+            )
+            return
+        self._ingest(event.paths)
+
+    @work(group=_INGEST_GROUP)
+    async def _ingest(self, paths: tuple[Path, ...]) -> None:
+        for path in paths:
+            self._refresh_status(busy=f"ingesting {path.name}…")
+            try:
+                result = await self.chat.ingest(path)
+            except AgentChatError as error:
+                self.notify(str(error), severity="error")
+                continue
+            finally:
+                self._refresh_status()
+            if result.reused:
+                self.notify(f"{result.document.title} — already ingested.")
+                continue
+            count = len(result.snippets)
+            self.notify(
+                f"{result.document.title} — {count} "
+                f"{'snippet' if count == 1 else 'snippets'}, "
+                "searchable from every chat."
+            )
+
+    @work(group=_CORPUS_GROUP)
+    async def _sync_corpus(self) -> None:
+        """Keep the store in line with `corpus_dir` for as long as the app
+        runs: what is in that directory is what is retrievable.
+
+        Polled rather than watched. The corpus sits on a network filesystem,
+        where a file written by an `scp` from another host raises no inotify
+        event on this node — a `stat` sweep sees it either way, and at corpus
+        scale it costs nothing.
+        """
+        try:
+            # Created if absent so there is somewhere obvious to copy into —
+            # the browser names the path, and a directory that does not exist
+            # names nothing.
+            self.settings.corpus_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        while True:
+            try:
+                sync = await self.chat.sync_corpus(self.settings.corpus_dir)
+            except AgentChatError as error:
+                self.notify(str(error), severity="warning")
+                return
+            if sync.changed:
+                self.notify(_corpus_summary(sync))
+                self._refresh_status()
+            for path, reason in sync.failed:
+                self.notify(f"{path.name}: {reason}", severity="warning")
+            if self.settings.corpus_poll_seconds <= 0 and not sync.pending:
+                return
+            await asyncio.sleep(max(0.5, self.settings.corpus_poll_seconds))
 
     # -- actions ----------------------------------------------------------
 
@@ -301,6 +424,41 @@ class ChatApp(App[None]):
         )
         if chosen is not None and chosen != self.conversation.id:
             await self._switch_to(chosen)
+
+    @work
+    async def action_open_documents(self) -> None:
+        # Bare @work, like the other browsers: opening it must not cancel a
+        # running generation or a running ingest.
+        await self.push_screen_wait(
+            DocumentBrowser(
+                *await self._documents(),
+                corpus_dir=self.settings.corpus_dir if self.settings.corpus_sync else None,
+            )
+        )
+
+    async def _documents(self) -> tuple[list[Document], dict[str, list[Snippet]]]:
+        documents = await self.chat.documents()
+        return documents, {
+            document.id: await self.chat.snippets_of(document.id)
+            for document in documents
+        }
+
+    async def on_document_browser_delete_requested(
+        self, event: DocumentBrowser.DeleteRequested
+    ) -> None:
+        """The browser already confirmed inline; it stays open and gets the
+        remaining documents back."""
+        browser = self.screen
+        if not isinstance(browser, DocumentBrowser):
+            return
+        try:
+            await self.chat.delete_document(event.document_id)
+        except AgentChatError as error:
+            self.notify(str(error), severity="error")
+            return
+        # Escape during the store work leaves nothing to refresh.
+        if self.screen is browser:
+            await browser.refresh_documents(*await self._documents())
 
     async def on_conversation_picker_delete_requested(
         self, event: ConversationPicker.DeleteRequested

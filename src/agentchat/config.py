@@ -17,7 +17,9 @@ from dotenv import find_dotenv, load_dotenv
 from agentchat.core.delegation import DelegationService
 from agentchat.core.errors import AgentChatError
 from agentchat.core.facts import FactExtractor
-from agentchat.core.retrieval import AdaptiveRetriever, FactIndex
+from agentchat.core.ingest import DocumentIngestor
+from agentchat.core.retrieval import AdaptiveRetriever, FactIndex, SnippetIndex
+from agentchat.core.snippets import SNIPPET_CHARS, SNIPPET_OVERLAP
 from agentchat.llm.base import ModelInfo
 from agentchat.llm.embedding import (
     DEFAULT_EMBED_MODEL_ID,
@@ -196,6 +198,60 @@ class Settings:
             120.0 if (v := _env_float("RECALL_TIMEOUT")) is None else v
         )
     )
+    #: On by default, same reasoning as `extract_facts`. Off means a dropped
+    #: file is declined, no reader is imported and no snippet is written.
+    ingest_documents: bool = field(
+        default_factory=lambda: _env_flag("INGEST_DOCUMENTS", True)
+    )
+    #: Keep the store in line with `corpus_dir`: what is in that directory is
+    #: what is retrievable. Scanned at startup and then polled.
+    corpus_sync: bool = field(default_factory=lambda: _env_flag("CORPUS_SYNC", True))
+    #: Seconds between corpus scans. `0` scans once at startup and stops —
+    #: polled rather than watched because a file `scp`-ed onto a network
+    #: filesystem raises no inotify event on this node.
+    corpus_poll_seconds: float = field(
+        default_factory=lambda: (
+            5.0 if (v := _env_float("CORPUS_POLL_SECONDS")) is None else v
+        )
+    )
+    snippet_chars: int = field(
+        default_factory=lambda: (
+            SNIPPET_CHARS if (v := _env_int("SNIPPET_CHARS")) is None else v
+        )
+    )
+    snippet_overlap: int = field(
+        default_factory=lambda: (
+            SNIPPET_OVERLAP if (v := _env_int("SNIPPET_OVERLAP")) is None else v
+        )
+    )
+    max_document_mb: float = field(
+        default_factory=lambda: (
+            10.0 if (v := _env_float("MAX_DOCUMENT_MB")) is None else v
+        )
+    )
+    #: Off searches the group's facts alone — the document corpus is skipped,
+    #: ingested or not.
+    recall_documents: bool = field(
+        default_factory=lambda: _env_flag("RECALL_DOCUMENTS", True)
+    )
+    recall_snippet_hits: int = field(
+        default_factory=lambda: 8 if (v := _env_int("RECALL_SNIPPET_HITS")) is None else v
+    )
+    recall_snippet_min_score: float = field(
+        default_factory=lambda: (
+            0.25 if (v := _env_float("RECALL_SNIPPET_MIN_SCORE")) is None else v
+        )
+    )
+    recall_digest_snippets: int = field(
+        default_factory=lambda: (
+            5 if (v := _env_int("RECALL_DIGEST_SNIPPETS")) is None else v
+        )
+    )
+    recall_snippets_per_document: int = field(
+        default_factory=lambda: (
+            2 if (v := _env_int("RECALL_SNIPPETS_PER_DOCUMENT")) is None else v
+        )
+    )
     #: On by default: an instrument that has to be switched on is an
     #: instrument nobody has running when the interesting turn happens.
     log_llm_io: bool = field(default_factory=lambda: _env_flag("LOG_LLM_IO", True))
@@ -258,10 +314,14 @@ def build_fact_extractor(
 
 
 def build_embedder(settings: Settings) -> Embedder | None:
-    """`None` when recall is off. `HashingEmbedder` under the mock backend —
-    the same switch `build_registry` makes, for the same reason: no test and
-    no laptop should need embedding weights on disk."""
-    if not settings.recall_facts:
+    """`None` when nothing needs vectors. `HashingEmbedder` under the mock
+    backend — the same switch `build_registry` makes, for the same reason: no
+    test and no laptop should need embedding weights on disk.
+
+    Built once and shared by both indexes: two `LocalEmbedder`s would load the
+    encoder twice.
+    """
+    if not settings.recall_facts and not settings.ingest_documents:
         return None
     if settings.backend == "mock":
         return HashingEmbedder()
@@ -271,11 +331,38 @@ def build_embedder(settings: Settings) -> Embedder | None:
     )
 
 
+def build_snippet_index(
+    settings: Settings, store: ConversationStore, embedder: Embedder | None
+) -> SnippetIndex | None:
+    """The document corpus's index. `None` when ingestion is off — nothing
+    then writes snippets — or when no embedder was built."""
+    if not settings.ingest_documents or embedder is None:
+        return None
+    return SnippetIndex(store, embedder)
+
+
+def build_ingestor(
+    settings: Settings, store: ConversationStore, index: SnippetIndex | None
+) -> DocumentIngestor | None:
+    """The only place ingestion is switched on; `None` when
+    `ingest_documents` is off."""
+    if not settings.ingest_documents:
+        return None
+    return DocumentIngestor(
+        store,
+        index,
+        size=settings.snippet_chars,
+        overlap=settings.snippet_overlap,
+        max_bytes=int(settings.max_document_mb * 1024 * 1024),
+    )
+
+
 def build_retriever(
     settings: Settings,
     registry: ModelRegistry,
     store: ConversationStore,
     embedder: Embedder | None,
+    snippets: SnippetIndex | None = None,
 ) -> AdaptiveRetriever | None:
     """Assemble the adaptive retriever. `None` when recall is off or no
     embedder was built. `recall_seeds` is clamped to `MAX_SEEDS` inside
@@ -285,12 +372,17 @@ def build_retriever(
     return AdaptiveRetriever(
         registry,
         FactIndex(store, embedder),
+        snippets if settings.recall_documents else None,
         rounds=settings.recall_rounds,
         rewrites=settings.recall_rewrites,
         hits=settings.recall_hits,
         seeds=settings.recall_seeds,
         min_score=settings.recall_min_score,
         digest_facts=settings.recall_digest_facts,
+        snippet_hits=settings.recall_snippet_hits,
+        snippet_min_score=settings.recall_snippet_min_score,
+        digest_snippets=settings.recall_digest_snippets,
+        snippets_per_document=settings.recall_snippets_per_document,
         timeout=settings.recall_timeout,
     )
 

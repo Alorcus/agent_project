@@ -108,7 +108,10 @@ def mock_settings(**overrides) -> Settings:
     to two silent LLM calls per window; tests that are about fact extraction
     pass ``extract_facts=True`` explicitly. Recall defaults to off for the
     same reason again — otherwise every turn would grow a gate call; tests
-    that are about recall pass ``recall_facts=True`` explicitly.
+    that are about recall pass ``recall_facts=True`` explicitly. Document
+    ingestion defaults to off once more: on, every app test would build an
+    ingestor and ingest whatever ``corpus_dir`` happens to point at, and the
+    corpus poller would run for the life of every app test.
     """
     overrides.setdefault("backend", "mock")
     overrides.setdefault("store", "sqlite")
@@ -117,6 +120,8 @@ def mock_settings(**overrides) -> Settings:
     overrides.setdefault("subagents", False)
     overrides.setdefault("extract_facts", False)
     overrides.setdefault("recall_facts", False)
+    overrides.setdefault("ingest_documents", False)
+    overrides.setdefault("corpus_sync", False)
     return Settings(**overrides)
 
 

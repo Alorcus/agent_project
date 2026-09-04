@@ -16,6 +16,9 @@ dependencies = [
     # Arrives with torch today, but retrieval.py and storage/sqlite.py import
     # it directly — an undeclared import is one `uv sync` from being wrong.
     "numpy>=1.26",
+    # PDF text extraction. Pure Python: no system libraries to install on the
+    # cluster, and nothing fetched at read time.
+    "pypdf>=5.0",
 ]
 
 [project.scripts]

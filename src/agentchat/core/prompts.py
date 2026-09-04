@@ -16,7 +16,7 @@ from agentchat.core.context import estimate_tokens
 from agentchat.core.models import Message
 
 if TYPE_CHECKING:
-    from agentchat.core.retrieval import Hit, Recall
+    from agentchat.core.retrieval import Hit, Recall, SnippetHit
 
 #: The system prompt for the assistant the user actually talks to — the
 #: `default` entry in the router's roster, which names no `SubAgent` and so
@@ -319,9 +319,10 @@ def parse_query(text: str) -> str:
 
 
 JUDGE_SYSTEM = f"""\
-You are given the user's original message and a list of retrieved facts. \
-Decide whether the facts are enough to answer the message well. Never answer \
-the question yourself.
+You are given the user's original message and the evidence retrieved for it — \
+facts from earlier conversations, passages from the user's documents, or \
+both. Decide whether that evidence is enough to answer the message well. \
+Never answer the question yourself.
 
 Reply `{VERDICT_ENOUGH}` if they are. Otherwise reply `{VERDICT_MISSING}: ` \
 followed by one sentence naming precisely what is absent — the wrong entity, \
@@ -331,7 +332,7 @@ vague to use.
 Example:
 
 Message: what Postgres version are we on in production?
-Facts:
+Evidence:
 - The team runs Postgres for the billing service.
 
 Verdict:
@@ -341,14 +342,14 @@ Verdict:
 Example:
 
 Message: what Postgres version are we on in production?
-Facts:
-- The team upgraded production to Postgres 15 in March.
+Evidence:
+- [runbook.pdf p.2] "Production runs Postgres 15 since the March upgrade."
 
 Verdict:
 
 {VERDICT_ENOUGH}"""
 
-JUDGE_PROMPT = "Message: {message}\nFacts:\n{facts}\n\nVerdict:"
+JUDGE_PROMPT = "Message: {message}\nEvidence:\n{evidence}\n\nVerdict:"
 #: The judge and the reseed prompt are shown the ORIGINAL user message, never
 #: a rewritten query: rewrites are lossy interpretations of intent, and a
 #: loop that judges against its own last guess drifts away from what was
@@ -404,9 +405,10 @@ def parse_seeds(text: str, *, limit: int = MAX_SEEDS) -> tuple[str, ...]:
 
 RECALL_HEADER = """\
 ---
-The notes below were retrieved from the user's earlier conversations in this \
-project. The user did not write them and cannot see them. Use them where they \
-help answer the message above; where they are silent, fall back on your own \
+The notes below were retrieved for you: facts from the user's earlier \
+conversations in this project, and passages from documents the user provided. \
+The user did not write them here and cannot see them. Use them where they help \
+answer the message above; where they are silent, fall back on your own \
 knowledge. Never mention that a retrieval step happened."""
 
 RECALL_HEDGE = (
@@ -415,6 +417,48 @@ RECALL_HEDGE = (
 )
 
 RECALL_FOOTER = "The user's message, again: {user_text}"
+
+
+#: How much of the digest's budget facts may take before documents get the
+#: rest. Documents also inherit whatever the facts leave unused, so a turn
+#: whose only evidence is a document still spends the whole budget on it.
+DIGEST_FACT_SHARE = 2 / 3
+
+
+def render_digest(
+    fact_hits: Sequence["Hit"],
+    snippet_hits: Sequence["SnippetHit"] = (),
+    *,
+    budget: int,
+) -> str:
+    """Both corpora as one block: `Facts:`/`Said:` from the group's facts,
+    then `Documents:` from the global snippet corpus."""
+    share = int(budget * DIGEST_FACT_SHARE) if snippet_hits else budget
+    facts = render_facts(fact_hits, budget=share)
+    documents = render_documents(
+        snippet_hits, budget=budget - estimate_tokens(facts)
+    )
+    return "\n\n".join(block for block in (facts, documents) if block)
+
+
+def render_documents(hits: Sequence["SnippetHit"], *, budget: int) -> str:
+    """The retrieved snippets as `- [title p.N] "…"` lines, each attributable
+    to the document and page it came from. Drops whole hits, lowest-scored
+    first, to fit `budget` tokens."""
+    ordered = sorted(hits, key=lambda h: h.score, reverse=True)
+
+    def render(kept: Sequence["SnippetHit"]) -> str:
+        if not kept:
+            return ""
+        lines = [
+            f'- [{hit.source}] "{" ".join(hit.snippet.text.split())}"' for hit in kept
+        ]
+        return "Documents:\n" + "\n".join(lines)
+
+    kept = list(ordered)
+    while kept and estimate_tokens(render(kept)) > budget:
+        kept.pop()
+    return render(kept)
 
 
 def render_facts(hits: Sequence["Hit"], *, budget: int) -> str:

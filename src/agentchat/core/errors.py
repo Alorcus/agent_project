@@ -35,6 +35,12 @@ class RetrievalError(AgentChatError):
     boundary and degraded to a normal reply, never surfaced to the user."""
 
 
+class IngestError(AgentChatError):
+    """Reading, snippeting or storing a dropped document failed. Unlike
+    `RetrievalError` this one reaches the user: they asked for the ingest
+    explicitly, so silence would look like success."""
+
+
 class DelegationError(AgentChatError):
     """Consulting a sub-agent failed — routing, task authoring, or the
     specialist's own answer produced nothing worth injecting."""

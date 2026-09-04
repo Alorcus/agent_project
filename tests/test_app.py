@@ -9,16 +9,17 @@ from __future__ import annotations
 
 import asyncio
 
+from textual import events
 from textual.geometry import Region
 from textual.widgets import Input, ListView, Static
 
 from agentchat.core.errors import ProviderError, StorageError
 from agentchat.core.models import DEFAULT_GROUP_ID, Author, Conversation, Fact, Group, Message, Phrase
 from agentchat.ui.app import _EXTRACTION_GROUP, ChatApp
-from agentchat.ui.screens import ConversationPicker, GroupChooser
-from agentchat.ui.widgets import ConversationHeader, MessageBubble
+from agentchat.ui.screens import ConversationPicker, DocumentBrowser, GroupChooser
+from agentchat.ui.widgets import ConversationHeader, MessageBubble, PromptInput
 from conftest import mock_settings
-from factories import make_conversation
+from factories import make_conversation, make_pdf_bytes
 
 # mock_settings() defaults to near-instant timing; tests that assert on
 # mid-generation state need a real gap to observe, so they opt back into
@@ -1762,3 +1763,226 @@ async def test_ctrl_f_mid_generation_leaves_the_generation_worker_running():
 
         assert app._generating
         assert any(w.group == _GENERATION_GROUP for w in app.workers)
+
+
+# -- dropped documents -----------------------------------------------------
+
+
+_PROSE = "\n\n".join(
+    f"Paragraph {n}. Expenses over two hundred euro need written approval "
+    f"from a finance partner before the purchase is made." * 3
+    for n in range(4)
+)
+
+
+def _ingesting_settings(tmp_path, **overrides):
+    return mock_settings(
+        ingest_documents=True, corpus_dir=tmp_path / "corpus", **overrides
+    )
+
+
+async def _drop(pilot, path) -> None:
+    """What a terminal does with a dropped file: paste its path into the
+    focused prompt."""
+    prompt = pilot.app.query_one("#prompt", PromptInput)
+    prompt.focus()
+    await pilot.pause()
+    prompt.post_message(events.Paste(str(path)))
+    await pilot.pause()
+
+
+async def _wait_for_documents(pilot, app, count: int) -> list:
+    for _ in range(60):
+        await pilot.pause()
+        documents = await app.chat.documents()
+        if len(documents) == count:
+            return documents
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"store never held {count} documents")
+
+
+async def test_dropping_a_file_ingests_it_and_leaves_the_prompt_empty(tmp_path):
+    path = tmp_path / "handbook.txt"
+    path.write_text(_PROSE)
+    app = ChatApp(_ingesting_settings(tmp_path))
+    async with app.run_test() as pilot:
+        await _drop(pilot, path)
+
+        documents = await _wait_for_documents(pilot, app, 1)
+        assert documents[0].title == "handbook.txt"
+        assert documents[0].snippet_count > 1
+        # The path was consumed as a drop, not typed into the message.
+        assert app.query_one("#prompt", PromptInput).value == ""
+
+
+async def test_dropping_a_pdf_ingests_it(tmp_path):
+    path = tmp_path / "handbook.pdf"
+    path.write_bytes(make_pdf_bytes(["Expenses need approval from finance."]))
+    app = ChatApp(_ingesting_settings(tmp_path))
+    async with app.run_test() as pilot:
+        await _drop(pilot, path)
+
+        documents = await _wait_for_documents(pilot, app, 1)
+        assert documents[0].media_type == "pdf"
+
+
+async def test_dropping_the_same_file_twice_ingests_it_once(tmp_path):
+    path = tmp_path / "handbook.txt"
+    path.write_text(_PROSE)
+    app = ChatApp(_ingesting_settings(tmp_path))
+    async with app.run_test() as pilot:
+        await _drop(pilot, path)
+        await _wait_for_documents(pilot, app, 1)
+
+        await _drop(pilot, path)
+        for _ in range(10):
+            await pilot.pause()
+            await asyncio.sleep(0.02)
+
+        assert len(await app.chat.documents()) == 1
+
+
+async def test_pasting_prose_still_types_into_the_prompt(tmp_path):
+    app = ChatApp(_ingesting_settings(tmp_path))
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.focus()
+        await pilot.pause()
+
+        prompt.post_message(events.Paste("Let's use SQLite for storage."))
+        await pilot.pause()
+
+        assert prompt.value == "Let's use SQLite for storage."
+        assert await app.chat.documents() == []
+
+
+async def test_dropping_an_unsupported_file_notifies_and_keeps_running(tmp_path):
+    path = tmp_path / "report.docx"
+    path.write_text("not a document")
+    app = ChatApp(_ingesting_settings(tmp_path))
+    async with app.run_test() as pilot:
+        await _drop(pilot, path)
+        for _ in range(20):
+            await pilot.pause()
+            if app._notifications:
+                break
+            await asyncio.sleep(0.02)
+
+        assert any("not a document" in n.message for n in app._notifications)
+        assert await app.chat.documents() == []
+        assert app.is_running
+
+
+async def test_submitting_a_bare_path_ingests_it_rather_than_asking_about_it(tmp_path):
+    """The fallback for terminals that type a dropped path as keystrokes
+    instead of sending a bracketed paste."""
+    path = tmp_path / "handbook.txt"
+    path.write_text(_PROSE)
+    app = ChatApp(_ingesting_settings(tmp_path))
+    async with app.run_test() as pilot:
+        await _submit(pilot, str(path))
+
+        documents = await _wait_for_documents(pilot, app, 1)
+        assert documents[0].title == "handbook.txt"
+        # No turn was taken: the conversation is still empty.
+        assert app.conversation.messages == []
+
+
+async def test_a_corpus_directory_is_ingested_at_startup(tmp_path):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "handbook.txt").write_text(_PROSE)
+    app = ChatApp(
+        _ingesting_settings(tmp_path, corpus_sync=True, corpus_poll_seconds=0.0)
+    )
+    async with app.run_test() as pilot:
+        documents = await _wait_for_documents(pilot, app, 1)
+
+        assert documents[0].title == "handbook.txt"
+
+
+async def test_a_file_copied_into_the_corpus_while_running_is_picked_up(tmp_path):
+    """What `scp`-ing a document to the cluster looks like from the app's
+    side: the file simply appears under `corpus_dir`."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    app = ChatApp(
+        _ingesting_settings(tmp_path, corpus_sync=True, corpus_poll_seconds=0.5)
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert await app.chat.documents() == []
+
+        (corpus / "handbook.txt").write_text(_PROSE)
+        documents = await _wait_for_documents(pilot, app, 1)
+
+        assert documents[0].title == "handbook.txt"
+        assert any("handbook.txt" in n.message for n in app._notifications)
+
+
+async def test_a_file_removed_from_the_corpus_stops_being_retrievable(tmp_path):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    path = corpus / "handbook.txt"
+    path.write_text(_PROSE)
+    app = ChatApp(
+        _ingesting_settings(tmp_path, corpus_sync=True, corpus_poll_seconds=0.5)
+    )
+    async with app.run_test() as pilot:
+        await _wait_for_documents(pilot, app, 1)
+
+        path.unlink()
+        await _wait_for_documents(pilot, app, 0)
+
+        assert await app.chat.documents() == []
+
+
+async def test_ingestion_off_declines_a_drop_without_writing_anything(tmp_path):
+    path = tmp_path / "handbook.txt"
+    path.write_text(_PROSE)
+    app = ChatApp(mock_settings(ingest_documents=False))
+    async with app.run_test() as pilot:
+        await _drop(pilot, path)
+        for _ in range(20):
+            await pilot.pause()
+            if app._notifications:
+                break
+            await asyncio.sleep(0.02)
+
+        assert app.chat.ingestor is None
+        assert any("ingestion is off" in n.message for n in app._notifications)
+        assert await app.chat.documents() == []
+
+
+async def test_ctrl_b_lists_the_documents_and_ctrl_x_deletes_one(tmp_path):
+    path = tmp_path / "handbook.txt"
+    path.write_text(_PROSE)
+    app = ChatApp(_ingesting_settings(tmp_path))
+    async with app.run_test() as pilot:
+        await _drop(pilot, path)
+        await _wait_for_documents(pilot, app, 1)
+
+        await pilot.press("ctrl+b")
+        await _wait_for_screen(pilot, app, DocumentBrowser)
+        assert any("handbook.txt" in row for row in _row_texts(app.screen))
+
+        await pilot.press("ctrl+x")
+        await pilot.pause()
+        await pilot.press("y")
+        for _ in range(60):
+            await pilot.pause()
+            if not await app.chat.documents():
+                break
+            await asyncio.sleep(0.05)
+
+        assert await app.chat.documents() == []
+
+
+async def test_ctrl_b_with_no_documents_shows_the_empty_state(tmp_path):
+    app = ChatApp(_ingesting_settings(tmp_path))
+    async with app.run_test() as pilot:
+        await pilot.press("ctrl+b")
+        await _wait_for_screen(pilot, app, DocumentBrowser)
+
+        body = app.screen.query_one("#documents-body", Static)
+        assert "drop a text or PDF file" in str(body.content)

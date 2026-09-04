@@ -133,6 +133,52 @@ class Fact:
 
 
 @dataclass
+class Document:
+    """A file the user dropped in, as ingestion read it. Its identity is
+    `content_hash`, not its path: the same bytes under two names are one
+    document, and an edited file is a different one."""
+
+    id: str = field(default_factory=_new_id)
+    title: str = ""
+    #: Absolute path at ingest time — provenance, not identity.
+    path: str = ""
+    media_type: Literal["text", "pdf"] = "text"
+    content_hash: str = ""
+    #: The extracted text a `Snippet`'s offsets index into. Empty on rows from
+    #: `list_documents`; only `store.document()` fills it in.
+    text: str = ""
+    char_count: int = 0
+    snippet_count: int = 0
+    created_at: datetime = field(default_factory=_now)
+
+
+@dataclass(frozen=True)
+class Snippet:
+    """One span of a document's text, plus the substring it covers —
+    denormalised the way `Phrase` is, so retrieval never reloads the
+    document to render a hit."""
+
+    id: str = field(default_factory=_new_id)
+    document_id: str = ""
+    ordinal: int = 0
+    text: str = ""
+    start: int = 0
+    end: int = 0
+    #: 1-based page for a paginated document, `None` for plain text.
+    page: int | None = None
+
+
+@dataclass(frozen=True)
+class SnippetEmbedding:
+    """One snippet embedded by one model. `dim` and `created_at` are filled in
+    by the store at write time."""
+
+    snippet_id: str
+    model_id: str
+    vector: tuple[float, ...]
+
+
+@dataclass
 class Conversation:
     """An ordered list of messages."""
 

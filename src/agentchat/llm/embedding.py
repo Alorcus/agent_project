@@ -97,6 +97,9 @@ class LocalEmbedder:
         self._tokenizer: Any = None
         self._model: Any = None
         self._loaded = False
+        # A background ingest and a turn's `ensure_indexed` both call `embed`;
+        # without this both see `_loaded == False` and load the encoder twice.
+        self._load_lock = asyncio.Lock()
 
     @property
     def info(self) -> EmbedderInfo:
@@ -110,7 +113,9 @@ class LocalEmbedder:
         if not texts:
             return []
         if not self._loaded:
-            await asyncio.to_thread(self._load_blocking)
+            async with self._load_lock:
+                if not self._loaded:
+                    await asyncio.to_thread(self._load_blocking)
         out: list[list[float]] = []
         batch: list[str] = []
         for text in texts:

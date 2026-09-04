@@ -72,6 +72,18 @@ src/agentchat/
                     code, never by asking the model: normalise, anchor,
                     anchor_in, significant, coverage. No I/O, no provider, no
                     store — must stay that way
+    snippets.py    Span, spans, page_of: cutting a document's text into
+                    overlapping snippets. Pure, the same contract
+                    anchoring.py holds — a span indexes into the extracted
+                    text, so nothing may renormalise that text afterwards
+    ingest.py      readers (.txt-family, .pdf via pypdf), dropped_paths, and
+                    DocumentIngestor: read → snippet → persist → embed, with
+                    one boundary where every failure becomes an IngestError.
+                    Unlike recall's, an ingest failure IS shown to the user.
+                    sync_dir treats corpus_dir as authoritative (added files
+                    ingested, deleted files' documents dropped) and is POLLED,
+                    not watched: the corpus is on a network filesystem, where
+                    an scp from another host raises no inotify event here
     facts.py       countable, windows, FactExtractor: a sliding window of six
                     messages stepping four, one fact call and one quotes call
                     per full window. The window arithmetic is derived from the
@@ -81,12 +93,16 @@ src/agentchat/
                     projection from a fact's stored spans to the window
                     messages the Ctrl+F view renders them over. No store, no
                     widget — the same contract anchoring.py holds
-    retrieval.py   Hit, Recall, FactIndex, AdaptiveRetriever: the bounded RAG
-                    loop over a group's facts — gate, then rewrite → retrieve →
-                    assemble (deterministic, no LLM call) → judge, the judge's
-                    gap seeding the next round. The ONLY module that may read
-                    fact_embeddings. recall() is the single entry point and
-                    the single place failure becomes None (answer normally)
+    retrieval.py   Hit, SnippetHit, Recall, FactIndex, SnippetIndex,
+                    AdaptiveRetriever: the bounded RAG loop over two corpora —
+                    gate, then rewrite → retrieve → assemble (deterministic, no
+                    LLM call) → judge, the judge's gap seeding the next round.
+                    Facts are group-scoped and two-view; document snippets are
+                    GLOBAL and one-view, searched with the same query vectors,
+                    so documents add no LLM call. The ONLY module that may read
+                    fact_embeddings and snippet_embeddings. recall() is the
+                    single entry point and the single place failure becomes
+                    None (answer normally)
     usage.py       CallUsage/TurnUsage, the context meter's figures: a call's
                     prompt plus what it generated, recorded in two steps
                     because the halves are known at different times. Recorded
@@ -110,6 +126,11 @@ src/agentchat/
                     silently makes the transcript describe the wrong thing.
   storage/         ConversationStore protocol and its SQLite implementation
   ui/              Textual application, widgets, and modal screens
+                    A dropped file arrives as a *paste*, not an event of its
+                    own: PromptInput._on_paste decides drop-or-text before
+                    Input's own handler types it. Textual runs every _on_paste
+                    in the MRO, so that override must not call super() and must
+                    prevent_default() to suppress the insertion
 ```
 
 Dependency direction is one-way: `ui → core → llm/storage`. The UI never

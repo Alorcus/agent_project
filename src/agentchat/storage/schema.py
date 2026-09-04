@@ -70,6 +70,37 @@ CREATE TABLE IF NOT EXISTS fact_embeddings (
   PRIMARY KEY (fact_id, view, model_id));
 CREATE INDEX IF NOT EXISTS idx_fact_embeddings_fact ON fact_embeddings(fact_id);
 
+-- Documents are global: no `group_id`, no conversation. A file dropped into
+-- one chat is searchable from every chat, which is what separates the document
+-- corpus from the group-scoped fact corpus.
+CREATE TABLE IF NOT EXISTS documents (
+  id TEXT PRIMARY KEY, title TEXT NOT NULL, path TEXT NOT NULL,
+  media_type TEXT NOT NULL, content_hash TEXT NOT NULL,
+  text TEXT NOT NULL, char_count INTEGER NOT NULL,
+  snippet_count INTEGER NOT NULL, created_at TEXT NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_hash ON documents(content_hash);
+CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path);
+
+-- `start`/`"end"` index into `documents.text`, exactly as `fact_phrases` does
+-- into a message.
+CREATE TABLE IF NOT EXISTS document_snippets (
+  id TEXT PRIMARY KEY,
+  document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL, text TEXT NOT NULL,
+  start INTEGER NOT NULL, "end" INTEGER NOT NULL, page INTEGER,
+  UNIQUE (document_id, ordinal));
+CREATE INDEX IF NOT EXISTS idx_snippets_document
+  ON document_snippets(document_id);
+
+-- One row per (snippet, embedder), keyed like `fact_embeddings` and for the
+-- same reason: switching embedders and back must not have thrown the first
+-- embedder's vectors away.
+CREATE TABLE IF NOT EXISTS snippet_embeddings (
+  snippet_id TEXT NOT NULL REFERENCES document_snippets(id) ON DELETE CASCADE,
+  model_id TEXT NOT NULL, dim INTEGER NOT NULL, vector BLOB NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (snippet_id, model_id));
+
 -- `covered_messages` here counts *countable* messages (core.facts.countable),
 -- not rows in `messages`.
 CREATE TABLE IF NOT EXISTS fact_extraction_state (

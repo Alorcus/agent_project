@@ -8,11 +8,26 @@ from pathlib import Path
 import pytest
 
 from agentchat.core.errors import StorageError
-from agentchat.core.models import DEFAULT_GROUP_ID, Author, Fact, Message, Phrase
+from agentchat.core.models import (
+    DEFAULT_GROUP_ID,
+    Author,
+    Fact,
+    Message,
+    Phrase,
+    Snippet,
+    SnippetEmbedding,
+)
 from agentchat.storage.schema import connect
 from agentchat.storage.sqlite import SqliteStore
 
-from factories import make_conversation, make_fact, make_group, make_phrase
+from factories import (
+    make_conversation,
+    make_document,
+    make_fact,
+    make_group,
+    make_phrase,
+    make_snippet,
+)
 
 
 async def test_round_trip_title_group_messages_and_model_id(tmp_path: Path):
@@ -558,3 +573,116 @@ async def test_phrase_quote_round_trips_and_matches_the_source_message(tmp_path:
     phrase = loaded.phrases[0]
     assert phrase.quote == "moving staging to GKE next month"
     assert phrase.quote == phrase.text(messages[0])
+
+
+# -- documents -------------------------------------------------------------
+
+
+def _document_with_snippets(count: int = 3, **overrides):
+    document = make_document(snippet_count=count, **overrides)
+    snippets = [
+        make_snippet(
+            document_id=document.id,
+            ordinal=n,
+            text=f"snippet {n} of the handbook",
+            start=n * 20,
+            end=n * 20 + 20,
+            page=n + 1,
+        )
+        for n in range(count)
+    ]
+    return document, snippets
+
+
+async def test_a_document_round_trips_with_its_snippets(tmp_path: Path):
+    store = SqliteStore(tmp_path / "chat.db")
+    document, snippets = _document_with_snippets()
+    await store.save_document(document, snippets)
+
+    loaded = await store.document(document.id)
+
+    assert loaded is not None
+    assert loaded.title == document.title
+    assert loaded.media_type == "text"
+    assert loaded.text == document.text
+    assert await store.list_snippets(document.id) == snippets
+
+
+async def test_a_listed_document_is_a_header_and_document_fills_in_the_text(
+    tmp_path: Path,
+):
+    store = SqliteStore(tmp_path / "chat.db")
+    document, snippets = _document_with_snippets()
+    await store.save_document(document, snippets)
+
+    listed = await store.list_documents()
+
+    assert [d.id for d in listed] == [document.id]
+    assert listed[0].text == ""
+    assert listed[0].snippet_count == 3
+    assert (await store.document(document.id)).text == document.text
+
+
+async def test_a_document_is_found_by_hash_and_by_path(tmp_path: Path):
+    store = SqliteStore(tmp_path / "chat.db")
+    document, snippets = _document_with_snippets()
+    await store.save_document(document, snippets)
+
+    assert (await store.document_by_hash(document.content_hash)).id == document.id
+    assert (await store.document_by_path(document.path)).id == document.id
+    assert await store.document_by_hash("nothing-like-it") is None
+    assert await store.document_by_path("/tmp/absent.txt") is None
+
+
+async def test_a_second_document_with_the_same_content_is_refused(tmp_path: Path):
+    store = SqliteStore(tmp_path / "chat.db")
+    document, snippets = _document_with_snippets()
+    await store.save_document(document, snippets)
+
+    with pytest.raises(StorageError):
+        await store.save_document(make_document(path="/tmp/copy.txt"), [])
+
+
+async def test_deleting_a_document_takes_its_snippets_and_vectors(tmp_path: Path):
+    store = SqliteStore(tmp_path / "chat.db")
+    document, snippets = _document_with_snippets()
+    await store.save_document(document, snippets)
+    await store.save_snippet_embeddings(
+        [SnippetEmbedding(snippet_id=s.id, model_id="m1", vector=(0.5, 0.5)) for s in snippets]
+    )
+
+    await store.delete_document(document.id)
+
+    assert await store.list_documents() == []
+    assert await store.list_snippets(document.id) == []
+    assert await store.snippet_vectors(model_id="m1") == []
+
+
+async def test_snippet_vectors_and_the_backlog_are_scoped_by_embedder_id(
+    tmp_path: Path,
+):
+    store = SqliteStore(tmp_path / "chat.db")
+    document, snippets = _document_with_snippets()
+    await store.save_document(document, snippets)
+
+    assert len(await store.snippets_without_embeddings(model_id="m1")) == 3
+    await store.save_snippet_embeddings(
+        [SnippetEmbedding(snippet_id=snippets[0].id, model_id="m1", vector=(1.0, 0.0))]
+    )
+
+    assert len(await store.snippets_without_embeddings(model_id="m1")) == 2
+    # Another embedder has embedded nothing at all yet.
+    assert len(await store.snippets_without_embeddings(model_id="m2")) == 3
+    assert len(await store.snippet_vectors(model_id="m1")) == 1
+    assert await store.snippet_vectors(model_id="m2") == []
+
+
+async def test_snippets_by_ids_loads_only_what_was_asked_for(tmp_path: Path):
+    store = SqliteStore(tmp_path / "chat.db")
+    document, snippets = _document_with_snippets()
+    await store.save_document(document, snippets)
+
+    loaded = await store.snippets_by_ids([snippets[0].id, snippets[2].id])
+
+    assert {s.id for s in loaded} == {snippets[0].id, snippets[2].id}
+    assert await store.snippets_by_ids([]) == []

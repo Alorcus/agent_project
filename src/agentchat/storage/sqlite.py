@@ -22,11 +22,14 @@ from agentchat.core.models import (
     DEFAULT_GROUP_ID,
     Author,
     Conversation,
+    Document,
     Fact,
     FactEmbedding,
     Group,
     Message,
     Phrase,
+    Snippet,
+    SnippetEmbedding,
     _now,
 )
 from agentchat.storage import schema
@@ -101,6 +104,43 @@ class SqliteStore:
         return await asyncio.to_thread(
             self._facts_without_embeddings, group_id, model_id
         )
+
+    async def save_document(self, document: Document, snippets: Sequence[Snippet]) -> None:
+        await asyncio.to_thread(self._save_document, document, snippets)
+
+    async def document(self, document_id: str) -> Document | None:
+        return await asyncio.to_thread(self._document, "id", document_id, True)
+
+    async def document_by_hash(self, content_hash: str) -> Document | None:
+        return await asyncio.to_thread(self._document, "content_hash", content_hash, False)
+
+    async def document_by_path(self, path: str) -> Document | None:
+        return await asyncio.to_thread(self._document, "path", path, False)
+
+    async def list_documents(self) -> list[Document]:
+        return await asyncio.to_thread(self._list_documents)
+
+    async def list_snippets(self, document_id: str) -> list[Snippet]:
+        return await asyncio.to_thread(self._list_snippets, document_id)
+
+    async def snippets_by_ids(self, ids: Sequence[str]) -> list[Snippet]:
+        if not ids:
+            return []
+        return await asyncio.to_thread(self._snippets_by_ids, tuple(ids))
+
+    async def delete_document(self, document_id: str) -> None:
+        await asyncio.to_thread(self._delete_document, document_id)
+
+    async def save_snippet_embeddings(self, rows: Sequence[SnippetEmbedding]) -> None:
+        if not rows:
+            return
+        await asyncio.to_thread(self._save_snippet_embeddings, rows)
+
+    async def snippet_vectors(self, *, model_id: str) -> list[SnippetEmbedding]:
+        return await asyncio.to_thread(self._snippet_vectors, model_id)
+
+    async def snippets_without_embeddings(self, *, model_id: str) -> list[Snippet]:
+        return await asyncio.to_thread(self._snippets_without_embeddings, model_id)
 
     def _list_conversations(self, group_id: str | None) -> list[Conversation]:
         try:
@@ -462,6 +502,165 @@ class SqliteStore:
             )
         return [_fact_from_row(row, phrases_by_fact.get(row[0], [])) for row in fact_rows]
 
+    # -- documents ---------------------------------------------------------
+
+    def _save_document(self, document: Document, snippets: Sequence[Snippet]) -> None:
+        try:
+            with closing(self._connect()) as conn, conn:
+                conn.execute(
+                    "INSERT INTO documents (id, title, path, media_type, "
+                    "content_hash, text, char_count, snippet_count, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        document.id,
+                        document.title,
+                        document.path,
+                        document.media_type,
+                        document.content_hash,
+                        document.text,
+                        document.char_count,
+                        document.snippet_count,
+                        document.created_at.isoformat(),
+                    ),
+                )
+                conn.executemany(
+                    "INSERT INTO document_snippets "
+                    '(id, document_id, ordinal, text, start, "end", page) '
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            snippet.id,
+                            document.id,
+                            snippet.ordinal,
+                            snippet.text,
+                            snippet.start,
+                            snippet.end,
+                            snippet.page,
+                        )
+                        for snippet in snippets
+                    ],
+                )
+        except sqlite3.Error as exc:
+            raise StorageError(f"failed to save document {document.title!r}") from exc
+
+    def _document(self, column: str, value: str, with_text: bool) -> Document | None:
+        # `column` is chosen by the three callers above from a fixed set, never
+        # by anything the user typed.
+        try:
+            with closing(self._connect()) as conn, conn:
+                row = conn.execute(
+                    f"SELECT {_DOCUMENT_COLUMNS} FROM documents WHERE {column} = ? "
+                    "ORDER BY created_at DESC",
+                    (value,),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            raise StorageError(f"failed to load document by {column}") from exc
+        return None if row is None else _document_from_row(row, with_text=with_text)
+
+    def _list_documents(self) -> list[Document]:
+        try:
+            with closing(self._connect()) as conn, conn:
+                rows = conn.execute(
+                    f"SELECT {_DOCUMENT_COLUMNS} FROM documents ORDER BY created_at DESC"
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError("failed to list documents") from exc
+        return [_document_from_row(row, with_text=False) for row in rows]
+
+    def _list_snippets(self, document_id: str) -> list[Snippet]:
+        try:
+            with closing(self._connect()) as conn, conn:
+                rows = conn.execute(
+                    f"SELECT {_SNIPPET_COLUMNS} FROM document_snippets "
+                    "WHERE document_id = ? ORDER BY ordinal",
+                    (document_id,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError(
+                f"failed to list snippets for document {document_id}"
+            ) from exc
+        return [_snippet_from_row(row) for row in rows]
+
+    def _snippets_by_ids(self, ids: tuple[str, ...]) -> list[Snippet]:
+        placeholders = ", ".join("?" * len(ids))
+        try:
+            with closing(self._connect()) as conn, conn:
+                rows = conn.execute(
+                    f"SELECT {_SNIPPET_COLUMNS} FROM document_snippets "
+                    f"WHERE id IN ({placeholders})",
+                    ids,
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError("failed to load snippets") from exc
+        return [_snippet_from_row(row) for row in rows]
+
+    def _delete_document(self, document_id: str) -> None:
+        try:
+            with closing(self._connect()) as conn, conn:
+                conn.execute("DELETE FROM documents WHERE id = ?", (document_id,))
+        except sqlite3.Error as exc:
+            raise StorageError(f"failed to delete document {document_id}") from exc
+
+    def _save_snippet_embeddings(self, rows: Sequence[SnippetEmbedding]) -> None:
+        now = _now().isoformat()
+        try:
+            with closing(self._connect()) as conn, conn:
+                conn.executemany(
+                    "INSERT INTO snippet_embeddings "
+                    "(snippet_id, model_id, dim, vector, created_at) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(snippet_id, model_id) DO UPDATE SET "
+                    "dim = excluded.dim, vector = excluded.vector, "
+                    "created_at = excluded.created_at",
+                    [
+                        (
+                            row.snippet_id,
+                            row.model_id,
+                            len(row.vector),
+                            _pack_vector(row.vector),
+                            now,
+                        )
+                        for row in rows
+                    ],
+                )
+        except sqlite3.Error as exc:
+            raise StorageError("failed to save snippet embeddings") from exc
+
+    def _snippet_vectors(self, model_id: str) -> list[SnippetEmbedding]:
+        try:
+            with closing(self._connect()) as conn, conn:
+                rows = conn.execute(
+                    "SELECT snippet_id, model_id, vector FROM snippet_embeddings "
+                    "WHERE model_id = ?",
+                    (model_id,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError("failed to list snippet embeddings") from exc
+        return [
+            SnippetEmbedding(
+                snippet_id=snippet_id,
+                model_id=row_model_id,
+                vector=_unpack_vector(blob),
+            )
+            for snippet_id, row_model_id, blob in rows
+        ]
+
+    def _snippets_without_embeddings(self, model_id: str) -> list[Snippet]:
+        try:
+            with closing(self._connect()) as conn, conn:
+                rows = conn.execute(
+                    "SELECT s.id, s.document_id, s.ordinal, s.text, s.start, "
+                    's."end", s.page FROM document_snippets s '
+                    "LEFT JOIN snippet_embeddings e "
+                    "ON e.snippet_id = s.id AND e.model_id = ? "
+                    "WHERE e.snippet_id IS NULL ORDER BY s.document_id, s.ordinal",
+                    (model_id,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError("failed to list unembedded snippets") from exc
+        return [_snippet_from_row(row) for row in rows]
+
+
 
 def _pack_vector(vector: Sequence[float]) -> bytes:
     # The explicit `<` is what keeps a database written on one machine
@@ -494,4 +693,51 @@ def _fact_from_row(row: tuple, phrases: list[Phrase]) -> Fact:
         window_end=window_end,
         model_id=model_id,
         created_at=datetime.fromisoformat(created_at),
+    )
+
+
+_DOCUMENT_COLUMNS = (
+    "id, title, path, media_type, content_hash, text, char_count, "
+    "snippet_count, created_at"
+)
+_SNIPPET_COLUMNS = 'id, document_id, ordinal, text, start, "end", page'
+
+
+def _document_from_row(row: tuple, *, with_text: bool) -> Document:
+    (
+        id_,
+        title,
+        path,
+        media_type,
+        content_hash,
+        text,
+        char_count,
+        snippet_count,
+        created_at,
+    ) = row
+    return Document(
+        id=id_,
+        title=title,
+        path=path,
+        media_type=media_type,
+        content_hash=content_hash,
+        # A listed document is a header: carrying every document's full text
+        # into a picker would load the whole corpus to draw a list.
+        text=text if with_text else "",
+        char_count=char_count,
+        snippet_count=snippet_count,
+        created_at=datetime.fromisoformat(created_at),
+    )
+
+
+def _snippet_from_row(row: tuple) -> Snippet:
+    id_, document_id, ordinal, text, start, end, page = row
+    return Snippet(
+        id=id_,
+        document_id=document_id,
+        ordinal=ordinal,
+        text=text,
+        start=start,
+        end=end,
+        page=page,
     )

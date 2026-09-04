@@ -8,6 +8,9 @@ build/
 
 # runtime state — regenerated, excluded from the archive (NFR-D-05)
 data/
+# the knowledge corpus: whatever is copied in is ingested, and it is the
+# user's own documents, not the project's
+corpus/
 *.db
 *.sqlite3
 .models/

@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timezone
 from itertools import chain
+from pathlib import Path
 from typing import ClassVar, Literal
 
 from textual import events
@@ -18,7 +19,7 @@ from textual.widget import Widget
 from textual.widgets import Input, ListItem, ListView, Static
 
 from agentchat.core.evidence import evidence_for
-from agentchat.core.models import Conversation, Fact, Group
+from agentchat.core.models import Conversation, Document, Fact, Group, Snippet
 from agentchat.ui.widgets import EvidenceExcerpt
 
 #: ("switch", conversation id), ("new", None) or ("choose", None).
@@ -32,6 +33,7 @@ _NEW_GROUP_ID = "__new_group__"
 _NEW_GROUP_LABEL = "+ New group…"
 _HINT = "enter switch · ctrl+g group · ctrl+x delete · esc cancel"
 _FACTS_HINT = "↑↓ fact · enter open its chat · tab evidence · esc close"
+_DOCUMENTS_HINT = "↑↓ document · ctrl+x delete · esc close"
 #: The fact-list pane is a fixed width, so a row's truncation is deterministic
 #: and a test can assert on it; the untruncated text opens the evidence pane.
 _LABEL_CELLS = 40
@@ -584,6 +586,158 @@ class FactBrowser(ModalScreen[str | None]):
         fact = self._fact_for(getattr(event.item, "fact_id", None))
         if fact is not None:
             self.dismiss(fact.conversation_id)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class DocumentBrowser(ModalScreen[None], _HintLine):
+    """The ingested documents on the left; highlighting one shows its snippets
+    on the right. Ctrl+X deletes, behind the same inline confirmation the
+    picker uses. Escape closes.
+
+    Documents are global, so this screen names no group: what is listed here
+    is what every chat can retrieve.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("ctrl+x", "delete_highlighted", "Delete", show=False),
+    ]
+
+    HINT_ID: ClassVar[str] = "documents-hint"
+    IDLE_HINT: ClassVar[str] = _DOCUMENTS_HINT
+
+    class DeleteRequested(Message):
+        def __init__(self, document_id: str) -> None:
+            super().__init__()
+            self.document_id = document_id
+
+    def __init__(
+        self,
+        documents: list[Document],
+        snippets: dict[str, list[Snippet]],
+        corpus_dir: Path | None = None,
+    ) -> None:
+        super().__init__()
+        self._documents = documents
+        self._snippets = snippets
+        self._corpus_dir = corpus_dir
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="documents"):
+            yield Static("Documents", classes="picker__title")
+            if self._corpus_dir is not None:
+                # Where documents come from is the part nobody can guess, and
+                # it is the answer to "how do I add one from my laptop?".
+                yield Static(
+                    f"Anything copied into {self._corpus_dir} is indexed "
+                    "automatically, and removing it there removes it here.",
+                    classes="documents__corpus",
+                    markup=False,
+                )
+            yield self._body()
+            yield Static(self.IDLE_HINT, id=self.HINT_ID, classes="picker__hint")
+
+    def _body(self) -> Widget:
+        if not self._documents:
+            return Static(
+                "No documents yet — copy a text file or PDF into the corpus "
+                "directory, or drop a text or PDF file onto the terminal.",
+                id="documents-body",
+                classes="picker__empty",
+            )
+        return Horizontal(
+            ListView(
+                *(self._row_for(document) for document in self._documents),
+                id="documents-list",
+            ),
+            VerticalScroll(id="documents-snippets"),
+            id="documents-body",
+        )
+
+    def _row_for(self, document: Document) -> ListItem:
+        count = document.snippet_count
+        label = (
+            f"{_one_line(document.title)}  ·  "
+            f"{count} {'snippet' if count == 1 else 'snippets'}"
+        )
+        item = ListItem(Static(label, classes="documents__item", markup=False))
+        item.document_id = document.id
+        return item
+
+    def on_mount(self) -> None:
+        if self._documents:
+            self.query_one(ListView).focus()
+
+    def _document_for(self, document_id: str | None) -> Document | None:
+        return next((d for d in self._documents if d.id == document_id), None)
+
+    async def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        # Fires once on mount, which is what renders the first document.
+        if event.item is None:
+            return
+        document = self._document_for(getattr(event.item, "document_id", None))
+        if document is not None:
+            await self._render_snippets(document)
+
+    async def _render_snippets(self, document: Document) -> None:
+        pane = self.query_one("#documents-snippets", VerticalScroll)
+        await pane.remove_children()
+        widgets: list[Widget] = [
+            Static(document.path, classes="facts__source", markup=False)
+        ]
+        for snippet in self._snippets.get(document.id, []):
+            page = "" if snippet.page is None else f" · p.{snippet.page}"
+            widgets.append(
+                Static(
+                    f"#{snippet.ordinal}{page}",
+                    classes="facts__excerpt-header",
+                    markup=False,
+                )
+            )
+            widgets.append(
+                Static(snippet.text, classes="facts__excerpt", markup=False)
+            )
+        await pane.mount_all(widgets)
+
+    def action_delete_highlighted(self) -> None:
+        list_views = self.query(ListView)
+        if not list_views:
+            return
+        item = list_views.first().highlighted_child
+        document_id = None if item is None else getattr(item, "document_id", None)
+        if document_id is None:
+            return
+        document = self._document_for(document_id)
+        title = document.title if document is not None else "this document"
+        self._ask_delete(document_id, f'Delete "{title}"?')
+
+    def on_key(self, event: events.Key) -> None:
+        confirmed = self._answer_pending_delete(event)
+        if confirmed is not None:
+            self.post_message(self.DeleteRequested(confirmed))
+
+    async def refresh_documents(
+        self, documents: list[Document], snippets: dict[str, list[Snippet]]
+    ) -> None:
+        """Swap in a new list without closing the screen, keeping the
+        highlight where it was so the row after a deleted one is selected."""
+        list_views = self.query(ListView)
+        highlighted = list_views.first().index or 0 if list_views else 0
+        self._documents = documents
+        self._snippets = snippets
+
+        await self.query_one("#documents-body").remove()
+        await self.query_one("#documents", Vertical).mount(
+            self._body(), before=f"#{self.HINT_ID}"
+        )
+        list_views = self.query(ListView)
+        if not list_views:
+            return
+        list_view = list_views.first()
+        list_view.index = min(highlighted, len(list_view.children) - 1)
+        list_view.focus()
 
     def action_cancel(self) -> None:
         self.dismiss(None)
