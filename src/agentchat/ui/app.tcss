@@ -99,8 +99,12 @@ Screen {
     color: $text-muted;
 }
 
+/* Not $warning, however much "interrupted" wants amber: the built-in themes
+   alias $warning to $accent, so an amber rule here is the *user* turn's rule
+   and a stopped reply merges into the message above it. A neutral rule cannot
+   collide with a role's colour whatever the theme. */
 .bubble--stopped {
-    border-left: outer $warning;
+    border-left: outer $foreground-muted;
 }
 
 .bubble--error {
@@ -225,6 +229,32 @@ ConversationPicker, GroupChooser {
 
 FactBrowser {
     align: center middle;
+}
+
+#documents {
+    width: 80%;
+    height: 80%;
+    background: $surface;
+    border: round $primary;
+    padding: 1 2;
+}
+
+#documents-body {
+    height: 1fr;
+}
+
+#documents-list {
+    width: 40%;
+    border-right: solid $primary-darken-2;
+}
+
+#documents-snippets {
+    width: 1fr;
+    padding: 0 1;
+}
+
+.documents__item {
+    padding: 0 1;
 }
 
 #facts {

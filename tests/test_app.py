@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 
+from textual.geometry import Region
 from textual.widgets import Input, ListView, Static
 
 from agentchat.core.errors import ProviderError, StorageError
@@ -115,6 +116,28 @@ async def test_escape_stops_generation_and_keeps_partial_text():
         assert not app._generating
         reply = list(app.query(MessageBubble))[-1]
         assert reply.has_class("bubble--stopped")
+
+
+def _rule_colour(bubble: MessageBubble):
+    """The colour the bubble's left rule is actually painted in.
+
+    Asserted on instead of the class, because the class was never the problem:
+    `.bubble--stopped` and `.bubble--user` both resolved to the same colour.
+    """
+    return next(iter(bubble.render_lines(Region(0, 0, bubble.size.width, 1))[0])).style.color
+
+
+async def test_a_stopped_reply_stays_distinguishable_from_the_user_turn():
+    app = ChatApp(mock_settings(**_REALISTIC_TIMING))
+    async with app.run_test() as pilot:
+        await _submit(pilot, "stop me")
+        await asyncio.sleep(0.7)
+        await pilot.press("escape")
+        await _wait_until_done(pilot, app)
+
+        user, reply = list(app.query(MessageBubble))
+        assert reply.has_class("bubble--stopped")
+        assert _rule_colour(reply) != _rule_colour(user)
 
 
 async def test_backend_failure_surfaces_as_an_error_bubble_not_a_crash():
