@@ -23,9 +23,11 @@ _LOREM = (
     "chunk, over a real interval, on a worker that the interface can cancel."
 )
 
-_THINKING_PREFIX = (
-    "Thinking. Considering the request, the available context, and what a useful "
-    "answer would contain. "
+#: Tagged the way a reasoning model tags it, so the interface's handling of a
+#: thinking block is exercised without a GPU.
+_THINKING_BLOCK = (
+    "<think>\nConsidering the request, the available context, and what a useful "
+    "answer would contain.\n</think>\n\n"
 )
 
 
@@ -127,7 +129,7 @@ class MockProvider:
         turns = sum(1 for m in messages if m.role in ("user", "assistant"))
         parts: list[str] = []
         if options.thinking:
-            parts.append(_THINKING_PREFIX)
+            parts.append(_THINKING_BLOCK)
         parts.append(f'You said: "{last_user.strip()}". ')
         parts.append(_LOREM)
         parts.append(

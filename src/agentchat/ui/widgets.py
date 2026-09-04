@@ -256,6 +256,75 @@ class RecallNote(CollapsibleNote):
         return lines
 
 
+#: What a reasoning model wraps its thinking in. Qwen3 emits the pair; some
+#: chat templates open the block in the prompt itself, so a closing tag with
+#: no opener means everything before it was reasoning.
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+
+
+def split_thinking(text: str) -> tuple[str, str, bool]:
+    """Separate a reply's reasoning block from its answer, returning
+    `(thinking, answer, unterminated)` — `unterminated` marks a block whose
+    closing tag has not arrived, which mid-stream means the model is still
+    thinking.
+
+    Text outside the block keeps its place in the answer even when it precedes
+    the opening tag: a model that speaks before it thinks is misbehaving, but
+    hiding what it said would be the worse failure.
+    """
+    start = text.find(_THINK_OPEN)
+    if start == -1:
+        end = text.find(_THINK_CLOSE)
+        if end == -1:
+            return "", text, False
+        return text[:end].strip(), text[end + len(_THINK_CLOSE) :].lstrip(), False
+
+    head = text[:start]
+    rest = text[start + len(_THINK_OPEN) :]
+    end = rest.find(_THINK_CLOSE)
+    if end == -1:
+        return rest.strip(), head.strip(), True
+    return rest[:end].strip(), (head + rest[end + len(_THINK_CLOSE) :]).lstrip(), False
+
+
+class ThinkingNote(CollapsibleNote):
+    """One line above a reply the model reasoned its way to: the reasoning
+    itself, folded away until clicked.
+
+    The header tracks the block while it streams — until the answer starts, a
+    thinking reply is an empty bubble, and this is the only thing on screen
+    saying why.
+    """
+
+    def __init__(self, thinking: str, *, streaming: bool = False) -> None:
+        self._thinking = thinking
+        self._streaming = streaming
+        super().__init__()
+
+    def show(self, thinking: str, *, streaming: bool) -> None:
+        if (thinking, streaming) == (self._thinking, self._streaming):
+            return
+        self._thinking = thinking
+        self._streaming = streaming
+        self.update(self._text())
+
+    def settle(self) -> None:
+        """Stop reporting progress — the turn is over, however it ended."""
+        self.show(self._thinking, streaming=False)
+
+    def _header_text(self) -> str:
+        if self._streaming:
+            return "thinking…"
+        words = len(self._thinking.split())
+        return f"thought for {words} {'word' if words == 1 else 'words'}"
+
+    def _detail_lines(self) -> Sequence[str]:
+        # One detail line per source line, so the reasoning's paragraphs
+        # survive the base's whitespace collapse.
+        return self._thinking.split("\n")
+
+
 class ConsultationNote(CollapsibleNote):
     """One line under a reply written with a specialist's help: which one,
     and — on click — the task it was given and what it answered."""
@@ -327,11 +396,17 @@ class MessageBubble(Vertical):
         # Built eagerly and held by reference: streaming updates can arrive
         # before compose() finishes. markup=False so model output containing
         # brackets is never parsed as Textual markup.
+        thinking, answer, _ = split_thinking(self._buffer)
         self._header = Static(self._header_text(), classes="bubble__header")
-        self._body = Static(self._buffer, classes="bubble__body", markup=False)
+        self._body = Static(answer, classes="bubble__body", markup=False)
+        # A restored message is finished, however its block ended, so the note
+        # is built settled rather than streaming.
+        self._thinking_note = ThinkingNote(thinking) if thinking else None
 
     def compose(self) -> ComposeResult:
         yield self._header
+        if self._thinking_note is not None:
+            yield self._thinking_note
         yield self._body
 
     # -- streaming --------------------------------------------------------
@@ -350,17 +425,19 @@ class MessageBubble(Vertical):
     def append(self, chunk: str) -> None:
         self._buffer += chunk
         self.message.content = self._buffer
-        self._body.update(self._buffer)
+        self._show_split(streaming=True)
 
     def set_text(self, text: str) -> None:
         self._buffer = text
-        self._body.update(text)
+        self._show_split(streaming=False)
 
     def mark_stopped(self) -> None:
         self._status = "stopped"
         self.add_class("bubble--stopped")
         if not self._buffer.strip():
             self.set_text("[stopped before any output]")
+        else:
+            self._show_split(streaming=False)
         self._refresh_header()
 
     def mark_error(self, detail: str) -> None:
@@ -371,6 +448,7 @@ class MessageBubble(Vertical):
 
     def mark_done(self) -> None:
         self._status = None
+        self._show_split(streaming=False)
         self._refresh_header()
 
     def show_recall(self, recall: dict[str, Any] | None) -> None:
@@ -408,6 +486,32 @@ class MessageBubble(Vertical):
         self._mount_consultation_note(note)
 
     # -- internals --------------------------------------------------------
+
+    def _show_split(self, *, streaming: bool) -> None:
+        """Show the buffer as its two halves — the reasoning in the note, the
+        answer in the body. `self.message` keeps the model's output whole; only
+        the display is split.
+
+        Not `_render`: that name belongs to `Widget` itself, and taking it
+        breaks every repaint of the bubble."""
+        thinking, answer, unterminated = split_thinking(self._buffer)
+        self._body.update(answer)
+        if not thinking:
+            # An error replaces the buffer wholesale: what the model did think
+            # stays on screen, but it is no longer in progress.
+            if self._thinking_note is not None:
+                self._thinking_note.settle()
+            return
+        if self._thinking_note is None:
+            self._thinking_note = ThinkingNote(
+                thinking, streaming=streaming and unterminated
+            )
+            # Directly above the body: the reasoning came before the answer,
+            # and mounting relative to the body leaves a consultation note
+            # (mounted under the header) above it where it belongs.
+            self.mount(self._thinking_note, before=self._body)
+            return
+        self._thinking_note.show(thinking, streaming=streaming and unterminated)
 
     def _mount_consultation_note(self, note: ConsultationNote) -> None:
         # Above the body: the attribution belongs with the header that names

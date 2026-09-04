@@ -1478,6 +1478,106 @@ async def test_recall_off_renders_no_note():
         assert list(app.query(RecallNote)) == []
 
 
+# -- the thinking note ------------------------------------------------------
+
+from agentchat.ui.widgets import ThinkingNote, split_thinking  # noqa: E402
+
+
+def test_split_thinking_separates_the_block_from_the_answer():
+    assert split_thinking("<think>weighing it</think>\n\nthe answer") == (
+        "weighing it",
+        "the answer",
+        False,
+    )
+
+
+def test_split_thinking_reports_a_block_that_has_not_closed():
+    assert split_thinking("<think>still going") == ("still going", "", True)
+
+
+def test_split_thinking_reads_a_closing_tag_with_no_opener():
+    # Templates that open the block in the prompt leave only the closing tag.
+    assert split_thinking("weighing it</think>the answer") == (
+        "weighing it",
+        "the answer",
+        False,
+    )
+
+
+def test_split_thinking_leaves_an_untagged_reply_alone():
+    assert split_thinking("just an answer") == ("", "just an answer", False)
+
+
+async def test_a_thinking_reply_folds_its_reasoning_into_a_note():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await pilot.press("ctrl+t")
+        await _submit(pilot, "hello")
+        await _wait_until_done(pilot, app)
+
+        notes = list(app.query(ThinkingNote))
+        assert len(notes) == 1
+        assert "thought for" in str(notes[0].content)
+
+        bubble = list(app.query(MessageBubble))[-1]
+        # The tags and the reasoning are out of the reply proper, but the
+        # message keeps what the model actually wrote.
+        body = str(bubble.query_one(".bubble__body", Static).content)
+        assert "<think>" not in body and "</think>" not in body
+        assert "You said:" in body
+        assert "<think>" in bubble.message.content
+
+        notes[0].scroll_visible(animate=False)
+        await pilot.pause()
+        await pilot.click(ThinkingNote)
+        assert "available context" in " ".join(str(notes[0].content).split())
+
+
+async def test_stopping_mid_thought_settles_the_note():
+    app = ChatApp(mock_settings(**_REALISTIC_TIMING))
+    async with app.run_test() as pilot:
+        await pilot.press("ctrl+t")
+        await _submit(pilot, "stop me while I think")
+        for _ in range(60):
+            await pilot.pause()
+            if list(app.query(ThinkingNote)):
+                break
+            await asyncio.sleep(0.05)
+        note = app.query_one(ThinkingNote)
+        assert "thinking…" in str(note.content)
+
+        await pilot.press("escape")
+        await _wait_until_done(pilot, app)
+        assert "thinking…" not in str(note.content)
+
+
+async def test_reopening_the_conversation_rebuilds_the_thinking_note():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await pilot.press("ctrl+t")
+        await _submit(pilot, "hello")
+        await _wait_until_done(pilot, app)
+        conv_id = app.conversation.id
+        header_before = str(app.query_one(ThinkingNote).content)
+
+        await app.action_new_conversation()
+        await pilot.pause()
+        await app._switch_to(conv_id)
+        await pilot.pause()
+
+        notes = list(app.query(ThinkingNote))
+        assert len(notes) == 1
+        assert str(notes[0].content) == header_before
+
+
+async def test_thinking_off_renders_no_note():
+    app = ChatApp(mock_settings())
+    async with app.run_test() as pilot:
+        await _submit(pilot, "hello")
+        await _wait_until_done(pilot, app)
+        assert list(app.query(ThinkingNote)) == []
+
+
 # -- fact evidence view (Ctrl+F) --------------------------------------------
 
 from agentchat.ui.app import _GENERATION_GROUP  # noqa: E402

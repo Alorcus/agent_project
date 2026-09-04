@@ -46,6 +46,12 @@ AGENTCHAT_TEST_REAL_MODEL=1 uv run pytest
 `Ctrl+O` switches between them at runtime; only one is resident at a time, so
 switching evicts the other from the GPU.
 
+`Ctrl+T` turns thinking mode on. A reasoning model's `<think>` block stays out
+of the reply itself: above the answer a muted line appears — `▸ thinking…`
+while the block is still arriving, then `▸ thought for 214 words` — that
+expands on click to show the reasoning. The stored message keeps the model's
+output verbatim, so reopening the conversation rebuilds the same note.
+
 The context windows are set below what the model configs advertise (40960 for
 Qwen3, 131072 for Phi). The limit is KV-cache memory, not the architecture: on
 a 40 GB A100, Qwen3-14B's weights take ~29 GB and its cache costs ~0.33 MB per
