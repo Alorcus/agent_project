@@ -93,7 +93,7 @@ def test_unknown_backend_is_a_configuration_error():
 
 def test_max_context_caps_both_the_registry_and_the_provider(tmp_path: Path):
     """The chat service sizes context off the *provider's* info, so a cap that
-    only reached the registry's copy would silently do nothing (NFR-CTX-04)."""
+    only reached the registry's copy would silently do nothing."""
     registry = build_registry(
         Settings(backend="local", model_root=tmp_path, max_context=4096)
     )

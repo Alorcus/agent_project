@@ -586,7 +586,7 @@ class AdaptiveRetriever:
         """Facts of *this* conversation covering messages the recency window
         is almost certainly still carrying verbatim — injecting them would
         spend budget restating the prompt. Older facts of the same
-        conversation are still retrieved (NFR-CTX-01)."""
+        conversation are still retrieved."""
         cutoff = len(countable(conversation.messages)) - WINDOW_SIZE
         try:
             facts = await self.index.store.list_facts(conversation.group_id)

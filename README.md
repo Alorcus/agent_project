@@ -7,21 +7,53 @@ and Qwen3-14B, loaded in-process from the cluster's shared checkpoint directory
 and streamed token by token. The mock backend is still there, behind a switch,
 for working on the interface without a GPU.
 
+## Setup
+
+The only prerequisite is `uv` (`curl -LsSf https://astral.sh/uv/install.sh | sh`);
+it resolves the interpreter and dependencies from `pyproject.toml` and
+`uv.lock`, so there is no install step.
+
+```bash
+git clone https://github.com/Alorcus/agent_project.git
+cd agent_project
+uv run pytest                              # mock backend, no GPU — confirms the environment builds
+AGENTCHAT_BACKEND=mock uv run agentchat
+```
+
+The real backend reads three checkpoint directories under
+`AGENTCHAT_MODEL_ROOT`, already populated on the cluster
+(`/sc/projects/sci-lippert/intelligent-agents/model_checkpoints`):
+
+```
+microsoft/Phi-4-mini-instruct              # phi-4-mini
+Qwen/Qwen3-14B                             # qwen3-14b
+sentence-transformers/all-MiniLM-L6-v2     # the retrieval embedder (CPU)
+```
+
+Nothing is downloaded at runtime and a missing checkpoint fails loudly.
+Elsewhere, fetch them once and point `AGENTCHAT_MODEL_ROOT` at the tree:
+
+```bash
+uv run hf download sentence-transformers/all-MiniLM-L6-v2 \
+  --local-dir <model_root>/sentence-transformers/all-MiniLM-L6-v2
+```
+
+`AGENTCHAT_EMBED_MODEL_PATH` overrides the embedder's location on its own, and
+the mock backend needs no encoder at all — it uses a weightless hashing one.
+
+Nothing else is created by hand: `data/` (database and logs) and `corpus/`
+appear on first run, both gitignored. Optional settings go in the environment or
+a `.env` file at the project root — copy `.env.example`; see Configuration
+below.
+
 ## Run it
 
 ```bash
 uv run agentchat
 ```
 
-`uv` resolves the interpreter and dependencies from `pyproject.toml`; there is
-no separate install step.
-
 Needs a GPU node — the first message loads the weights, which takes a moment.
-Without one, or on a laptop:
-
-```bash
-AGENTCHAT_BACKEND=mock uv run agentchat
-```
+Without one, or on a laptop: `AGENTCHAT_BACKEND=mock uv run agentchat`.
 
 Tests:
 
@@ -232,19 +264,6 @@ timeout) degrades to a normal reply, never an error or a hang.
 `AGENTCHAT_RECALL_FACTS=0` switches the feature off entirely — no embedder
 load, no gate call, no `fact_embeddings` reads. `AGENTCHAT_RECALL_DOCUMENTS=0`
 leaves recall running over the group's facts alone.
-
-### Setup: the embedding weights
-
-The retrieval loop needs a small sentence encoder on disk (real backend only —
-`AGENTCHAT_BACKEND=mock` uses a weightless hashing embedder and needs nothing):
-
-```bash
-uv run hf download sentence-transformers/all-MiniLM-L6-v2 \
-  --local-dir /sc/projects/sci-lippert/intelligent-agents/model_checkpoints/sentence-transformers/all-MiniLM-L6-v2
-```
-
-Or point `AGENTCHAT_EMBED_MODEL_PATH` at wherever the checkpoint already
-lives.
 
 ## Documents
 
@@ -493,16 +512,3 @@ imports a concrete backend.
 - Document ingestion — a dropped text file or PDF is snippeted, embedded and
   stored, and searched globally by the same retrieval loop. See "Documents"
   above.
-
-## Not yet built
-
-Deliberately stubbed, with the seam in place:
-
-- The two required fine-tunes.
-- Intelligent context management (elective).
-- Specialists on their own weights (LoRA adapters over the shared resident
-  base) — the roster is prompt-differentiated for now; `SubAgent` has no
-  `model_id`.
-- History virtualisation for very long conversations.
-
-See `requirements.md` for the full non-functional requirement set.

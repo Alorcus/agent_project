@@ -53,7 +53,7 @@ async def test_registry_keeps_one_model_resident():
     registry.cycle()
     second = await registry.active_provider()
     assert second.is_loaded
-    assert not first.is_loaded, "previous model must be evicted (NFR-P-05)"
+    assert not first.is_loaded, "previous model must be evicted"
 
 
 async def test_unknown_model_id_is_an_error():
